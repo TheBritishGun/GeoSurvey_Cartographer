@@ -7,18 +7,12 @@ Runs beside another map mod, such as Xaero's or JourneyMap.
 Minecraft 26.2, Fabric, Java 25. Client side.
 
 For players
-Put the jar in your mods folder, with Fabric API. Sandpaper comes inside. Install it instead of GeoSurvey, never beside it.
+Put the jar in your mods folder, with Fabric API. Install it instead of GeoSurvey, never beside it.
 
 Open the settings (Mod Menu, or the Open settings key) and type the collector's address. Contributing starts.
 
-setting	what it does
-collector address	where the ground goes
-contribute ground	on or off; the address stays
-prove this account to the collector	tells the collector who holds this key; off by default
-contribute	every server, or only the servers listed
-approved servers	the servers to contribute from, comma separated
-Commands
-command	what it does
+
+Commands:
 
 /geosurvey share	shows whether you are contributing
 
@@ -42,6 +36,7 @@ Build
 JDK 25 and Python 3, a built Sandpaper checkout beside this one (../sandpaper), and the Minecraft and Fabric jars in libs/. Then:
 
 python build.py
+
 License
 AGPL-3.0-or-later. See LICENSE.
 
