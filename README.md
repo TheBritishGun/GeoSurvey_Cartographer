@@ -18,7 +18,7 @@ Commands:
 
 /geosurvey share on, off	turns contributing on or off
 
-/geosurvey collector <address>	sets the collector
+/geosurvey collector <address> sets the collector
 
 /geosurvey collector find	lists collector addresses to choose from
 
