@@ -1,0 +1,69 @@
+package dev.openmap.symbol;
+
+// Standard identity: a frame shape paired with a fill colour.
+public enum Affiliation {
+
+    // Light blue.
+    FRIEND(Frame.RECTANGLE, Fills.FRIEND, "Friendly"),
+
+    // Light red.
+    HOSTILE(Frame.DIAMOND, Fills.HOSTILE, "Hostile"),
+
+    // Light green.
+    NEUTRAL(Frame.SQUARE, Fills.NEUTRAL, "Neutral"),
+
+    // Light yellow.
+    UNKNOWN(Frame.QUATREFOIL, Fills.UNKNOWN, "Unknown");
+
+    // One ink for frame outlines and icons, on every affiliation.
+    public static final int LINE = 0xFF101010;
+
+    private static final class Fills {
+
+        private static final int FRIEND = 0xFF80E0FF;
+        private static final int HOSTILE = 0xFFFF8080;
+        private static final int NEUTRAL = 0xFFAAFFAA;
+        private static final int UNKNOWN = 0xFFFFFF80;
+
+        private Fills() {
+        }
+    }
+
+    private final Frame frame;
+    private final int fill;
+    private final String label;
+
+    Affiliation(Frame frame, int fill, String label) {
+        this.frame = frame;
+        this.fill = fill;
+        this.label = label;
+    }
+
+    // What to call this on screen.
+    public String label() {
+        return label;
+    }
+
+    public Frame frame() {
+        return frame;
+    }
+
+    // The standard's fill colour for this identity, ARGB.
+    public int fill() {
+        return fill;
+    }
+
+    public Affiliation next() {
+        return switch (this) {
+            case FRIEND -> HOSTILE;
+            case HOSTILE -> NEUTRAL;
+            case NEUTRAL -> UNKNOWN;
+            case UNKNOWN -> FRIEND;
+        };
+    }
+
+    // Frame outlines, one per standard identity.
+    public enum Frame {
+        RECTANGLE, DIAMOND, SQUARE, QUATREFOIL
+    }
+}

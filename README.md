@@ -7,7 +7,7 @@ Runs beside another map mod, such as Xaero's or JourneyMap.
 Minecraft 26.2, Fabric, Java 25. Client side.
 
 For players
-Put the jar in your mods folder, with Fabric API. Install it instead of GeoSurvey, never beside it.
+Put the jar in your mods folder, with Fabric API. Install it instead of the GeoSurvey map mod, not with it.
 
 Open the settings (Mod Menu, or the Open settings key) and type the collector's address. Contributing starts.
 

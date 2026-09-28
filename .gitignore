@@ -1,0 +1,8 @@
+build/
+runs/
+libs/
+logs/
+__pycache__/
+*.class
+*.jar
+*.pyc
