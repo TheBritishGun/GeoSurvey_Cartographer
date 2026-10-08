@@ -27,7 +27,7 @@ public final class Attestation {
 
     public static final String PLAYER_ALGORITHM = "SHA256withRSA";
 
-    // Lowercase hex; the exact bytes are load-bearing.
+    // Lowercase hex; the exact bytes matter.
     private static final byte[] HEX_DIGITS =
             "0123456789abcdef".getBytes(StandardCharsets.ISO_8859_1);
 

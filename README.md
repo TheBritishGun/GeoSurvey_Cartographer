@@ -7,7 +7,7 @@ Runs beside another map mod, such as Xaero's or JourneyMap.
 Minecraft 26.2, Fabric, Java 25. Client side.
 
 For players
-Put the jar in your mods folder, with Fabric API. Install it instead of the GeoSurvey map mod, not with it.
+Put the jar in your mods folder, with Fabric API. GeoSurvey 0.1.12-i and newer already hold it; do not add it beside them.
 
 Open the settings (Mod Menu, or the Open settings key) and type the collector's address. Contributing starts.
 
@@ -24,13 +24,15 @@ Commands:
 
 /geosurvey collector clear	forgets the collector
 
+/geosurvey server	lists the approved servers
+
 /geosurvey server add <address>, remove <address>	edits the approved servers
 
 /geosurvey friend add <player>, remove <player>	edits the friends list
 
-/geosurvey claim ...	creates, edits, lists and removes a claim
+/geosurvey claim ...	creates, edits, lists, shares and removes a claim
 
-/geosurvey marker ...	places, lists, edits and removes a marker
+/geosurvey marker ...	places, lists, edits, shares and removes a marker
 
 Build
 JDK 25 and Python 3, a built Sandpaper checkout beside this one (../sandpaper), and the Minecraft and Fabric jars in libs/. Then:

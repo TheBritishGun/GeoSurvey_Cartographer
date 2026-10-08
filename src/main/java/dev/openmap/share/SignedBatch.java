@@ -89,8 +89,8 @@ public record SignedBatch(Attestation.Credential credential, byte[] signature,
         int left = body.remaining();
         if (left != 0) {
             throw new IOException(left
-                    + " bytes after the signed batch."
-                    + " Refusing it.");
+                    + " extra bytes"
+                    + " after the signed batch.");
         }
         return new SignedBatch(
                 new Attestation.Credential(player, expires, key, keySignature),
@@ -146,7 +146,6 @@ public record SignedBatch(Attestation.Credential credential, byte[] signature,
         return held == null ? null : held.attestedPresence(at);
     }
 
-    // The envelope opened as a roster rather than a position.
     public RosterReport verifiedRosterByAnyOf(Collection<? extends PublicKey> mojangKeys,
             Instant now, BiConsumer<PublicKey, GeneralSecurityException> unusable,
             Predicate<Attestation.Credential> operatorTrusts) throws IOException {
@@ -233,7 +232,7 @@ public record SignedBatch(Attestation.Credential credential, byte[] signature,
                 && withinBounds(sent, skew, stale), skew);
     }
 
-    // The envelope opened as an answer to "prove you stood here".
+    // A proof answers "prove you stood here".
     public WorldProof verifiedProofByAnyOf(Collection<? extends PublicKey> mojangKeys,
             Instant now, BiConsumer<PublicKey, GeneralSecurityException> unusable,
             Predicate<Attestation.Credential> operatorTrusts) throws IOException {
@@ -245,7 +244,7 @@ public record SignedBatch(Attestation.Credential credential, byte[] signature,
         return held == null ? null : held.attestedProof(at);
     }
 
-    // A proof, with a window measured in hours rather than minutes.
+    // A proof, with a window in hours, not minutes.
     private WorldProof attestedProof(long at) throws IOException {
         WorldProof inside = WorldProof.decode(batch);
         if (!matches(credential.player(), inside.by())) {
@@ -276,7 +275,7 @@ public record SignedBatch(Attestation.Credential credential, byte[] signature,
         return inPresenceWindow(at, sent);
     }
 
-    // Package-private: StandingAsk.current reads this constant directly.
+    // StandingAsk.current reads this constant.
     static final long PRESENCE_WINDOW_SECONDS = 300;
 
     static long skewBound(long at) {

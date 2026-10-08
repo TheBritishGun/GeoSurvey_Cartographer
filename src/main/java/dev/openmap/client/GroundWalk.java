@@ -1,7 +1,10 @@
 package dev.openmap.client;
 
+import dev.openmap.claim.NodeAddress;
+import dev.openmap.claim.ServerConfirmation;
 import dev.openmap.share.SignedBatch;
 import dev.openmap.share.StandingAsk;
+import dev.openmap.share.UtcClock;
 import dev.openmap.share.WorldAsk;
 import dev.openmap.share.WorldPrint;
 import dev.openmap.share.WorldProof;
@@ -16,13 +19,11 @@ import dev.sandpaper.core.Step;
 import dev.sandpaper.core.Tick;
 import net.minecraft.world.level.Level;
 
-// Walking a collector's regions, one answer at a time.
-// near() (tick thread) reads and parks an answer; beat() (share thread) sends it.
-// Nothing here is persisted; the walk resets on a new connection or a new collector.
+// Walks a collector's regions, one answer at a time.
 final class GroundWalk {
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
     private static final long READ_AGAIN_MILLIS = 30_000L;
 
@@ -36,27 +37,40 @@ final class GroundWalk {
     private static final long POST_BACKOFF_NANOS =
             java.util.concurrent.TimeUnit.SECONDS.toNanos(2L);
 
-    private static final String SAID = "[GeoSurvey] ";
+    static final String SAID = "[GeoSurvey] ";
 
-    // Lines waiting for the tick thread, bounded.
     private static final int MAX_NOTICES = 8;
 
-    // Distinct lines remembered before the memory is dropped and lines repeat.
     private static final int MAX_SAID = 64;
 
     private static final String REFUSED_ROW =
             "This collector asked for ground this client cannot read."
                     + " Ask the operator.";
 
+    private static final String NOT_TOLD =
+            "The collector asks for ground this client was not told about."
+                    + " Reconnect to pick it up.";
+
+    private static final String OVER_CAP =
+            "This collector asks for too much ground."
+                    + " Ask the operator to list at most " + WorldAsk.MAX_REGIONS + " regions.";
+
+    private static final int HTTP_STATUS_CLASS = 100;
+
+    private static final int HTTP_SUCCESS_CLASS = 2;
+
+    private static final int HTTP_SERVER_ERROR_CLASS = 5;
+
+    private static final int HTTP_TOO_MANY_REQUESTS = 429;
+
+    private static final int HTTP_UNAUTHORIZED = 401;
+
     private static final java.lang.invoke.VarHandle TROUBLE = troubleField();
 
-    // Lines the tick thread has not put in chat yet.
     private final ConcurrentLinkedQueue<String> notices = new ConcurrentLinkedQueue<>();
 
-    // Every line said this session; a repeat says nothing.
     private final Set<String> alreadySaid = ConcurrentHashMap.newKeySet();
 
-    // One answer waiting for the share thread, or null.
     private record Parked(String server, URI collector, WorldPrint.Region region,
                           String signature, int tries) {
     }
@@ -76,7 +90,6 @@ final class GroundWalk {
 
     private final AtomicReference<ShareSender.ReplySink> spareReply = new AtomicReference<>();
 
-    // The standing ask's own reply-sink slot; kept separate from spareReply.
     private final AtomicReference<ShareSender.ReplySink> spareStandingReply =
             new AtomicReference<>();
 
@@ -105,22 +118,23 @@ final class GroundWalk {
 
     private final java.util.function.LongSupplier clock = System::nanoTime;
 
-    // When each owed region was last read, by name. Bounded by WorldAsk.MAX_REGIONS.
+    private final UtcClock utc;
+
+    // Bounded by WorldAsk.MAX_REGIONS.
     private final ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong> lastRead =
             new ConcurrentHashMap<>();
 
-    // The server the current lists belong to; null before the first ask.
+    // Null when no server is joined.
     private volatile String server;
 
-    // The collector the current lists came from; null before the first ask.
     private volatile URI collector;
 
     private final Object walkLock = new Object();
 
-    // Every region this node asks about, or null before it has been asked.
+    // Null until the node is asked.
     private volatile List<WorldPrint.Region> asked;
 
-    // What is still owed. Null means the node has not said (not the same as nothing left).
+    // Null until the node answers; empty when nothing is left.
     private volatile List<String> remaining;
 
     private record Owed(List<WorldPrint.Region> asked, List<String> remaining,
@@ -130,62 +144,81 @@ final class GroundWalk {
     private final AtomicReference<Owed> owedCache = new AtomicReference<>();
 
     private record Said(String text, String why, List<WorldPrint.Region> asked,
-                        List<WorldPrint.Region> owed, List<String> left, String refused) {
+                        List<WorldPrint.Region> owed, List<String> left, List<String> refused) {
     }
 
     private final AtomicReference<Said> saidCache = new AtomicReference<>();
 
-    // The last thing worth telling the player, for the tooltip.
     private volatile String trouble;
 
-    private volatile String refusedRow;
+    // Refused row names; a row with no readable name is "".
+    private volatile List<String> refusedRows = List.of();
 
     private volatile boolean reasked;
 
-    // The rectangle being read a chunk at a time, or null. Tick thread only.
+    private enum Outcome {
+        LISTED, AGAIN, SHUT, UNPROVEN
+    }
+
+    // Only the thread that sends a standing ask uses it.
+    private Outcome standingOutcome = Outcome.SHUT;
+
+    private volatile boolean standingDue = false;
+
+    private volatile boolean standingShut = false;
+
+    private volatile boolean standingUnproven = false;
+
+    // Tick thread only: reading and every reading* field.
     private WorldHandshake.Progress reading;
 
-    // The dimension reading was opened in, or null. Tick thread only.
     private String readingIn;
 
     private Level readingLevel;
 
-    // The collector reading was opened against, or null. Tick thread only.
     private java.net.URI readingVia;
 
-    // The server reading was opened for, or null. Tick thread only.
     private String readingFor;
 
-    // Forgets a server's lists, so a reconnection starts the walk again.
+    GroundWalk() {
+        this(UtcClock.collector());
+    }
+
+    GroundWalk(UtcClock utc) {
+        this.utc = utc;
+    }
+
     void joined(String joinedServer) {
         if (!java.util.Objects.equals(joinedServer, server)) {
             synchronized (walkLock) {
                 server = joinedServer;
                 forget();
                 reasked = false;
+                standingShut = false;
+                standingUnproven = false;
             }
         }
     }
 
-    // Forgets a collector's lists when the address moves off it.
     private void pointedAt(URI atCollector) {
-        URI held = collector;
-        if (held == null || !held.equals(atCollector)) {
-            synchronized (walkLock) {
-                collector = atCollector;
+        synchronized (walkLock) {
+            URI held = collector;
+            if (held == null || !held.equals(atCollector)) {
                 forget();
+                collector = atCollector;
                 reasked = false;
+                standingShut = false;
+                standingUnproven = false;
             }
         }
     }
 
-    // Everything a walk holds, dropped as a unit.
-    // reading is deliberately not cleared here; it belongs to the tick thread.
     private void forget() {
         asked = null;
         remaining = null;
         trouble = null;
-        refusedRow = null;
+        refusedRows = List.of();
+        standingDue = false;
         owedCache.set(null);
         saidCache.set(null);
         dimScan.set(null);
@@ -196,8 +229,8 @@ final class GroundWalk {
         alreadySaid.clear();
     }
 
-    // Queues one line for chat, once. Any thread.
-    private void say(String line) {
+    // Any thread.
+    void say(String line) {
         if (line != null && !line.isEmpty()) {
             if (alreadySaid.size() >= MAX_SAID) {
                 alreadySaid.clear();
@@ -211,13 +244,25 @@ final class GroundWalk {
         }
     }
 
-    // Takes one line for chat, or null. Tick thread.
+    // Any thread.
+    boolean sayAt(URI atCollector, String line) {
+        boolean pointed;
+        synchronized (walkLock) {
+            URI held = collector;
+            pointed = held != null && held.equals(atCollector);
+            if (pointed) {
+                say(line);
+            }
+        }
+        return pointed;
+    }
+
+    // Tick thread only; null when no line waits.
     String notice() {
         return notices.poll();
     }
 
-    // Whether the walk is still the one this call started against; narrows the race
-    // window around a network call, does not close it.
+    // Narrows the race around a network call; cannot close it.
     private boolean stillWalking(URI atCollector, String atServer,
                                  java.util.function.Supplier<URI> liveCollector) {
         URI live = liveCollector == null ? null : liveCollector.get();
@@ -226,12 +271,10 @@ final class GroundWalk {
                 && atServer != null && atServer.equals(server);
     }
 
-    // Whether the handshake has anything a player can act on yet.
     boolean worthSaying() {
         return asked != null || trouble != null;
     }
 
-    // Whether this node has been asked what it wants yet.
     boolean asked() {
         return asked != null;
     }
@@ -241,8 +284,30 @@ final class GroundWalk {
         return at != null && at.isEmpty();
     }
 
+    ServerConfirmation.Ground groundFor(String nodeHost, String forServer) {
+        URI with = collector;
+        List<WorldPrint.Region> list = asked;
+        if (with == null || nodeHost == null
+                || !NodeAddress.withoutRootDot(nodeHost)
+                        .equalsIgnoreCase(NodeAddress.withoutRootDot(with.getHost()))
+                || forServer == null || !forServer.equals(server)) {
+            return ServerConfirmation.Ground.ASKING;
+        }
+        if (list == null) {
+            return ServerConfirmation.Ground.ASKING;
+        }
+        if (list.isEmpty()) {
+            return ServerConfirmation.Ground.NO_REGIONS;
+        }
+        return proven() ? ServerConfirmation.Ground.PROVEN : ServerConfirmation.Ground.OWED;
+    }
+
     boolean mayReask() {
         return !reasked;
+    }
+
+    boolean standingDue() {
+        return standingDue;
     }
 
     void reask() {
@@ -252,13 +317,21 @@ final class GroundWalk {
         }
     }
 
-    // Whether a ground reading is open. Read on the tick thread, which is also where
-    // near() writes it.
+    void keyEnrolled() {
+        synchronized (walkLock) {
+            if (standingUnproven) {
+                standingUnproven = false;
+                standingShut = false;
+                standingDue = true;
+            }
+        }
+    }
+
+    // Tick thread only.
     boolean readingOpen() {
         return reading != null;
     }
 
-    // Asks a collector which regions it wants read. Share thread.
     boolean ask(ShareSender.Transport transport, URI atCollector, String forServer) {
         return ask(transport, atCollector, forServer, () -> this.collector);
     }
@@ -268,8 +341,7 @@ final class GroundWalk {
         return ask(transport, atCollector, forServer, liveCollector, null);
     }
 
-    // Also sends the signed standing ask when identity is given (null skips it).
-    // Ground pool's worker.
+    // Ground pool's worker; a null identity skips the standing ask.
     boolean ask(ShareSender.Transport transport, URI atCollector, String forServer,
                 java.util.function.Supplier<URI> liveCollector, ShareSender.Identity identity) {
         if (atCollector == null || forServer == null || forServer.isBlank()) {
@@ -279,6 +351,9 @@ final class GroundWalk {
             return asked != null;
         }
         pointedAt(atCollector);
+        if (identity != null && standingDue) {
+            return standingAgain(transport, atCollector, forServer, liveCollector, identity);
+        }
         boolean outcome;
         ShareSender.ReplySink sink = heldReply(spareAskReply);
         try {
@@ -287,10 +362,12 @@ final class GroundWalk {
                             + java.net.URLEncoder.encode(forServer,
                                     java.nio.charset.StandardCharsets.UTF_8)),
                     WorldAsk.MAX_BODY, sink);
-            if (!stillWalking(atCollector, forServer, liveCollector)) {
+            if (Thread.currentThread().isInterrupted()) {
+                outcome = asked != null;
+            } else if (!stillWalking(atCollector, forServer, liveCollector)) {
                 outcome = asked != null;
             } else if (!found) {
-                // 404: a legacy node with no handshake; it asks nothing.
+                // 404: a node with no handshake.
                 synchronized (walkLock) {
                     if (!stillWalking(atCollector, forServer, liveCollector)) {
                         outcome = asked != null;
@@ -298,7 +375,8 @@ final class GroundWalk {
                         asked = List.of();
                         remaining = List.of();
                         trouble = null;
-                        refusedRow = null;
+                        refusedRows = List.of();
+                        standingDue = false;
                         outcome = true;
                     }
                 }
@@ -311,7 +389,7 @@ final class GroundWalk {
                             outcome = asked != null;
                         } else {
                             trouble = "This collector answered something this version cannot read.";
-                            refusedRow = null;
+                            refusedRows = List.of();
                             outcome = false;
                         }
                     }
@@ -323,21 +401,22 @@ final class GroundWalk {
                                 outcome = asked != null;
                             } else {
                                 trouble = REFUSED_ROW;
-                                refusedRow = null;
+                                refusedRows = List.of();
                                 say(REFUSED_ROW);
                                 outcome = false;
                             }
                         }
+                    } else if (got.regionsCut()) {
+                        outcome = cut(atCollector, forServer, liveCollector);
                     } else {
                         outcome = filed(transport, atCollector, forServer, liveCollector,
-                                identity, got, refused);
+                                identity, got);
                     }
                 }
                 spareAsk.set(got);
             }
             spareAskReply.set(sink);
         } catch (IOException | RuntimeException unreachable) {
-            // Left unasked on purpose, so the next beat tries again.
             synchronized (walkLock) {
                 if (stillWalking(atCollector, forServer, liveCollector)) {
                     trouble = "The collector could not be asked which ground to read.";
@@ -348,12 +427,9 @@ final class GroundWalk {
         return outcome;
     }
 
-    // Files a readable answer under walkLock and says the walk's line, unless a standing
-    // ask is still due. Ground pool's worker, called only from ask().
     private boolean filed(ShareSender.Transport transport, URI atCollector, String forServer,
                           java.util.function.Supplier<URI> liveCollector,
-                          ShareSender.Identity identity, WorldAsk.AskHolder got,
-                          boolean refused) {
+                          ShareSender.Identity identity, WorldAsk.AskHolder got) {
         boolean outcome;
         boolean standing;
         synchronized (walkLock) {
@@ -364,53 +440,112 @@ final class GroundWalk {
                 keepAnswer(got);
                 remaining = null;
                 trouble = null;
-                refusedRow = refused ? REFUSED_ROW : null;
+                refusedRows = got.refusedNames();
+                standingDue = false;
                 if (!asked.isEmpty()) {
                     reasked = false;
                 }
-                standing = identity != null && !asked.isEmpty();
+                standing = identity != null && !asked.isEmpty() && !standingShut;
                 if (!standing) {
-                    sayOwed(refused);
+                    sayOwed();
                 }
                 outcome = asked != null;
             }
         }
         if (standing) {
-            standingAsk(transport, atCollector, forServer, liveCollector, identity, refused);
+            standingAsk(transport, atCollector, forServer, liveCollector, identity);
         }
         return outcome;
     }
 
-    // Says the walk's line and the refused-row line. Runs with walkLock held.
-    private void sayOwed(boolean refused) {
+    private boolean cut(URI atCollector, String forServer,
+                        java.util.function.Supplier<URI> liveCollector) {
+        boolean outcome;
+        synchronized (walkLock) {
+            if (!stillWalking(atCollector, forServer, liveCollector)) {
+                outcome = asked != null;
+            } else {
+                trouble = OVER_CAP;
+                say(OVER_CAP);
+                outcome = false;
+            }
+        }
+        return outcome;
+    }
+
+    // Caller holds walkLock.
+    private void sayOwed() {
         List<WorldPrint.Region> wanted = owed();
         if (!wanted.isEmpty()) {
             say(WorldPrint.saying(wanted));
         }
-        if (refused) {
-            say(refusedRow);
-        }
+        say(refusedRowReason(asked, remaining, refusedRows));
     }
 
-    // Asks what this account still owes, then says the walk's line. Ground pool's worker,
-    // called only from filed(); no lock during the post, walkLock for the write after.
+    // Caller holds walkLock.
+    private void sayWalk() {
+        List<WorldPrint.Region> wanted = owed();
+        List<String> left = remaining;
+        say(wanted.isEmpty() && left != null && !left.isEmpty()
+                ? unwalkable(asked, left, refusedRows)
+                : WorldPrint.saying(wanted));
+    }
+
     private void standingAsk(ShareSender.Transport transport, URI atCollector,
                              String forServer,
                              java.util.function.Supplier<URI> liveCollector,
-                             ShareSender.Identity identity, boolean refused) {
+                             ShareSender.Identity identity) {
         List<String> left = standingReply(transport, atCollector, forServer, identity);
+        Outcome said = standingOutcome;
         synchronized (walkLock) {
             if (stillWalking(atCollector, forServer, liveCollector)) {
-                if (left != null) {
-                    remaining = left;
-                }
-                sayOwed(refused);
+                fileStanding(said, left);
+                sayOwed();
             }
         }
     }
 
-    // Signs and posts the standing ask; returns the list it names, or null if unreadable.
-    // Ground pool's worker, no lock.
+    private boolean standingAgain(ShareSender.Transport transport, URI atCollector,
+                                  String forServer,
+                                  java.util.function.Supplier<URI> liveCollector,
+                                  ShareSender.Identity identity) {
+        List<String> left = standingReply(transport, atCollector, forServer, identity);
+        Outcome said = standingOutcome;
+        boolean outcome;
+        synchronized (walkLock) {
+            if (standingDue && stillWalking(atCollector, forServer, liveCollector)) {
+                List<WorldPrint.Region> before = owed();
+                fileStanding(said, left);
+                if (!owed().equals(before)) {
+                    sayWalk();
+                }
+            }
+            outcome = asked != null;
+        }
+        return outcome;
+    }
+
+    // Caller holds walkLock; left is null unless said is LISTED.
+    private void fileStanding(Outcome said, List<String> left) {
+        switch (said) {
+            case LISTED -> {
+                remaining = left;
+                standingDue = false;
+            }
+            case AGAIN -> standingDue = true;
+            case SHUT -> {
+                standingDue = false;
+                standingShut = true;
+            }
+            case UNPROVEN -> {
+                standingDue = false;
+                standingShut = true;
+                standingUnproven = true;
+            }
+        }
+    }
+
+    // Null unless a 2xx reply carries a list.
     private List<String> standingReply(ShareSender.Transport transport, URI atCollector,
                                        String forServer, ShareSender.Identity identity) {
         ShareSender.ReplySink sink = heldReply(spareStandingReply);
@@ -418,25 +553,48 @@ final class GroundWalk {
         WorldAsk.AnswerHolder said = heldStandingAnswer();
         List<String> left;
         try {
-            StandingAsk.body(forServer, System.currentTimeMillis(), WorldPrint.nonce(), body);
+            StandingAsk.body(forServer, utc.nowMillis(), WorldPrint.nonce(), body);
             standingSigner.set(body.bytes(), body.length());
             byte[] signature = identity.signer().sign(standingSigner);
             byte[] message = SignedBatch.encodeInto(spareStandingMessage.getAndSet(null),
                     identity.credential(), signature, body.bytes(), body.length());
-            transport.answer(standingEndpointFor(atCollector), message, sink);
+            ShareSender.Reply reply = transport.answer(standingEndpointFor(atCollector), message, sink);
 
-            // Returned normally: read the sink, then hand it back.
             sink.answer(said);
             spareStandingMessage.set(message);
             spareStandingReply.set(sink);
-            left = said.listed() ? said.names() : null;
+            standingOutcome = standingOf(reply.status(), said.listed());
+            left = standingOutcome == Outcome.LISTED ? said.names() : null;
         } catch (IOException | RuntimeException unreachable) {
-            // On failure the sink is dropped, not reused.
+            standingOutcome = Outcome.AGAIN;
             left = null;
         }
         spareStandingBody.set(body);
         spareStandingAnswer.set(said);
         return left;
+    }
+
+    private static Outcome standingOf(int status, boolean listed) {
+        Outcome answer;
+        if (successful(status)) {
+            answer = listed ? Outcome.LISTED : Outcome.SHUT;
+        } else if (sendAgainLater(status)) {
+            answer = Outcome.AGAIN;
+        } else if (status == HTTP_UNAUTHORIZED) {
+            answer = Outcome.UNPROVEN;
+        } else {
+            answer = Outcome.SHUT;
+        }
+        return answer;
+    }
+
+    private static boolean successful(int status) {
+        return status / HTTP_STATUS_CLASS == HTTP_SUCCESS_CLASS;
+    }
+
+    private static boolean sendAgainLater(int status) {
+        return status / HTTP_STATUS_CLASS == HTTP_SERVER_ERROR_CLASS
+                || status == HTTP_TOO_MANY_REQUESTS;
     }
 
     private StandingAsk.Body heldBody() {
@@ -459,7 +617,7 @@ final class GroundWalk {
         return held.endpoint();
     }
 
-    // The regions still to walk, in the operator's order.
+    // In the operator's order.
     List<WorldPrint.Region> owed() {
         List<WorldPrint.Region> list = asked;
         List<String> left = remaining;
@@ -510,8 +668,6 @@ final class GroundWalk {
         }
     }
 
-    // Whether the walk is finished; both the owed list and remaining must be empty, not
-    // just one.
     boolean proven() {
         List<WorldPrint.Region> at = asked;
         if (at == null) {
@@ -521,14 +677,12 @@ final class GroundWalk {
         return WorldPrint.owesNothing(at, left) && (left == null || left.isEmpty());
     }
 
-    // What to show the player. The trouble (why) is appended to the instruction (where),
-    // not substituted; a finished walk carries neither.
     String saying() {
         String why = trouble;
         List<WorldPrint.Region> at = asked;
         List<WorldPrint.Region> nowOwed = at == null ? List.of() : owed();
         List<String> left = remaining;
-        String refused = refusedRow;
+        List<String> refused = refusedRows;
         Said held = saidCache.get();
         if (held != null && held.why() == why && held.asked() == at
                 && held.owed() == nowOwed && held.left() == left && held.refused() == refused) {
@@ -541,33 +695,99 @@ final class GroundWalk {
 
     private String composeSaying(String why, List<WorldPrint.Region> at,
                                  List<WorldPrint.Region> owed, List<String> left,
-                                 String refused) {
+                                 List<String> refused) {
         String saying;
         if (at == null) {
             saying = why == null ? "Checking what this collector asks for." : why;
         } else if (owed.isEmpty() && left != null && !left.isEmpty()) {
-            if (refused != null) {
-                saying = refused;
-            } else {
-                saying = "The collector is asking for ground this client was not told about."
-                        + " Reconnect to pick it up.";
-            }
+            saying = unwalkable(at, left, refused);
         } else {
-            String instruction = WorldPrint.saying(owed);
+            String instruction = flat(WorldPrint.saying(owed));
+            String reason = refusedRowReason(at, left, refused);
             if (why == null || owed.isEmpty()) {
-                saying = refused == null ? instruction : instruction + " " + refused;
+                saying = reason == null ? instruction : instruction + "\n" + reason;
             } else {
-                saying = refused == null
-                        ? instruction + " " + why
-                        : instruction + " " + why + " " + refused;
+                saying = reason == null
+                        ? instruction + "\n" + why
+                        : instruction + "\n" + why + "\n" + reason;
             }
         }
         return saying;
     }
 
-    // Reads an owed region the player is standing in. Tick thread only.
-    // An incomplete reading is dropped, not parked: a partial read is a different
-    // signature, not a worse one. Throttled separately from the parked-answer check.
+    // A name from a collector stays on its line; only this class puts a line break in a line.
+    private static String flat(String text) {
+        return text.replace('\n', ' ').replace('\r', ' ');
+    }
+
+    private static String refusedRowReason(List<WorldPrint.Region> list, List<String> left,
+                                           List<String> refused) {
+        return refusedStillListed(list, left, refused) ? REFUSED_ROW : null;
+    }
+
+    // The line for listed ground with no rectangle to walk.
+    private static String unwalkable(List<WorldPrint.Region> list, List<String> left,
+                                     List<String> refused) {
+        return refusedStillListed(list, left, refused) ? REFUSED_ROW : NOT_TOLD;
+    }
+
+    // A null left means no answer.
+    private static boolean refusedStillListed(List<WorldPrint.Region> list, List<String> left,
+                                              List<String> refused) {
+        boolean listed;
+        if (refused.isEmpty() || list == null) {
+            listed = false;
+        } else if (left == null) {
+            listed = true;
+        } else {
+            listed = namesAny(refused, left) || (holdsUnnamed(refused) && unplaced(list, left));
+        }
+        return listed;
+    }
+
+    // Matching ignores case, as in WorldPrint.owing.
+    private static boolean namesAny(List<String> refused, List<String> left) {
+        boolean found = false;
+        int rows = refused.size();
+        int names = left.size();
+        for (int i = 0; i < rows && !found; i++) {
+            String refusedName = refused.get(i);
+            for (int j = 0; j < names && !found && !refusedName.isEmpty(); j++) {
+                found = refusedName.equalsIgnoreCase(left.get(j));
+            }
+        }
+        return found;
+    }
+
+    private static boolean holdsUnnamed(List<String> refused) {
+        boolean found = false;
+        int rows = refused.size();
+        for (int i = 0; i < rows && !found; i++) {
+            found = refused.get(i).isEmpty();
+        }
+        return found;
+    }
+
+    private static boolean unplaced(List<WorldPrint.Region> list, List<String> left) {
+        boolean missing = false;
+        int names = left.size();
+        for (int i = 0; i < names && !missing; i++) {
+            missing = !carries(list, left.get(i));
+        }
+        return missing;
+    }
+
+    // Matching ignores case, as in WorldPrint.owing.
+    private static boolean carries(List<WorldPrint.Region> list, String name) {
+        boolean found = false;
+        int rows = list.size();
+        for (int i = 0; i < rows && !found; i++) {
+            found = list.get(i).name().equalsIgnoreCase(name);
+        }
+        return found;
+    }
+
+    // Tick thread only.
     void near(Level level, String atServer, String atDimension, int x, int z) {
         if (level == null || atServer == null || !atServer.equals(server)) {
             return;
@@ -575,7 +795,6 @@ final class GroundWalk {
         if (parked.get() != null || reading != null) {
             return;
         }
-        long since = System.nanoTime();
         List<WorldPrint.Region> nearby = owedFor(atDimension);
         int nearbyCount = nearby.size();
         boolean armed = false;
@@ -584,10 +803,9 @@ final class GroundWalk {
             if (!region.holds(x, z)) {
                 continue;
             }
+            long since = clock.getAsLong();
             java.util.concurrent.atomic.AtomicLong last = lastRead.get(region.name());
-            if (last != null && since - last.get() < READ_AGAIN_NANOS) {
-                // continue, not return: two owed regions can overlap, so the next one
-                // still gets a chance.
+            if (last != null && since >= last.get() && since - last.get() < READ_AGAIN_NANOS) {
                 continue;
             }
             if (last == null) {
@@ -595,7 +813,6 @@ final class GroundWalk {
             } else {
                 last.set(since);
             }
-            // Arms a sliced job; the actual read happens in readMore(), a chunk at a time.
             reading = WorldHandshake.begin(region);
             readingFor = atServer;
             readingIn = atDimension;
@@ -605,7 +822,7 @@ final class GroundWalk {
         }
     }
 
-    // Reads a little more of the armed rectangle, a chunk per call. Tick thread only.
+    // Tick thread only.
     Step readMore(Level level, Tick tick) {
         WorldHandshake.Progress open = reading;
         if (open == null || level == null) {
@@ -631,7 +848,7 @@ final class GroundWalk {
                 dropReading();
                 readingTrouble(belongsTo, via, "This ground could not be read (see the log).", false);
                 LOGGER.warn("geosurvey could not read the ground for the region {}."
-                        + " Nothing lost. The walk retries.",
+                        + " Nothing is lost; the walk retries.",
                         open.region().name(), broke);
             }
             if (!stepBroke) {
@@ -653,12 +870,12 @@ final class GroundWalk {
                             }
                         }
                     } else if (got.obfuscated() > 0) {
-                        String hidden = "This server hides its bedrock. This ground cannot be read. "
+                        String hidden = "This ground cannot be read: this server hides its bedrock. "
                                 + "Ask the operator about anti-xray.";
                         readingTrouble(belongsTo, via, hidden, true);
                     } else {
-                        String shortRead = "This ground was not all loaded when read: the reading"
-                                + " came up short. Keep the whole region in view and walk it again.";
+                        String shortRead = "This ground was not all loaded."
+                                + " Keep the whole region in view and walk it again.";
                         readingTrouble(belongsTo, via, shortRead, true);
                     }
                 }
@@ -683,7 +900,7 @@ final class GroundWalk {
         }
     }
 
-    // Closes an open reading and every stamp that identified it. Tick thread only.
+    // Tick thread only.
     private void dropReading() {
         reading = null;
         readingFor = null;
@@ -696,7 +913,7 @@ final class GroundWalk {
         dropReading();
     }
 
-    // Posts a parked answer, if there is one. Share thread only.
+    // Share thread only.
     void beat(ShareSender.Transport transport, URI atCollector,
               ShareSender.Identity me) {
         beat(transport, atCollector, () -> this.collector, me);
@@ -732,7 +949,7 @@ final class GroundWalk {
         try {
             byte[] body = WorldProof.encodeInto(spareBody.getAndSet(null), answer.server(),
                     answer.region().name(), me.credential().player(), nonce,
-                    answer.signature(), System.currentTimeMillis());
+                    answer.signature(), utc.nowMillis());
             built = true;
             proofSigner.set(body);
             byte[] signature = me.signer().sign(proofSigner);
@@ -741,7 +958,7 @@ final class GroundWalk {
             spareBody.set(body);
         } catch (IOException | RuntimeException notSendable) {
             LOGGER.warn("geosurvey could not build the ground proof for the region"
-                    + " {}. Nothing lost. The walk retries.",
+                    + " {}. Nothing is lost; the walk retries.",
                     answer.region().name(), notSendable);
             synchronized (walkLock) {
                 if (stillWalking(atCollector, answer.server(), liveCollector)) {
@@ -761,6 +978,9 @@ final class GroundWalk {
     private void postProof(ShareSender.Transport transport, URI atCollector,
                            java.util.function.Supplier<URI> liveCollector, Parked answer,
                            byte[] message) {
+        if (Thread.currentThread().isInterrupted()) {
+            return;
+        }
         ShareSender.ReplySink sink = heldReply(spareReply);
         try {
             ShareSender.Reply reply = transport.answer(proofEndpointFor(atCollector),
@@ -770,11 +990,10 @@ final class GroundWalk {
             spareReply.set(sink);
 
             if (stillWalking(atCollector, answer.server(), liveCollector)) {
-                if (proofAnswer.listed()) {
+                if (successful(reply.status()) && proofAnswer.listed()) {
                     repliedWithList(answer, atCollector, liveCollector, proofAnswer.names());
                 } else {
-                    repliedWithoutList(answer, atCollector, liveCollector, reply,
-                            proofAnswer.accepted());
+                    repliedWithoutList(answer, atCollector, liveCollector, reply, proofAnswer);
                 }
             }
         } catch (IOException | RuntimeException unreachable) {
@@ -787,7 +1006,7 @@ final class GroundWalk {
         }
     }
 
-    // Takes slot's sink (or makes one) and resets it. The caller alone sets it back.
+    // The caller alone returns the sink to slot.
     private ShareSender.ReplySink heldReply(AtomicReference<ShareSender.ReplySink> slot) {
         ShareSender.ReplySink held = slot.getAndSet(null);
         if (held == null) {
@@ -814,6 +1033,7 @@ final class GroundWalk {
             if (stillWalking(atCollector, answer.server(), liveCollector)) {
                 parked.compareAndSet(answer, null);
                 remaining = left;
+                standingDue = false;
 
                 List<WorldPrint.Region> stillOwed = owed();
                 String askedName = answer.region().name();
@@ -824,15 +1044,18 @@ final class GroundWalk {
                 }
                 if (!stillWanted) {
                     trouble = null;
-                    say(stillOwed.isEmpty() && !left.isEmpty()
-                            ? (refusedRow != null ? refusedRow
-                                    : "The collector is asking for ground this client was"
-                                            + " not told about. Reconnect to pick it up.")
-                            : WorldPrint.accepted(answer.region().name(), stillOwed));
+                    if (stillOwed.isEmpty() && !left.isEmpty()) {
+                        say(unwalkable(asked, left, refusedRows));
+                    } else if (stillOwed.size() > 1) {
+                        say(WorldPrint.acceptedAt(answer.region().name()));
+                        say(WorldPrint.leftToWalk(stillOwed));
+                    } else {
+                        say(WorldPrint.accepted(answer.region().name(), stillOwed));
+                    }
                 } else {
                     String stillOwedLine = "The collector took that reading and still asks for "
-                            + ShareCommand.drawable(askedName) + ". Its records may name that"
-                            + " ground twice. Ask the operator.";
+                            + ShareCommand.drawable(askedName) + "."
+                            + " Ask the operator.";
                     trouble = stillOwedLine;
                     say(stillOwedLine);
                 }
@@ -842,31 +1065,43 @@ final class GroundWalk {
 
     private void repliedWithoutList(Parked answer, URI atCollector,
                                     java.util.function.Supplier<URI> liveCollector,
-                                    ShareSender.Reply reply, boolean took) {
+                                    ShareSender.Reply reply, WorldAsk.AnswerHolder said) {
+        int status = reply.status();
+        boolean took = successful(status) && said.accepted();
         synchronized (walkLock) {
             if (stillWalking(atCollector, answer.server(), liveCollector)) {
-                // 404: a legacy node, not a fault.
-                if (reply.status() == NOT_FOUND_STATUS) {
+                if (status == NOT_FOUND_STATUS) {
                     parked.compareAndSet(answer, null);
                     asked = null;
                     remaining = null;
-                    refusedRow = null;
-                    String noRouteLine = "The collector has no ground route (404). It cannot take"
-                            + " the reading it asked for. This client is asking it again.";
+                    refusedRows = List.of();
+                    standingDue = false;
+                    String noRouteLine = "The collector has no ground route (404)."
+                            + " This client asks the collector again.";
                     trouble = noRouteLine;
                     say(noRouteLine);
                 } else if (took) {
                     parked.compareAndSet(answer, null);
-                    String unreadableListLine = "The collector took that reading. This client cannot read its"
-                            + " list of what is still owed. Ask the operator.";
+                    String unreadableListLine = "The collector took that reading, but this client cannot read"
+                            + " what is still owed. Ask the operator.";
                     trouble = unreadableListLine;
                     say(unreadableListLine);
+                } else if (successful(status) && !said.refused()) {
+                    parked.compareAndSet(answer, null);
+                    String unreadableReplyLine = "This client cannot read the collector's reply ("
+                            + status + ").";
+                    trouble = unreadableReplyLine;
+                    say(unreadableReplyLine);
                 } else {
                     String refusalLine = "The collector did not accept that reading ("
-                            + reply.status() + ").";
+                            + status + ").";
                     trouble = refusalLine;
                     say(refusalLine);
-                    rePark(answer);
+                    if (sendAgainLater(status)) {
+                        rePark(answer);
+                    } else {
+                        parked.compareAndSet(answer, null);
+                    }
                 }
             }
         }
@@ -875,6 +1110,7 @@ final class GroundWalk {
         int nextTries = answer.tries() + 1;
         if (nextTries >= MAX_POST_TRIES) {
             parked.compareAndSet(answer, null);
+            say("The proof could not be sent.");
             return;
         }
         postRetryAt.set(clock.getAsLong() + POST_BACKOFF_NANOS * nextTries);

@@ -3,7 +3,7 @@ package dev.openmap.map;
 import dev.openmap.symbol.Affiliation;
 import dev.openmap.symbol.SymbolIcon;
 
-// A named point the player has plotted.
+// A named point the player plotted.
 public final class Landmark {
 
     // Longest name drawn, in glyphs.
@@ -20,11 +20,14 @@ public final class Landmark {
     // ARGB; 0 means the default.
     private int colour;
 
-    // Whose it is (MIL-STD-2525). May be null.
+    // May be null.
     private Affiliation affiliation;
 
-    // Null means a plain point of interest.
+    // Null means a plain point.
     private SymbolIcon icon;
+
+    // Null when the marker is not shared.
+    private String shared;
 
     // For JsonBind.
     @SuppressWarnings("unused")
@@ -71,6 +74,10 @@ public final class Landmark {
         return icon;
     }
 
+    public String shared() {
+        return shared;
+    }
+
     void setName(String newName) {
         name = newName == null ? "" : newName;
         normalise();
@@ -91,7 +98,11 @@ public final class Landmark {
         normalise();
     }
 
-    // Distance in blocks, squared. Saturates; never wraps negative.
+    void setShared(String newShared) {
+        shared = newShared;
+    }
+
+    // Squared distance in blocks; saturates, never wraps.
     public long distanceSquared(int fromX, int fromZ) {
         long dx = (long) x - fromX;
         long dz = (long) z - fromZ;
@@ -102,7 +113,7 @@ public final class Landmark {
         return sum < 0 ? Long.MAX_VALUE : sum;
     }
 
-    // The largest value whose square still fits in a long.
+    // The largest value whose square fits a long.
     private static final long WIDEST_EXACT_ROOT = 3_037_000_499L;
 
     private static boolean saturatesWhenSquared(long v) {
@@ -113,7 +124,7 @@ public final class Landmark {
         return saturatesWhenSquared(v) ? Long.MAX_VALUE : v * v;
     }
 
-    // Clamps a hand-edited entry into something drawable.
+    // Makes the entry drawable.
     public Landmark normalise() {
         name = LabelText.clean(name, MAX_NAME, LabelText.UNBOUNDED_READ, false).trim();
         if (name.isBlank()) {

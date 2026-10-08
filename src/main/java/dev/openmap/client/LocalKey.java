@@ -3,6 +3,7 @@ package dev.openmap.client;
 import dev.sandpaper.core.Background;
 import dev.openmap.LandNav;
 import dev.openmap.share.Attestation;
+import dev.openmap.share.UtcClock;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.OverlappingFileLockException;
@@ -44,7 +45,7 @@ import java.util.concurrent.atomic.AtomicReference;
 final class LocalKey {
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
     static final String FILE_NAME = "geosurvey-identity.key";
 
@@ -91,7 +92,9 @@ final class LocalKey {
     private static final AtomicReference<CompletableFuture<KeyPair>> LOADING =
             new AtomicReference<>();
 
-    // On nanoTime's clock, not the wall clock.
+    private static volatile StoppableWorkers.Registration attemptsRegistration = null;
+
+    // A nanoTime value.
     private static volatile long nextAttemptAt;
 
     private static volatile byte[] publicKey;
@@ -102,21 +105,17 @@ final class LocalKey {
 
     private static volatile boolean announced;
 
-    // The last failure class logged; null before the first one.
     private static volatile String warnedUnusable;
 
-    // The last signing-failure class logged; null before the first one.
     private static volatile String warnedSigning;
 
-    // The key and player nextMintAttemptAt applies to; null until a signing attempt fails.
     private static volatile KeyPair mintAttemptKey;
 
     private static volatile UUID mintAttemptPlayer;
 
-    // On the same clock as nextAttemptAt (nanoTime).
+    // A nanoTime value.
     private static volatile long nextMintAttemptAt;
 
-    // The folder sweepLeftovers last scanned; null before the first scan.
     private static volatile Path sweptFolder;
 
     private LocalKey() {
@@ -136,7 +135,6 @@ final class LocalKey {
         }
         if (pair == mintAttemptKey && player.equals(mintAttemptPlayer)
                 && nextMintAttemptAt - System.nanoTime() > 0) {
-            // Subtraction, not <: nanoTime can wrap.
             return null;
         }
         ShareSender.Identity made = mint(pair, player);
@@ -147,11 +145,11 @@ final class LocalKey {
     private static boolean usable(ShareSender.Identity held, UUID player) {
         Attestation.Credential credential = held.credential();
         return credential.player().equals(player)
-                && System.currentTimeMillis()
+                && UtcClock.collector().nowMillis()
                         < credential.expiresAt().toEpochMilli() - REMINT_WITHIN_MILLIS;
     }
 
-    // The key pair once ready, else null; the caller must ask again later.
+    // Null until ready.
     private static KeyPair keyPair() {
         CompletableFuture<KeyPair> started = LOADING.get();
         if (started != null) {
@@ -163,7 +161,6 @@ final class LocalKey {
                 return made;
             }
             if (nextAttemptAt - System.nanoTime() > 0) {
-                // Subtraction, not <: nanoTime can wrap.
                 return null;
             }
         }
@@ -181,8 +178,7 @@ final class LocalKey {
                 if (!kind.equals(warnedUnusable)) {
                     warnedUnusable = kind;
                     LOGGER.warn("geosurvey could not prepare its local identity key."
-                            + " Retries every " + RETRY_AFTER_SECONDS + " seconds."
-                            + "",
+                            + " Retries every " + RETRY_AFTER_SECONDS + " seconds.",
                             unexpected);
                 }
             } finally {
@@ -192,11 +188,26 @@ final class LocalKey {
                 fresh.complete(made);
             }
         };
+        registerAttempts();
         ATTEMPTS.execute(making);
         return null;
     }
 
+    private static void registerAttempts() {
+        if (attemptsRegistration != null) {
+            return;
+        }
+        synchronized (LocalKey.class) {
+            if (attemptsRegistration == null) {
+                attemptsRegistration = StoppableWorkers.executor("geosurvey-identity", ATTEMPTS);
+            }
+        }
+    }
+
     private static KeyPair loadOrCreate() {
+        if (Thread.currentThread().isInterrupted()) {
+            return null;
+        }
         Path file = keyFile();
         sweepLeftovers(file);
         KeyPair loaded;
@@ -204,6 +215,8 @@ final class LocalKey {
             OptionalLong size = presentSize(file);
             if (size.isPresent()) {
                 loaded = read(file, size.getAsLong());
+            } else if (Thread.currentThread().isInterrupted()) {
+                loaded = null;
             } else {
                 try {
                     loaded = create(file);
@@ -219,11 +232,9 @@ final class LocalKey {
             if (!kind.equals(warnedUnusable)) {
                 warnedUnusable = kind;
                 LOGGER.warn("geosurvey could not open its local identity key at " + file
-                        + ". No replacement is minted."
-                        + ""
-                        + " Retries every "
-                        + RETRY_AFTER_SECONDS + " seconds."
-                        + "", noKey);
+                        + ". No replacement is minted;"
+                        + " retries every "
+                        + RETRY_AFTER_SECONDS + " seconds.", noKey);
             }
             loaded = null;
         }
@@ -267,26 +278,25 @@ final class LocalKey {
                     try {
                         if (Files.deleteIfExists(name)) {
                             LOGGER.info("geosurvey removed {}."
-                                    + " It could hold a copy of the key."
-                                    + " Nothing reads it."
-                                    + "", name);
+                                    + " It could hold a copy"
+                                    + " of the key.", name);
                         }
                     } catch (IOException | RuntimeException leftBehind) {
                         LOGGER.warn("geosurvey could not remove {}"
                                 + " ({}). Nothing reads it;"
-                                + " safe to delete by hand.", name, leftBehind.toString());
+                                + " safe to delete.", name, leftBehind.toString());
                     }
                 }
             } catch (IOException vanished) {
             } catch (RuntimeException leftBehind) {
                 LOGGER.warn("geosurvey could not remove {}"
                         + " ({}). Nothing reads it;"
-                        + " safe to delete by hand.", name, leftBehind.toString());
+                        + " safe to delete.", name, leftBehind.toString());
             }
         }
     }
 
-    // Deletes the file if present but empty; otherwise returns its size.
+    // Deletes an empty file.
     private static OptionalLong presentSize(Path file) throws IOException {
         OptionalLong size;
         try {
@@ -315,15 +325,15 @@ final class LocalKey {
             throws IOException, GeneralSecurityException {
         if (size > MAX_FILE) {
             throw new IOException("the identity key file is " + size + " bytes, over"
-                    + " the " + MAX_FILE + "-byte ceiling - this wants a private key,"
-                    + " not an archive");
+                    + " the " + MAX_FILE + "-byte"
+                    + " ceiling");
         }
         KeyFactory rsa = KeyFactory.getInstance("RSA");
         PrivateKey held = rsa.generatePrivate(
                 new PKCS8EncodedKeySpec(Files.readAllBytes(file)));
         if (!(held instanceof RSAPrivateCrtKey crt)) {
-            throw new GeneralSecurityException("the stored key has no public half."
-                    + " Its credential cannot be checked.");
+            throw new GeneralSecurityException("the stored key has no public"
+                    + " half.");
         }
         PublicKey half = rsa.generatePublic(
                 new RSAPublicKeySpec(crt.getModulus(), crt.getPublicExponent()));
@@ -364,7 +374,7 @@ final class LocalKey {
             } catch (IOException leftBehind) {
                 LOGGER.warn("geosurvey could not remove {}"
                         + " ({}). Nothing reads it;"
-                        + " safe to delete by hand.", staging, leftBehind.toString());
+                        + " safe to delete.", staging, leftBehind.toString());
             }
         }
         return pair;
@@ -437,12 +447,12 @@ final class LocalKey {
             channel.close();
         } catch (IOException | RuntimeException closed) {
             LOGGER.warn("geosurvey could not close its local identity key file"
-                    + " ({}). The lock releases with the channel"
-                    + " when this process ends.", closed.toString());
+                    + " ({}). The lock stays"
+                    + " until this process ends.", closed.toString());
         }
     }
 
-    // Returns what is actually on disk; may differ from mine if another process won the race.
+    // Returns the key pair on disk, possibly another process's.
     private static KeyPair wonFallbackRace(Path file, KeyPair mine)
             throws IOException, GeneralSecurityException {
         KeyPair onDisk = read(file);
@@ -454,7 +464,7 @@ final class LocalKey {
 
     private static ShareSender.Identity mint(KeyPair pair, UUID player) {
         byte[] encoded = pair.getPublic().getEncoded();
-        Instant expiresAt = Instant.now().plus(LIFETIME);
+        Instant expiresAt = Instant.ofEpochMilli(UtcClock.collector().nowMillis()).plus(LIFETIME);
         byte[] keySignature;
         ShareSender.Identity identity;
         try {
@@ -475,9 +485,8 @@ final class LocalKey {
             if (!kind.equals(warnedSigning)) {
                 warnedSigning = kind;
                 LOGGER.warn("geosurvey's local identity key could not sign its credential."
-                        + " Nothing is contributed under it."
-                        + " Retries on the next scan."
-                        + "", cannotSign);
+                        + " Nothing is contributed under it;"
+                        + " retries on the next scan.", cannotSign);
             }
 
             unusable = "the local identity key could not sign for itself (see the log)";
@@ -494,11 +503,10 @@ final class LocalKey {
             return;
         }
         announced = true;
-        LOGGER.info("geosurvey is contributing under a local key, held"
-                + " at {}. A collector needs manual trust,"
+        LOGGER.info("A collector needs manual trust of the local key"
+                + " at {},"
                 + " or turn on Prove this account to the"
                 + " collector."
-                + ""
                 + " Fingerprint: {}",
                 keyFile(), fingerprint());
     }

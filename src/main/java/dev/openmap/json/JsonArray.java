@@ -5,7 +5,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
-// getAsLong, getAsString and similar accessors throw UnsupportedOperationException here.
+// getAsLong, getAsString and similar throw UnsupportedOperationException here.
 public final class JsonArray implements JsonElement, Iterable<JsonElement> {
 
     private final List<JsonElement> items;
@@ -23,7 +23,7 @@ public final class JsonArray implements JsonElement, Iterable<JsonElement> {
         return this;
     }
 
-    // A Java null becomes JsonNull.
+    // null becomes JsonNull.
     public void add(JsonElement value) {
         items.add(value == null ? JsonNull.INSTANCE : value);
     }

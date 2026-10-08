@@ -176,8 +176,8 @@ public record Presence(
             int left = body.remaining();
             if (left != 0) {
                 throw new IOException(left
-                        + " bytes after the report."
-                        + " Refusing it.");
+                        + " extra bytes"
+                        + " after the report.");
             }
             decoded = new Presence(server, dimension, by, name, sent, x, z, ticks,
                     storm, thunder);
@@ -190,7 +190,7 @@ public record Presence(
     private static void clean(String value, String what) {
         if (!value.equals(LabelText.clean(value, LabelText.UNBOUNDED_READ,
                 LabelText.UNBOUNDED_READ, false))) {
-            throw new IllegalArgumentException(what + " has a character this reader"
+            throw new IllegalArgumentException(what + " has characters this reader"
                     + " rejects.");
         }
     }

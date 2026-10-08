@@ -1,8 +1,9 @@
 package dev.openmap.map;
 
+import dev.openmap.api.GroundChunk;
 import java.util.Arrays;
 
-public final class ChunkSample {
+public final class ChunkSample implements GroundChunk {
 
     public static final int SIZE = 16;
     public static final int COLUMNS = SIZE * SIZE;
@@ -11,20 +12,23 @@ public final class ChunkSample {
 
     private static final int INSTANCE_BYTES = 64;
 
-    public final int chunkX;
-    public final int chunkZ;
+    private static final int OVERWORLD_FLOOR = -64;
+
+    private static final int NETHER_END_FLOOR = 0;
+
+    private static final byte UNKNOWN_COVER = (byte) LandCover.UNKNOWN.code();
+
+    public int chunkX;
+    public int chunkZ;
 
     private final short[] heights;
     private final byte[] cover;
     private int unfilled;
 
-    // Current sample schema version. A bump re-queues chunks the player
-    // revisits: 9 added epoch-millisecond timestamps, 10 the BEDROCK,
-    // END_STONE, CRIMSON and SULFUR covers.
+    // Sample schema version; a bump re-queues revisited chunks.
     public static final int CAPTURE_VERSION = 10;
 
-    // First version whose capturedAt() is epoch milliseconds UTC; below it,
-    // Minecraft game ticks. Use hasWallClockCapture(), not the value's size.
+    // First version with capturedAt() in epoch milliseconds UTC.
     public static final int WALL_CLOCK_VERSION = 9;
 
     private long capturedAt;
@@ -50,6 +54,24 @@ public final class ChunkSample {
         return new ChunkSample(chunkX, chunkZ, false);
     }
 
+    public void resetForFullWriter(int chunkX, int chunkZ) {
+        this.chunkX = chunkX;
+        this.chunkZ = chunkZ;
+        unfilled = 0;
+        capturedAt = 0L;
+        captureVersion = CAPTURE_VERSION;
+    }
+
+    public ChunkSample copyForFullWriter() {
+        ChunkSample copy = forFullWriter(chunkX, chunkZ);
+        System.arraycopy(heights, 0, copy.heights, 0, COLUMNS);
+        System.arraycopy(cover, 0, copy.cover, 0, COLUMNS);
+        copy.unfilled = unfilled;
+        copy.capturedAt = capturedAt;
+        copy.captureVersion = captureVersion;
+        return copy;
+    }
+
     private static int index(int localX, int localZ) {
         if (((localX | localZ) & ~(SIZE - 1)) != 0) {
             throw new IndexOutOfBoundsException("column " + localX + "," + localZ);
@@ -66,7 +88,7 @@ public final class ChunkSample {
         } else if (was != NO_HEIGHT && now == NO_HEIGHT) {
             unfilled++;
         } else {
-            // Unchanged fill state: unfilled does not move.
+            // Unchanged fill state.
         }
         heights[i] = now;
         cover[i] = (byte) landCover.code();
@@ -87,8 +109,7 @@ public final class ChunkSample {
         unfilled = missing;
     }
 
-    // Writes COLUMNS big-endian heights, then COLUMNS cover ordinals, at
-    // the given offset.
+    // Writes COLUMNS big-endian heights, then cover ordinals, from offset at.
     void copyColumnsInto(byte[] into, int at) {
         int coverBase = at + COLUMNS * Short.BYTES;
         for (int i = 0; i < COLUMNS; i++) {
@@ -108,6 +129,26 @@ public final class ChunkSample {
         System.arraycopy(cover, 0, coverBytes, 0, COLUMNS);
     }
 
+    @Override
+    public int chunkX() {
+        return chunkX;
+    }
+
+    @Override
+    public int chunkZ() {
+        return chunkZ;
+    }
+
+    @Override
+    public void copyHeights(short[] into) {
+        System.arraycopy(heights, 0, into, 0, COLUMNS);
+    }
+
+    @Override
+    public void copyCoverCodes(byte[] into) {
+        System.arraycopy(cover, 0, into, 0, COLUMNS);
+    }
+
     public short height(int localX, int localZ) {
         return heights[index(localX, localZ)];
     }
@@ -124,34 +165,39 @@ public final class ChunkSample {
         return heights[index(localX, localZ)] != NO_HEIGHT;
     }
 
-    // Epoch milliseconds UTC at WALL_CLOCK_VERSION and above, game ticks
-    // below it, 0 or an import's mtime otherwise. Compare only within a
-    // domain; check hasWallClockCapture() first.
+    public boolean holdsGround() {
+        boolean holds = false;
+        for (int column = 0; column < COLUMNS && !holds; column++) {
+            int height = heights[column];
+            holds = cover[column] != UNKNOWN_COVER
+                    || (height > OVERWORLD_FLOOR && height != NETHER_END_FLOOR);
+        }
+        return holds;
+    }
+
+    // Epoch milliseconds UTC from WALL_CLOCK_VERSION; game ticks below it; 0 or an import's mtime otherwise.
+    @Override
     public long capturedAt() {
         return capturedAt;
     }
 
-    // Whether capturedAt() is a comparable wall time. False before
-    // WALL_CLOCK_VERSION: rank those as unknown age, never convert.
+    // False before WALL_CLOCK_VERSION: rank those as unknown age, never convert.
     public boolean hasWallClockCapture() {
         return isWallClock(captureVersion);
     }
 
-    // hasWallClockCapture() for a version read off the wire.
     public static boolean isWallClock(int captureVersion) {
         return captureVersion >= WALL_CLOCK_VERSION;
     }
 
-    // Lowest version the capture path ever wrote. Below it (0) is an
-    // import, not an older survey.
+    // Version 0 is an import.
     public static final int FIRST_SURVEY_VERSION = 1;
 
-    // Whether captureVersion means capturedAt() is Minecraft game ticks:
-    // the survey range below WALL_CLOCK_VERSION, not an import.
     public static boolean isGameTick(int captureVersion) {
         return captureVersion >= FIRST_SURVEY_VERSION && captureVersion < WALL_CLOCK_VERSION;
     }
 
+    @Override
     public int captureVersion() {
         return captureVersion;
     }
@@ -164,8 +210,7 @@ public final class ChunkSample {
         return captureVersion >= CAPTURE_VERSION;
     }
 
-    // Epoch milliseconds UTC when this build stamps it; the capture
-    // version says the domain when decoding older records.
+    // Epoch milliseconds UTC.
     public void setCapturedAt(long when) {
         this.capturedAt = when;
     }

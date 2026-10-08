@@ -32,7 +32,6 @@ public final class WorldMapping {
         return mapping;
     }
 
-    // The vanilla dimensions, with worlds derived from publishedFolder.
     public static WorldMapping openMapDefaults() {
         WorldMapping mapping = new WorldMapping();
         for (String dimension : new String[] {
@@ -43,7 +42,7 @@ public final class WorldMapping {
         return mapping;
     }
 
-    // The folder name an Open-Map node publishes for a dimension.
+    // The folder name an Open-Map node publishes.
     public static String publishedFolder(String dimensionId) {
         int end = retainedLength(dimensionId);
         if (end == 0) {
@@ -144,7 +143,6 @@ public final class WorldMapping {
         return dimensionByWorld.isEmpty();
     }
 
-    // Whether an address somebody typed names the server the client is on.
     public static boolean sameServer(String configured, String connected) {
         String configuredTrimmed = trimmed(configured);
         String host = hostOf(configuredTrimmed);
@@ -164,7 +162,7 @@ public final class WorldMapping {
         return same;
     }
 
-    // An address as an identity: the host, and the port where one is stated.
+    // The host, plus the port if one is stated.
     public static String normaliseAddress(String address) {
         String trimmed = trimmed(address);
         String host = hostOf(trimmed);
@@ -172,7 +170,7 @@ public final class WorldMapping {
         return portEnd < 0 ? host : trimmed.substring(0, portEnd);
     }
 
-    // The port an address states, or "" if it states none.
+    // The stated port, or "" if none.
     public static String portOf(String address) {
         String trimmed = trimmed(address);
         return portOf(trimmed, hostOf(trimmed));
@@ -184,7 +182,6 @@ public final class WorldMapping {
             return "";
         }
         int start = host.length() + 1;
-        // Digits, or nothing.
         boolean digits = start < trimmed.length();
         for (int i = start; digits && i < trimmed.length(); i++) {
             char c = trimmed.charAt(i);
@@ -217,7 +214,7 @@ public final class WorldMapping {
         return tail.toLowerCase(Locale.ROOT);
     }
 
-    // The host part of an address, lower-cased, with any port taken off.
+    // The lower-case host, with any port removed.
     public static String normaliseHost(String host) {
         return hostOf(trimmed(host));
     }

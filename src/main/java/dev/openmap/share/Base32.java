@@ -82,7 +82,6 @@ public final class Base32 {
 
     private static final int UNSIGNED_BYTE_MASK = 0xFF;
 
-    // -1 for every character the alphabet does not hold.
     private static final byte[] VALUE = new byte[ASCII_VALUE_LIMIT];
 
     static {
@@ -99,7 +98,6 @@ public final class Base32 {
     private Base32() {
     }
 
-    // The bytes as base 32, upper case, no padding.
     public static String encode(byte[] data) {
         if (data == null || data.length == 0) {
             return "";
@@ -142,7 +140,7 @@ public final class Base32 {
         return new String(out, java.nio.charset.StandardCharsets.ISO_8859_1);
     }
 
-    // The bytes, or null when the text is not base 32 this can read.
+    // The bytes, or null if this cannot read the text.
     public static byte[] decode(String text) {
         if (text == null) {
             return null;

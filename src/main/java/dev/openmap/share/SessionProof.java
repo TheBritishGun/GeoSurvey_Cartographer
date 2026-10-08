@@ -8,12 +8,12 @@ import java.time.Duration;
 
 public final class SessionProof {
 
-    // How much entropy a challenge carries.
+    // Entropy of a challenge.
     public static final int CHALLENGE_BYTES = 32;
 
     public static final int CHALLENGE_CHARACTERS = CHALLENGE_BYTES * 2;
 
-    // How long a collector keeps a challenge it has issued.
+    // How long a collector keeps a challenge.
     public static final Duration LIFETIME = Duration.ofMinutes(2);
 
     private static final int HEX_CHARACTERS_PER_BYTE = 2;
@@ -43,7 +43,7 @@ public final class SessionProof {
         return hex(bytes);
     }
 
-    // Whether a string is shaped like a challenge this class issued.
+    // Whether a string looks like a challenge.
     public static boolean readable(String challenge) {
         if (challenge == null || challenge.length() != CHALLENGE_CHARACTERS) {
             return false;
@@ -59,10 +59,10 @@ public final class SessionProof {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
     }
 
-    // The string both sides hand to Mojang, derived from the challenge and the fingerprint.
+    // The string both sides send to Mojang.
     public static String serverId(String challenge, String fingerprint) {
         if (challenge == null || fingerprint == null) {
-            throw new IllegalArgumentException("a session proof needs both halves");
+            throw new IllegalArgumentException("challenge and fingerprint are required");
         }
         MessageDigest digest = SHA_1.get();
         digest.reset();

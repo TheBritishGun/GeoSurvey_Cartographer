@@ -1,8 +1,6 @@
 package dev.openmap.json;
 
-// A number or string that cannot parse: NumberFormatException.
-// getAsString on an object, array or null: UnsupportedOperationException.
-// getAsJsonObject/getAsJsonArray on the wrong kind: IllegalStateException.
+// Unparsable number or string: NumberFormatException.
 // JsonObject.getAsJsonArray(name) on the wrong kind: ClassCastException.
 public sealed interface JsonElement permits JsonObject, JsonArray, JsonPrimitive, JsonNull {
 
@@ -34,7 +32,7 @@ public sealed interface JsonElement permits JsonObject, JsonArray, JsonPrimitive
         throw new IllegalStateException("not a JSON primitive: " + JsonText.describe(this));
     }
 
-    // For a number, the literal as written, not a reformatting.
+    // For a number, the literal as written.
     default String getAsString() {
         throw new UnsupportedOperationException("not a JSON primitive: " + JsonText.describe(this));
     }

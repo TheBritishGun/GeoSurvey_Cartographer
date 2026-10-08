@@ -2,6 +2,7 @@ package dev.openmap.share;
 
 import dev.openmap.json.JsonArray;
 import dev.openmap.json.JsonElement;
+import dev.openmap.json.NumberGrammar;
 import dev.openmap.json.JsonObject;
 import dev.openmap.json.JsonParser;
 import java.io.IOException;
@@ -50,11 +51,11 @@ public final class Directory {
 
     public interface Ask {
 
-        // Null when nothing readable is there.
+        // Null when nothing is readable.
         String get(String address) throws IOException;
     }
 
-    // published never includes a seed's own address.
+    // published excludes a seed's own address.
     public record Found(List<String> published, List<String> answered,
                         List<String> contributedNothing, boolean cutShort) {
 
@@ -173,7 +174,7 @@ public final class Directory {
             if (parsed != null && parsed.isJsonObject()) {
                 JsonObject parsedDocument = parsed.getAsJsonObject();
                 JsonElement version = parsedDocument.get("version");
-                if (version != null && exactInteger(version) == VERSION) {
+                if (WireVersion.is(version, VERSION)) {
                     document = parsedDocument;
                 } else {
                     document = null;
@@ -187,26 +188,13 @@ public final class Directory {
         return document;
     }
 
-    static long exactInteger(JsonElement value) {
-        if (value == null || !value.isJsonPrimitive()) {
-            return NO_EXACT_INTEGER;
-        }
-        return exactIntegerOf(value.getAsString());
-    }
-
     static long exactIntegerOf(String text) {
         if (text == null) {
             return NO_EXACT_INTEGER;
         }
-        long exact = NO_EXACT_INTEGER;
-        try {
-            String whole = wholeNumberText(text);
-            if (whole != null) {
-                exact = Long.parseLong(whole);
-            }
-        } catch (RuntimeException notAnExactInteger) {
-        }
-        return exact;
+        String whole = wholeNumberText(text);
+        return whole == null ? NO_EXACT_INTEGER
+                : NumberGrammar.decimalLongOr(whole, NO_EXACT_INTEGER);
     }
 
     private static String wholeNumberText(String text) {
@@ -269,7 +257,7 @@ public final class Directory {
         return List.copyOf(out.values());
     }
 
-    // An http(s) origin only: no path, query, fragment or user info; trailing slash removed.
+    // An http(s) origin only; trailing slash removed.
     public static String tidy(String address) {
         return tidied(withScheme(address));
     }

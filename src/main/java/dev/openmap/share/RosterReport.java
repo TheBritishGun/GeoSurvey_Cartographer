@@ -9,7 +9,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
-// Who one client can see, as that client sees them.
+// Who one client sees, as it sees them.
 public record RosterReport(
         String server,
         String dimension,
@@ -22,13 +22,12 @@ public record RosterReport(
 
     public static final int MAX_NAME = Presence.MAX_NAME;
 
-    // Four times the 16-character Minecraft account name limit.
     public static final int MAX_PLAYER_NAME = 64;
 
     // Matches Roster.MAX_PLAYERS on the collector.
     public static final int MAX_PLAYERS = 512;
 
-    // Longest a report may take on the wire.
+    // Longest report accepted.
     public static final int MAX_BYTES = 32768;
 
     private static final int SPECTATOR_BIT = 1;
@@ -73,7 +72,7 @@ public record RosterReport(
     private static final ThreadLocal<SeenPlayers> DEDUPE_TABLE =
             ThreadLocal.withInitial(SeenPlayers::new);
 
-    // x and z are meaningless unless located().
+    // Use x and z only when located.
     public record Entry(UUID player, String name, boolean spectator,
                         boolean located, int x, int z) {
 
@@ -112,7 +111,7 @@ public record RosterReport(
                 : new ArrayList<>(players);
         if (held.size() > MAX_PLAYERS) {
             throw new IllegalArgumentException(
-                    held.size() + " players exceeds the " + MAX_PLAYERS + " limit");
+                    held.size() + " players exceed the " + MAX_PLAYERS + " limit");
         }
         if (!(players instanceof Owned owned && owned.deduped)) {
             distinct(held);
@@ -136,7 +135,7 @@ public record RosterReport(
         }
         if (players.size() > MAX_PLAYERS) {
             throw new IllegalArgumentException(
-                    players.size() + " players exceeds the " + MAX_PLAYERS + " limit");
+                    players.size() + " players exceed the " + MAX_PLAYERS + " limit");
         }
     }
 
@@ -151,7 +150,7 @@ public record RosterReport(
             if (!once.accepts(player.getMostSignificantBits(),
                     player.getLeastSignificantBits())) {
                 throw new IllegalArgumentException(
-                        "the same player twice in one roster: " + entry.player());
+                        "player listed twice: " + entry.player());
             }
         }
     }
@@ -163,7 +162,7 @@ public record RosterReport(
                 new Owned(owned, false));
     }
 
-    // Like adopting, but the caller already confirmed every entry names a different player.
+    // Like adopting; the caller guarantees distinct players.
     static RosterReport adoptingDeduped(String server, String dimension, String by, long sent,
                                         List<Entry> owned) {
         Objects.requireNonNull(owned, "players");
@@ -319,13 +318,13 @@ public record RosterReport(
                 String raw = body.readUtf("player", Presence.MAX_UTF8_BYTES_PER_CHAR * MAX_PLAYER_NAME);
                 String seen = cleanedName(raw);
                 if (seen.length() > MAX_PLAYER_NAME) {
-                    throw new IOException("player " + i + " is named with "
+                    throw new IOException("player " + i + " name is "
                             + seen.length() + " characters");
                 }
                 int flags = body.readUnsignedByte();
                 if ((flags & ~(SPECTATOR_BIT | LOCATED_BIT)) != 0) {
-                    throw new IOException("player " + i + " carries flags this"
-                            + " reader refuses.");
+                    throw new IOException("player " + i + " has unknown"
+                            + " flags.");
                 }
                 boolean spectator = (flags & SPECTATOR_BIT) != 0;
                 boolean located = (flags & LOCATED_BIT) != 0;
@@ -340,8 +339,8 @@ public record RosterReport(
             int left = body.remaining();
             if (left != 0) {
                 throw new IOException(left
-                        + " bytes after the roster."
-                        + " Refusing it.");
+                        + " extra bytes"
+                        + " after the roster.");
             }
             decoded = adopting(server, dimension, by, sent, players);
         } catch (IllegalArgumentException refused) {
@@ -353,7 +352,7 @@ public record RosterReport(
     private static void requireClean(String value, String what) {
         if (!value.equals(LabelText.clean(value, LabelText.UNBOUNDED_READ,
                 LabelText.UNBOUNDED_READ, false))) {
-            throw new IllegalArgumentException(what + " has a character this reader"
+            throw new IllegalArgumentException(what + " has characters this reader"
                     + " rejects.");
         }
     }

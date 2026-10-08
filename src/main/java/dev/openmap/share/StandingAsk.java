@@ -1,18 +1,13 @@
 package dev.openmap.share;
 
-import dev.openmap.json.JsonElement;
 import dev.openmap.json.JsonObject;
-import dev.openmap.json.JsonParser;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.Objects;
 
 public final class StandingAsk {
 
-    // The route, outside the /fingerprint prefix.
     public static final String PATH = "/owed";
 
-    // Longest a body this reads may be.
     public static final int MAX_BYTES = 512;
 
     private static final byte[] SENT_MEMBER = ",\"sent\":".getBytes(StandardCharsets.UTF_8);
@@ -34,10 +29,6 @@ public final class StandingAsk {
     private static final int HEX_DIGIT_MASK = 0xF;
 
     private static final int NONCE_DIGITS = Long.SIZE / HEX_DIGIT_BITS;
-
-    // sent is wall-clock milliseconds.
-    public record Ask(String server, long sent, String nonce) {
-    }
 
     public static final class Body {
 
@@ -118,51 +109,5 @@ public final class StandingAsk {
             out[next++] = HEX_DIGITS[(int) (value >>> shift) & HEX_DIGIT_MASK];
         }
         return next;
-    }
-
-    // The ask inside an already-verified body, or null when it cannot be read.
-    public static Ask ask(byte[] verifiedBody) {
-        if (verifiedBody == null || verifiedBody.length == 0
-                || verifiedBody.length > MAX_BYTES) {
-            return null;
-        }
-        Ask read;
-        try {
-            JsonElement parsed = JsonParser.parseString(
-                    new String(verifiedBody, StandardCharsets.UTF_8));
-            read = parsed != null && parsed.isJsonObject()
-                    ? usable(parsed.getAsJsonObject())
-                    : null;
-        } catch (RuntimeException notAnAsk) {
-            read = null;
-        }
-        return read;
-    }
-
-    // Whether an ask's sent falls inside the presence window, in both directions.
-    public static boolean current(Ask ask, Instant now) {
-        if (ask == null || now == null) {
-            return false;
-        }
-        return SignedBatch.inPresenceWindow(now.toEpochMilli(), ask.sent());
-    }
-
-    // The ask a parsed document names, or null when a field is missing or unusable.
-    private static Ask usable(JsonObject document) {
-        String server = string(document, "server");
-        String nonce = string(document, "nonce");
-        long sent = Directory.exactInteger(document.get("sent"));
-        boolean readable = server != null && !server.isBlank()
-                && server.length() <= WorldProof.MAX_NAME
-                && nonce != null && nonce.length() >= WorldProof.MIN_NONCE_CHARS
-                && nonce.length() <= WorldProof.MAX_NAME
-                && sent != Directory.NO_EXACT_INTEGER;
-        return readable ? new Ask(server, sent, nonce) : null;
-    }
-
-    // A primitive member's text, or null when the member is absent or not a primitive.
-    private static String string(JsonObject object, String field) {
-        JsonElement value = object.get(field);
-        return value != null && value.isJsonPrimitive() ? value.getAsString() : null;
     }
 }

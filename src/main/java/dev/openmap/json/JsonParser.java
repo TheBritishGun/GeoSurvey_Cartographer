@@ -48,7 +48,7 @@ public final class JsonParser {
 
     private StringBuilder builder;
 
-    // How much of the buffered text is valid to read.
+    // Valid length of the buffered text.
     private int length;
 
     private int at;
@@ -87,7 +87,7 @@ public final class JsonParser {
         this.reader = reader;
     }
 
-    // Trailing content after the value is an error.
+    // Throws on content after the value.
     public static JsonElement parseString(String body) {
         if (body == null) {
             return JsonNull.INSTANCE;
@@ -110,7 +110,7 @@ public final class JsonParser {
         return parsed;
     }
 
-    // Trailing content after the value is an error.
+    // Throws on content after the value.
     static JsonElement parseReader(Reader reader) {
         JsonParser parser = new JsonParser(reader);
         parser.refill();
@@ -172,7 +172,7 @@ public final class JsonParser {
             emitAt(0, sink);
             skipWhitespace();
             if (at < length()) {
-                throw fail("trailing content after the document");
+                throw fail("trailing content");
             }
         }
     }
@@ -223,7 +223,7 @@ public final class JsonParser {
             value = parser.valueAt(0);
             parser.skipWhitespace();
             if (parser.at < parser.length()) {
-                throw parser.fail("trailing content after the document");
+                throw parser.fail("trailing content");
             }
         }
         return value;
@@ -337,7 +337,7 @@ public final class JsonParser {
                 throw fail("object has more than " + MAX_MEMBERS + " members");
             }
             if (peek() != '"') {
-                throw fail("a member name must be a quoted string");
+                throw fail("unquoted member name");
             }
             String name = string(true);
             skipWhitespace();
@@ -350,11 +350,11 @@ public final class JsonParser {
                 break;
             }
             if (c != ',') {
-                throw fail("expected ',' or '}' in an object");
+                throw fail("expected ',' or '}'");
             }
             skipWhitespace();
             if (peek() == '}') {
-                throw fail("trailing comma before '}'");
+                throw fail("trailing comma");
             }
         }
         return out;
@@ -375,7 +375,7 @@ public final class JsonParser {
                 throw fail("object has more than " + MAX_MEMBERS + " members");
             }
             if (peek() != '"') {
-                throw fail("a member name must be a quoted string");
+                throw fail("unquoted member name");
             }
             String name = string(true);
             skipWhitespace();
@@ -389,11 +389,11 @@ public final class JsonParser {
                 break;
             }
             if (c != ',') {
-                throw fail("expected ',' or '}' in an object");
+                throw fail("expected ',' or '}'");
             }
             skipWhitespace();
             if (peek() == '}') {
-                throw fail("trailing comma before '}'");
+                throw fail("trailing comma");
             }
         }
         sink.endObject();
@@ -416,11 +416,11 @@ public final class JsonParser {
                 break;
             }
             if (c != ',') {
-                throw fail("expected ',' or ']' in an array");
+                throw fail("expected ',' or ']'");
             }
             skipWhitespace();
             if (peek() == ']') {
-                throw fail("trailing comma before ']'");
+                throw fail("trailing comma");
             }
         }
         return out;
@@ -443,17 +443,17 @@ public final class JsonParser {
                 break;
             }
             if (c != ',') {
-                throw fail("expected ',' or ']' in an array");
+                throw fail("expected ',' or ']'");
             }
             skipWhitespace();
             if (peek() == ']') {
-                throw fail("trailing comma before ']'");
+                throw fail("trailing comma");
             }
         }
         sink.endArray();
     }
 
-    // Counts containers held open, not values.
+    // Counts open containers, not values.
     private int deepen(int open) {
         if (open + 1 > MAX_DEPTH) {
             throw fail("nesting deeper than " + MAX_DEPTH);
@@ -482,7 +482,7 @@ public final class JsonParser {
                 at++;
                 refillToCursor();
                 if (at < length() && isDigit(characterAt(at))) {
-                    throw fail("a number may not have a leading zero");
+                    throw fail("leading zero in a number");
                 }
                 whole = 0;
                 carriesWhole = true;
@@ -499,7 +499,7 @@ public final class JsonParser {
                 int fraction = at;
                 digitRun(fraction);
                 if (at == fraction) {
-                    throw fail("a number must have a digit after '.'");
+                    throw fail("no digit after '.'");
                 }
             }
             if (at < length() && isExponentMarker(characterAt(at))) {
@@ -512,7 +512,7 @@ public final class JsonParser {
                 int exponent = at;
                 digitRun(exponent);
                 if (at == exponent) {
-                    throw fail("a number must have a digit in its exponent");
+                    throw fail("no digit in the exponent");
                 }
             }
             if (carriesWhole) {
@@ -754,7 +754,7 @@ public final class JsonParser {
             } else if (digit >= 'A' && digit <= 'F') {
                 value = digit - 'A' + HEX_LETTER_OFFSET;
             } else {
-                throw fail("a unicode escape needs four hex digits");
+                throw fail("non-hex digit in unicode escape");
             }
             code = (code << HEX_DIGIT_BITS) | value;
         }
@@ -805,7 +805,7 @@ public final class JsonParser {
         at = cursor;
     }
 
-    // Returns false once nothing more can be read.
+    // False at the end of the input.
     private boolean refill() {
         if (reader == null) {
             return false;
@@ -819,16 +819,16 @@ public final class JsonParser {
         try {
             arrived = reader.read(buffer);
         } catch (IOException cannotRead) {
-            throw new JsonParseException("could not read the JSON: " + cannotRead,
+            throw new JsonParseException("cannot read JSON: " + cannotRead,
                     cannotRead);
         }
         if (arrived > buffer.length) {
-            throw new JsonParseException("could not read the JSON: the reader answered " + arrived
+            throw new JsonParseException("cannot read JSON: the reader returned " + arrived
                     + " characters for buffer " + buffer.length + " at offset " + length);
         }
         if (arrived == 0) {
-            throw new JsonParseException("could not read the JSON: the reader answered 0"
-                    + ", neither text nor its end, offset " + length);
+            throw new JsonParseException("cannot read JSON: the reader returned 0"
+                    + " characters at offset " + length);
         }
         boolean grew = arrived > 0;
         if (grew) {
@@ -855,7 +855,7 @@ public final class JsonParser {
     private char peek() {
         while (at >= length()) {
             if (!refill()) {
-                throw fail("unexpected end of document");
+                throw fail("unexpected end");
             }
         }
         return characterAt(at);
@@ -890,7 +890,7 @@ public final class JsonParser {
         at++;
     }
 
-    // The message includes the offset, never the document text.
+    // Includes the offset, never the document text.
     private JsonParseException fail(String why) {
         return new JsonParseException(why + " at offset " + at, false);
     }

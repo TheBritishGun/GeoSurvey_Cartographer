@@ -3,7 +3,7 @@ package dev.openmap.share;
 import dev.openmap.map.LabelText;
 import java.io.IOException;
 
-// The contributor's half of the session handshake, with the game taken out.
+// The contributor's side of the handshake.
 public final class Enroller {
 
     private static final int HTTP_OK = 200;
@@ -30,27 +30,43 @@ public final class Enroller {
 
     private static final int HTTP_SERVER_ERROR = 500;
 
-    // The collector, reduced to the two things this exchange asks of it.
+    private static final int HTTP_UNAUTHORIZED = 401;
+
+    // Challenge and answer pairs per attempt.
+    private static final int MAX_PAIRS = 3;
+
+    // The collector's 401 text.
+    private static final String NOT_ISSUED = "not an answer to a challenge this collector issued";
+
+    // The collector's 401 text.
+    private static final String SESSION_DENIED = "the session service did not confirm that";
+
+    // The collector's side of the handshake.
     public interface Wire {
 
-        // The challenge, or null if this collector does not offer the road.
+        // Null if the road is not offered.
         String challenge() throws IOException;
 
-        // Posts the signed enrolment, and returns the status.
+        // Returns the HTTP status.
         int offer(byte[] enrolment) throws IOException;
+
+        // The last offer's reply text; empty if unread.
+        default String offerReply() {
+            return "";
+        }
     }
 
-    // The player's Mojang session, reduced the same way.
+    // The player's Mojang session.
     public interface Session {
 
-        // The name the session service will be asked to look up.
+        // Null on timeout, interrupt, or missing client thread.
         String name();
 
-        // Tells Mojang this account joined that serverId.
+        // Tells Mojang this account joined.
         boolean join(String serverId) throws IOException;
     }
 
-    // The local identity key, reduced to the one thing wanted from it.
+    // The local identity key.
     public interface Sealer {
 
         byte[] sign(byte[] payload) throws IOException;
@@ -58,16 +74,14 @@ public final class Enroller {
 
     public enum Outcome {
 
-        // The collector recorded the key. Nothing more to do for this address.
         ENROLLED,
 
-        // The collector will not record it however long we wait.
+        // Waiting will not help.
         REFUSED,
 
-        // Something that could be different next time.
         RETRY,
 
-        // This collector does not offer the road at all.
+        // This collector does not offer the road.
         UNROUTED
     }
 
@@ -79,7 +93,6 @@ public final class Enroller {
 
     private static volatile Memo memoised;
 
-    // One attempt, start to finish.
     public static Outcome once(Wire wire, Session session,
                                Attestation.Credential credential, Sealer sealer)
             throws IOException {
@@ -87,7 +100,6 @@ public final class Enroller {
         Outcome outcome;
         if (name == null) {
 
-            // null means a timeout, an interrupted wait, or no client thread to ask.
             outcome = Outcome.RETRY;
         } else {
             name = LabelText.clean(name, LabelText.UNBOUNDED_READ,
@@ -95,24 +107,42 @@ public final class Enroller {
             if (name.length() > Enrolment.MAX_NAME || name.isBlank()) {
                 outcome = Outcome.REFUSED;
             } else {
-                String challenge = wire.challenge();
-                if (challenge == null) {
-                    outcome = Outcome.UNROUTED;
-                } else if (!SessionProof.readable(challenge)) {
+                outcome = null;
+                int sent = 0;
+                while (outcome == null) {
+                    String challenge = wire.challenge();
+                    if (challenge == null) {
+                        outcome = Outcome.UNROUTED;
+                    } else if (!SessionProof.readable(challenge)) {
 
-                    outcome = Outcome.RETRY;
-                } else if (!session.join(SessionProof.serverId(challenge,
-                        fingerprint(credential)))) {
-                    outcome = Outcome.RETRY;
-                } else {
-                    byte[] payload = Enrolment.encode(challenge, name);
-                    byte[] body = new SignedBatch(credential, sealer.sign(payload), payload)
-                            .encode();
-                    outcome = read(wire.offer(body));
+                        outcome = Outcome.RETRY;
+                    } else if (!session.join(SessionProof.serverId(challenge,
+                            fingerprint(credential)))) {
+                        outcome = Outcome.RETRY;
+                    } else {
+                        byte[] payload = Enrolment.encode(challenge, name);
+                        byte[] body = new SignedBatch(credential, sealer.sign(payload), payload)
+                                .encode();
+                        int status = wire.offer(body);
+                        sent++;
+                        if (notIssued(status, wire)) {
+                            outcome = sent < MAX_PAIRS ? null : Outcome.RETRY;
+                        } else {
+                            outcome = read(status);
+                        }
+                    }
                 }
             }
         }
         return outcome;
+    }
+
+    public static boolean deniedBySession(String offerReply) {
+        return SESSION_DENIED.equals(offerReply);
+    }
+
+    private static boolean notIssued(int status, Wire wire) {
+        return status == HTTP_UNAUTHORIZED && NOT_ISSUED.equals(wire.offerReply());
     }
 
     private static String fingerprint(Attestation.Credential credential) {
@@ -133,7 +163,6 @@ public final class Enroller {
             return Outcome.RETRY;
         }
 
-        // 429 is grouped with the 5xx block, not the 4xx block.
         if (status == HTTP_TOO_MANY_REQUESTS) {
             return Outcome.RETRY;
         }

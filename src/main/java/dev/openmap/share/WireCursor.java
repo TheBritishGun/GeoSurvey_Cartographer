@@ -113,7 +113,7 @@ final class WireCursor {
         int left = remaining();
         if (claimed > left) {
             throw new IOException(what + " claims " + claimed + " bytes and only "
-                    + left + " are left in the message");
+                    + left + " are left");
         }
         if (claimed > maximum) {
             throw new IOException(what + " claims " + claimed + " bytes, over the "

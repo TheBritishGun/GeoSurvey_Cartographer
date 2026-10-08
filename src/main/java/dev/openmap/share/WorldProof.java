@@ -10,16 +10,15 @@ public record WorldProof(String server, String region, String by, String nonce,
     // CRF1.
     public static final int MAGIC = 0x43524631;
 
-    // Longest a name or an identifier may be.
+    // Longest name or identifier.
     public static final int MAX_NAME = Presence.MAX_NAME;
 
     // Hex characters a signature carries.
     public static final int SIGNATURE_CHARS = 16;
 
-    // Shortest nonce this reader accepts.
     public static final int MIN_NONCE_CHARS = 16;
 
-    // Longest message this reader will look at.
+    // Longest message accepted.
     public static final int MAX_BYTES = 2048;
 
     private static final int FRAMING_BYTES =
@@ -118,7 +117,7 @@ public record WorldProof(String server, String region, String by, String nonce,
             state = new ShaState(java.security.MessageDigest.getInstance("SHA-256"));
         } catch (java.security.NoSuchAlgorithmException impossible) {
             throw new IllegalStateException(
-                    "SHA-256 is required by the platform", impossible);
+                    "no SHA-256", impossible);
         }
         return state;
     }
@@ -126,7 +125,7 @@ public record WorldProof(String server, String region, String by, String nonce,
     private static final byte[] HEX_DIGITS =
             "0123456789abcdef".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
 
-    // The answer to send, which is not the answer itself.
+    // The response to send, not the signature.
     public static String responseFor(String signature, String nonce) {
         Objects.requireNonNull(signature, "signature");
         Objects.requireNonNull(nonce, "nonce");
@@ -209,8 +208,8 @@ public record WorldProof(String server, String region, String by, String nonce,
             int left = body.remaining();
             if (left != 0) {
                 throw new IOException(left
-                        + " bytes after the proof."
-                        + " Refusing it.");
+                        + " extra bytes"
+                        + " after the proof.");
             }
             proof = new WorldProof(server, region, by, nonce, response, sent);
         } catch (IllegalArgumentException refused) {
@@ -313,7 +312,7 @@ public record WorldProof(String server, String region, String by, String nonce,
         try {
             state.digest.digest(state.scratch, 0, state.scratch.length);
         } catch (java.security.DigestException impossible) {
-            throw new IllegalStateException("SHA-256 output buffer is too small", impossible);
+            throw new IllegalStateException("SHA-256 buffer is too small", impossible);
         }
         byte[] hex = state.hex;
         for (int i = 0; i < SIGNATURE_CHARS / HEX_CHARS_PER_BYTE; i++) {

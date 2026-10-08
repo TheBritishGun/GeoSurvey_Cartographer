@@ -11,7 +11,7 @@ import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
 
-// In document order. Duplicate keys: the last one wins.
+// Keeps document order. The last duplicate key wins.
 public final class JsonObject implements JsonElement {
 
     private static final int SMALL_CAPACITY = 8;
@@ -64,7 +64,7 @@ public final class JsonObject implements JsonElement {
         return this;
     }
 
-    // A Java null becomes JsonNull.
+    // A null becomes JsonNull.
     public void add(String name, JsonElement value) {
         JsonElement stored = value == null ? JsonNull.INSTANCE : value;
         if (promoted != null) {
@@ -112,7 +112,7 @@ public final class JsonObject implements JsonElement {
         add(name, value == null ? JsonNull.INSTANCE : JsonPrimitive.ofBoolean(value));
     }
 
-    // Java null if absent; JsonNull if the member is JSON null.
+    // Null if absent; JsonNull if the member is JSON null.
     public JsonElement get(String name) {
         if (promoted != null) {
             return promoted.get(name);
@@ -121,12 +121,12 @@ public final class JsonObject implements JsonElement {
         return index < 0 ? null : values[index];
     }
 
-    // True even when the member's value is JSON null.
+    // True even when the value is JSON null.
     public boolean has(String name) {
         return promoted != null ? promoted.containsKey(name) : indexOf(name) >= 0;
     }
 
-    // The removed member, or null if there was none.
+    // The removed member, or null.
     public JsonElement remove(String name) {
         if (promoted != null) {
             return promoted.remove(name);
@@ -153,7 +153,7 @@ public final class JsonObject implements JsonElement {
         return entries;
     }
 
-    // Null when absent; ClassCastException when present as a different kind.
+    // Null when absent; ClassCastException when not an object.
     public JsonObject getAsJsonObject(String name) {
         JsonElement value = get(name);
         if (value == null) {
@@ -166,7 +166,7 @@ public final class JsonObject implements JsonElement {
                 + JsonText.describe(value));
     }
 
-    // Null when absent; ClassCastException when present as a different kind.
+    // Null when absent; ClassCastException when not an array.
     public JsonArray getAsJsonArray(String name) {
         JsonElement value = get(name);
         if (value == null) {

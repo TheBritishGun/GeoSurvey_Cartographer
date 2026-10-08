@@ -1,7 +1,6 @@
 package dev.openmap.json;
 
-// Thrown when a document is not JSON this parser accepts.
-// Unchecked. Every catch in this tree is written against IOException or this class.
+// Thrown when this parser does not accept a document.
 public class JsonParseException extends RuntimeException {
 
     private static final long serialVersionUID = 1L;

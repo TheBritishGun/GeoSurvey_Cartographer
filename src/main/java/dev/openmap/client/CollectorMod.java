@@ -1,53 +1,90 @@
 package dev.openmap.client;
 
 import dev.openmap.LandNav;
+import dev.openmap.api.Cartographers;
 import dev.openmap.config.LandNavConfig;
+import dev.openmap.json.SaveWriter;
 import dev.openmap.map.MapStorage;
 import dev.sandpaper.Sandpaper;
 import dev.sandpaper.core.WorkPool;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.toasts.SystemToast;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
 
-// The collector artifact's entrypoint: capture and share, no rendering.
 public final class CollectorMod implements ClientModInitializer {
 
     public static final String MOD_ID = "openmap-collect";
 
-    // Named "geosurvey", shared with GeoSurvey's own capture class.
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(MOD_ID);
 
     private static final MapStorage MAP = new MapStorage();
 
     private static final ChunkCapture CAPTURE = new ChunkCapture(MAP);
 
-    // Keeps the load-problem notice to one toast, not a stack.
+    private static final LiveMapClient LIVE = new LiveMapClient();
+
+    private static final CollectorCartographer CARTOGRAPHER = new CollectorCartographer(CAPTURE.world(),
+            CAPTURE.ground(), new CollectorCartographerMarkers(MAP, CAPTURE.world()));
+
+    private static final Identifier HUD_CLAIM_SPLASH =
+            Identifier.fromNamespaceAndPath(MOD_ID, "claim_splash");
+
     private static final SystemToast.SystemToastId LOAD_PROBLEM_TOAST =
             new SystemToast.SystemToastId();
+
+    private static final long WORKER_STOP_MILLIS = 10_000L;
 
     @Override
     public void onInitializeClient() {
         sendGroundOnly(LandNav.config());
 
+        SaveWriter.live().runner(task -> Sandpaper.workPool().submit(
+                () -> {
+                    task.run();
+                    return null;
+                },
+                failure -> LOGGER.warn("could not run the settings writer", failure),
+                SaveWriter.live()::droppedUnrun,
+                failure -> LOGGER.warn("the settings writer failed", failure)));
+        SaveWriter.live().note(message -> LOGGER.warn("{}", message));
+
         shareTheWritePool(MAP);
         ShareCommand.register(CollectorMod::mapStorage);
+        sayClaimsPortNotesInChat();
         CAPTURE.register();
+        LIVE.register();
+        ClaimSplashHub.register();
+        HudElementRegistry.attachElementAfter(VanillaHudElements.TITLE_AND_SUBTITLE,
+                HUD_CLAIM_SPLASH, ClaimSplashHud::render);
 
-        // Checked once a tick, since client.gui is not yet built at init.
-        ClientTickEvents.END_CLIENT_TICK.register(client ->
-                sayLoadProblem(client, LandNav.config()));
-
-        // Flushes surveyed ground to disk on quit.
-        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
-            CAPTURE.flushNow();
-
-            // Cancels the tick jobs and reverts the published position.
-            CAPTURE.unregister();
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            SaveWriter.live().beat(System.nanoTime());
+            sayLoadProblem(client, LandNav.config());
         });
+
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            Cartographers.withdraw(CARTOGRAPHER);
+            CAPTURE.flushNow();
+            ShareOutboxHub.stop();
+            SaveWriter.live().finish(System.nanoTime(), SaveWriter.HOLD_NANOS);
+
+            CAPTURE.unregister();
+            LIVE.unregister();
+
+            StoppableWorkers.stopAll(WORKER_STOP_MILLIS);
+        });
+
+        ShareOutboxHub.start(new ShareOutboxHub.Seams(LandNav.dataDir(), LandNav::config,
+                ShareSender.outboxPoster(), CAPTURE::rootServer, MAP::afterLandmarksSaved,
+                ShareSender::liveVanished));
+        Cartographers.publish(CARTOGRAPHER);
     }
 
     public static ChunkCapture capture() {
@@ -58,20 +95,23 @@ public final class CollectorMod implements ClientModInitializer {
         return MAP;
     }
 
+    public static LiveMapClient live() {
+        return LIVE;
+    }
+
+    static void sayClaimsPortNotesInChat() {
+        ShareCommand.claimsPortNotes(said -> ShareSender.sayGroundNotice(said.text()));
+    }
+
     static void sendGroundOnly(LandNavConfig config) {
         ShareSender.publishesGroundOnly(config);
         if (config.takeSharePresenceSplit()) {
-            LOGGER.info("geosurvey publishes no name, no live position and"
-                    + " no player list."
-                    + " Nothing contributed"
-                    + " is affected."
-                    + " Ground still"
-                    + " goes up."
-                    + "");
+            LOGGER.info("geosurvey publishes no live position or player list."
+                    + " Ground still goes up;"
+                    + " a shared claim or marker sends your player name.");
         }
     }
 
-    // One-time toast: the last settings load could not read the file.
     static void sayLoadProblem(Minecraft client, LandNavConfig config) {
         if (client == null || !client.isGameLoadFinished()) {
             return;
@@ -85,13 +125,11 @@ public final class CollectorMod implements ClientModInitializer {
                         "GeoSurvey Cartographer settings could not be read"),
                 Component.translatableWithFallback(
                         "openmap-collect.toast.settings_unreadable.body",
-                        "This session uses shipped defaults."
-                                + " Check the log for why."
-                                + " Changing a setting now saves the defaults over the old file."));
+                        "This session uses default settings; check the log."
+                                + " A setting change saves them over the old file."));
         LOGGER.warn(config.loadProblem());
     }
 
-    // Routes this storage's region writes through the shared work pool.
     private static void shareTheWritePool(MapStorage storage) {
         storage.setLostGroundNote(LOGGER::warn);
         storage.writeThrough(new SharedWrites());
@@ -110,7 +148,7 @@ public final class CollectorMod implements ClientModInitializer {
                 pool = p;
             }
             SharedWrite task = new SharedWrite(write);
-            boolean taken = p.submit(LandNav.MOD_ID, task, done -> { }, task.receipt);
+            boolean taken = p.submit(CollectorMod.MOD_ID, task, done -> { }, task.receipt);
             return taken ? task : null;
         }
     }

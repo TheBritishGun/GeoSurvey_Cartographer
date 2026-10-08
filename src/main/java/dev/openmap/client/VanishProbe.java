@@ -28,29 +28,27 @@ import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import net.minecraft.world.level.GameType;
 
-// Tick thread: observe(), armed(). Writer thread: drain(); owns written,
-// faults, faultSaidAt, renderBuffer. Shared: due, owed, out, closing, stopped.
+// Tick thread: observe(), armed(). Writer thread: drain(), which owns written,
+// faults, faultSaidAt, renderBuffer; due, owed, out, closing, stopped are shared.
 class VanishProbe implements AutoCloseable {
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
     static final String DIRECTORY = "geosurvey diagnostics";
 
-    // How often a record goes out with nothing changed.
     static final long HEARTBEAT_MILLIS = 10_000L;
 
     private static final long HEARTBEAT_NANOS = HEARTBEAT_MILLIS * 1_000_000L;
 
     private static final long MILLIS_PER_SECOND = 1_000L;
 
-    // Recording stops at this size; it does not roll over.
     static final long MAX_BYTES = 4L << 20;
 
     private static final int MEGABYTE = 1 << 20;
 
     private static final String CEILING = "\n--- the probe reached its "
-            + MAX_BYTES / MEGABYTE + " MB ceiling and stopped recording here.\n";
+            + MAX_BYTES / MEGABYTE + " MB ceiling and stopped recording.\n";
 
     private static final int QUEUE_LIMIT = 16;
 
@@ -94,7 +92,7 @@ class VanishProbe implements AutoCloseable {
 
     private final Path file;
 
-    // nanoTime in the mod; a stepped counter in tests.
+    // On the nanoTime scale.
     private final LongSupplier clock;
 
     private volatile SeekableByteChannel out;
@@ -112,6 +110,8 @@ class VanishProbe implements AutoCloseable {
 
     private Thread writer;
 
+    private volatile StoppableWorkers.Registration stopRegistration;
+
     private volatile boolean closing;
 
     private long behind;
@@ -127,7 +127,7 @@ class VanishProbe implements AutoCloseable {
 
     private Picture picture;
 
-    // On the nanoTime scale, not the wall clock.
+    // On the nanoTime scale.
     private long wroteAt;
 
     private volatile boolean stopped;
@@ -141,7 +141,7 @@ class VanishProbe implements AutoCloseable {
 
     private volatile long sawRosters = -1;
 
-    // The roster count at the last HIDDEN record, or -1 when it was not hidden.
+    // -1 when not hidden.
     private long rostersWhenHidden = -1;
 
     // -1 before the first record.
@@ -154,13 +154,13 @@ class VanishProbe implements AutoCloseable {
 
     private long lastOffered;
 
-    // Ground accepted, not landed, at the last HIDDEN record; -1 when it was not hidden.
+    // Ground accepted, not landed; -1 when not hidden.
     private long groundWhenHidden = -1;
 
-    // The position count at the last HIDDEN record, or -1 when it was not hidden.
+    // -1 when not hidden.
     private long positionsWhenHidden = -1;
 
-    // The probe to keep, or null for not probing. existing may be null.
+    // Null when off; existing may be null.
     static VanishProbe armed(boolean wanted, VanishProbe existing) {
         if (!wanted) {
             if (existing != null) {
@@ -189,9 +189,9 @@ class VanishProbe implements AutoCloseable {
         }
         if (!free) {
             probe.stopped = true;
-            LOGGER.error("The vanish probe could not open {}: that name and every name"
-                    + " before it for the same second are taken. It is not recording."
-                    + " Nothing else is affected.", probe.file);
+            LOGGER.error("The vanish probe could not open {}: all names"
+                    + " for this second are taken."
+                    + " It does not record; nothing else is affected.", probe.file);
         }
         return probe;
     }
@@ -234,23 +234,24 @@ class VanishProbe implements AutoCloseable {
             if (free) {
                 Thread writing = Background.thread(this::drain, "geosurvey-vanish-probe");
                 writer = writing;
+                stopRegistration = StoppableWorkers.close("geosurvey-vanish-probe", this::stop,
+                        this::close, () -> writing.getState() == Thread.State.TERMINATED);
                 writing.start();
 
-                LOGGER.warn("The GeoSurvey vanish probe is ARMED and is writing to {}."
-                        + " It records the names of every listed player, vanished ones"
-                        + " included, and nothing it records is ever sent anywhere."
-                        + " Turn it off with shareVanishProbe=false.", file);
+                LOGGER.warn("The vanish probe is armed and writes the names of every listed player to {},"
+                        + " vanished ones included."
+                        + " Nothing is sent;"
+                        + " set shareVanishProbe=false to turn it off.", file);
             }
         } catch (IOException | RuntimeException trouble) {
             stopped = true;
             out = null;
-            LOGGER.error("The vanish probe could not open {} and is not recording."
+            LOGGER.error("The vanish probe could not open {} and does not record."
                     + " Nothing else is affected.", file, trouble);
         }
         return free;
     }
 
-    // Falls back to a temp directory when there is no game.
     static Path defaultDirectory() {
         Path directory;
         try {
@@ -269,7 +270,7 @@ class VanishProbe implements AutoCloseable {
     record MarkedBy(Predicate<String> decorated, Predicate<String> profile) {
     }
 
-    // self is null when no reading was taken.
+    // self is null with no reading.
     void observe(List<ShareSender.Seen> seen, List<RosterReport.Entry> reported,
                  Predicate<String> marked, List<String> markers, boolean selfHidden,
                  ShareSender.Self self, ShareSender.Sent sending) {
@@ -345,7 +346,7 @@ class VanishProbe implements AutoCloseable {
         } catch (RuntimeException trouble) {
             stop();
             stopped = true;
-            LOGGER.error("The vanish probe stopped recording after a failure."
+            LOGGER.error("The vanish probe stopped after a failure."
                     + " The filter is unaffected.", trouble);
         }
     }
@@ -362,30 +363,43 @@ class VanishProbe implements AutoCloseable {
         if (Thread.currentThread() != writer) {
             boolean woken = due.offer(END);
             if (!woken) {
-                LOGGER.debug("The vanish probe's queue was full when it was told to stop."
-                        + " Its writer was sent no wake-up. It needs none: with records"
-                        + " queued it is not waiting, and it reads the stop before it"
-                        + " waits again.");
+                LOGGER.debug("The vanish probe's queue was full when told to stop;"
+                        + " its writer needs no wake-up.");
             }
         }
     }
 
     public void close() {
+        close(CLOSE_WAIT_MILLIS);
+    }
+
+    private boolean close(long waitMillis) {
         stop();
         Thread writing = writer;
+        boolean ended;
         if (writing != null && writing.isAlive() && writing != Thread.currentThread()) {
-            try {
-                writing.join(CLOSE_WAIT_MILLIS);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+            if (waitMillis > 0L) {
+                try {
+                    writing.join(waitMillis);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
+            ended = !writing.isAlive();
         } else {
             SeekableByteChannel open = out;
             out = null;
             if (open != null) {
                 closeQuietly(open);
             }
+            StoppableWorkers.Registration registration = stopRegistration;
+            stopRegistration = null;
+            if (registration != null) {
+                registration.close();
+            }
+            ended = true;
         }
+        return ended;
     }
 
     private static void closeQuietly(SeekableByteChannel open) {
@@ -537,7 +551,7 @@ class VanishProbe implements AutoCloseable {
         }
     }
 
-    // self is null when no reading was taken this beat.
+    // self is null with no reading this beat.
     private static final class Gate {
 
         private ShareSender.Self self;
@@ -617,7 +631,7 @@ class VanishProbe implements AutoCloseable {
             return headMarked;
         }
 
-        // Whether the signals say hidden; not the same as the gate's own answer.
+        // The signals' answer, not the gate's.
         boolean derived() {
             return signalsSayHidden;
         }
@@ -681,7 +695,6 @@ class VanishProbe implements AutoCloseable {
                         long groundWhenHidden, long positionsWhenHidden) {
     }
 
-    // Evaluates every condition; none short-circuits.
     private static void gateOf(Gate into, ShareSender.Self self,
                                Predicate<String> markedDecorated,
                                Predicate<String> markedProfile, boolean answered) {
@@ -760,7 +773,6 @@ class VanishProbe implements AutoCloseable {
         return held;
     }
 
-    // Coordinates and the posting counters are not part of the comparison.
     private static Picture pictureOf(List<Read> reads, List<String> markers,
                                      Gate gate) {
         return new Picture(reads, markers, gate);
@@ -778,17 +790,17 @@ class VanishProbe implements AutoCloseable {
                 .append(beat.changed() ? "CHANGED" : "unchanged, heartbeat");
         if (beat.suppressed() > 0) {
             out.append("  (").append(beat.suppressed())
-                    .append(" beats not recorded since the last: no signal changed)");
+                    .append(" beats skipped: no signal changed)");
         }
         if (beat.behind() > 0) {
             out.append("  (").append(beat.behind())
-                    .append(" beats not recorded since the last")
+                    .append(" beats skipped")
                     .append(": the writer fell behind)");
         }
         out.append('\n');
         out.append("    this client: ").append(gate.answered()
-                        ? "HIDDEN: self-gate answered hidden"
-                        : "not hidden: its own tab entry carries no marker")
+                        ? "HIDDEN"
+                        : "not hidden")
                 .append('\n');
         int excluded = 0;
         int wrong = 0;
@@ -824,7 +836,7 @@ class VanishProbe implements AutoCloseable {
         posting(out, beat, reported);
         if (wrong > 0) {
             out.append("    !! PROBE DISAGREES WITH THE FILTER on ").append(wrong)
-                    .append(" player(s). Read nothing below as the filter's answer;")
+                    .append(" player(s). Trust nothing below;")
                     .append(" this is a bug in the probe or in reportable.\n");
         }
         for (int at = 0; at < listed && out.length() <= room; at++) {
@@ -833,29 +845,27 @@ class VanishProbe implements AutoCloseable {
         return out.length() > room ? null : out.toString();
     }
 
-    // inRoster is null when there was no reading to look for.
+    // inRoster is null with no reading.
     private static void self(StringBuilder out, Gate gate, Read inRoster) {
         ShareSender.Self read = gate.self();
         if (read == null) {
-            out.append("        (no self reading was taken this beat: the filter ran"
-                            + " without going through standing(). The line above is"
-                            + " the last answer the gate gave, not one taken now.)\n");
+            out.append("        (no self reading was taken.)\n");
             return;
         }
         name(out, "own profile ", read.name(), gate.profileMarked(),
-                "this client's own tab entry carries no profile name");
+                "its tab entry has no profile name");
         name(out, "own tab     ", read.shown(), gate.tabMarked(),
-                "the server has sent no UPDATE_DISPLAY_NAME for this client");
+                "the server sent no UPDATE_DISPLAY_NAME for this client");
         name(out, "own overhead", read.nearby(), gate.headMarked(),
-                "this client has no player entity, or it has no display name");
+                "this client has no player entity or no display name");
         out.append("        own uuid=").append(read.id())
                 .append("  game mode=").append(read.gameMode() == null ? null : read.gameMode().name())
                 .append("  getPlayerInfo=")
                 .append(read.found() ? "an entry" : "NULL")
-                .append("  in the listed set=").append(read.listed())
+                .append("  listed=").append(read.listed())
                 .append("  connected=").append(read.connected()).append('\n');
         if (read.id() != null) {
-            out.append("        own entry in the roster this walk produced: ");
+            out.append("        own entry in the roster: ");
             inRoster(out, inRoster);
             out.append('\n');
         }
@@ -865,34 +875,29 @@ class VanishProbe implements AutoCloseable {
             out.append(", by: ");
             conditions(out, gate);
         } else {
-            out.append(". Not one of its conditions fired: this client is connected,"
-                    + " its own entry is present and listed, and none of its three"
-                    + " names carries a marker");
+            out.append(". No condition fired: this client is connected,"
+                    + " its own entry is listed, and no name"
+                    + " has a marker");
         }
         out.append('\n');
         if (derived != gate.answered()) {
-            out.append("        !! PROBE DISAGREES WITH THE SELF-GATE. These signals"
+            out.append("        !! PROBE DISAGREES WITH THE SELF-GATE: the signals"
                             + " say ").append(derived ? "hidden" : "not hidden")
                     .append(" and the gate answered ")
                     .append(gate.answered() ? "hidden" : "not hidden")
-                    .append(". This is a bug in the probe or in Sight.hidden(); read"
-                            + " neither as the other's answer.\n");
+                    .append(".\n");
         }
         if (gate.spectator()) {
             out.append(gate.answered()
-                    ? "        (game mode SPECTATOR: the self-gate tests this, and"
-                            + " it alone is enough to hold this client.)\n"
-                    : "        !! game mode SPECTATOR and the self-gate answered NOT"
-                            + " hidden. The gate does test the mode: this is the"
-                            + " gate and the reading disagreeing, not a vanish"
-                            + " slipping past a condition that was never there.\n");
+                    ? "        (game mode SPECTATOR.)\n"
+                    : "        !! game mode SPECTATOR and the self-gate answered NOT hidden.\n");
         }
     }
 
     private static void inRoster(StringBuilder out, Read read) {
         if (read != null) {
             if (!read.reported()) {
-                out.append("excluded by the filter, on the same signals as anybody"
+                out.append("excluded by the filter, like anybody"
                         + " else");
                 return;
             }
@@ -905,10 +910,9 @@ class VanishProbe implements AutoCloseable {
             return;
         }
 
-        out.append("it is not in this walk at all");
+        out.append("it is not in this walk");
     }
 
-    // Every condition that fired, not only the first.
     private static void conditions(StringBuilder out, Gate gate) {
         int at = out.length();
         if (gate.adrift()) {
@@ -920,7 +924,7 @@ class VanishProbe implements AutoCloseable {
         }
         if (gate.unlisted()) {
             out.append(out.length() == at ? "" : ", ")
-                    .append("its own entry is not in the listed set");
+                    .append("its own entry is not listed");
         }
         if (gate.spectator()) {
             out.append(out.length() == at ? "" : ", ").append("game mode SPECTATOR");
@@ -946,29 +950,26 @@ class VanishProbe implements AutoCloseable {
         }
         Gate gate = beat.gate();
         out.append("    posting: ").append(sending.running()
-                        ? "the share thread is running"
-                        : "the share thread is NOT running: nothing can leave this"
-                                + " client and the counts below cannot move");
-        moved(out, "\n        positions taken by the collector: ", sending.positions(),
+                        ? "running"
+                        : "stopped; nothing leaves this client");
+        moved(out, "\n        positions accepted: ", sending.positions(),
                 beat.sawPositions());
-        moved(out, "\n        rosters taken by the collector:   ", sending.rosters(),
+        moved(out, "\n        rosters accepted:   ", sending.rosters(),
                 beat.sawRosters());
-        moved(out, "\n        ground put on the upload road:    ",
+        moved(out, "\n        ground accepted:    ",
                 sending.groundTaken(), beat.sawGroundTaken());
-        moved(out, "\n        ground the vanish gate refused:   ",
+        moved(out, "\n        ground refused:     ",
                 sending.groundHeld(), beat.sawGroundHeld());
         out.append('\n');
         said(out, "position beat", sending.positionReason());
         said(out, "roster beat  ", sending.rosterReason());
         if (!gate.answered() && wasHidden(beat)) {
-            out.append("    ** THE LAST HIDDEN WINDOW ENDED. The counter movement above"
-                    + " belongs to it.\n");
+            out.append("    ** THE LAST HIDDEN WINDOW ENDED.\n");
             if (wentOut(beat.rostersWhenHidden(), sending.rosterAttempts())) {
                 out.append("    !! A ROSTER WENT OUT IN THE LAST HIDDEN WINDOW.\n");
             }
             if (wentOut(beat.groundWhenHidden(), sending.groundTaken())) {
-                out.append("    !! SURVEYED GROUND WENT ONTO THE UPLOAD ROAD IN THE LAST"
-                        + " HIDDEN WINDOW.\n");
+                out.append("    !! GROUND WAS SENT IN THE LAST HIDDEN WINDOW.\n");
             }
             if (wentOut(beat.positionsWhenHidden(), sending.positionAttempts())) {
                 out.append("    !! A POSITION WAS SENT IN THE LAST HIDDEN WINDOW.\n");
@@ -976,97 +977,38 @@ class VanishProbe implements AutoCloseable {
         }
         boolean hidden = gate.answered();
         if (hidden) {
-            out.append("    ** THIS CLIENT IS HIDDEN AND NOTHING IS BEING SENT.\n"
-                            + "       The self-vanish gate stands all four down: the POSITION beat,\n"
-                            + "       the ROSTER beat, the GROUND upload and the account-proof "
-                            + "HANDSHAKE.\n"
-                            + "       This walk would have handed the roster "
-                            + ""
-                            + ""
-                            + "")
+            out.append("    ** THIS CLIENT IS HIDDEN: it sends no position,"
+                            + " player list, ground or account proof.\n")
+                    .append("       A shared claim or marker waits.\n"
+                            + "       Held: ")
                     .append(handedOn)
-                    .append(" player(s); the roster beat is holding them.\n"
-                            + "       HELD, not emptied: an empty roster reads as you withdrawing "
-                            + "every\n"
-                            + "       player you can see, not as none to report.\n"
-                            + "       The GROUND road is the one that cannot be taken back. A position\n"
-                            + "       goes stale in forty-five seconds; a surveyed chunk becomes "
-                            + "a\n"
-                            + "       permanent record in a replicated ledger naming this account, "
-                            + "the\n"
-                            + "       chunk and the minute. Ground surveyed while you are hidden "
-                            + "is\n"
-                            + "       DROPPED, not held for later: sending it afterwards moves "
-                            + "the\n"
-                            + "       delivery, not the record. This client has dropped "
-                            + ""
-                            + ""
-                            + ""
-                            + ""
-                            + ""
-                            + ""
-                            + ""
-                            + "")
+                    .append(" player(s). Dropped: ")
                     .append(sending.groundHeld())
-                    .append(" surveyed chunk(s) to the\n"
-                            + "       gate since it started; your own map kept every one of them.\n"
-                            + "       What the gate stands down is NEW capture only: ground already "
-                            + "on\n"
-                            + "       the upload road when you vanished is still signed and posted.\n"
-                            + "       The accepted count above holds still; this file carries no "
-                            + "count\n"
-                            + "       of that backlog.\n");
-            out.append(sending.running()
-                    ? "       Two of the counts above are the readings that matter: while"
-                            + " you are\n       hidden, neither the roster count nor the"
-                            + " ground accepted count may\n       move. The refused count"
-                            + " is expected to move and means the gate held.\n"
-                    : "       Nothing is being posted right now: the counts above cannot"
-                            + " move\n       either way, and a count that cannot move"
-                            + " proves nothing about the gate.\n       Switch contributing"
-                            + " on to take that reading.\n");
+                    .append(" chunk(s) so far; your map kept them.\n");
+            if (!sending.running()) {
+                out.append("       Nothing is posted; switch contributing on to take a reading.\n");
+            }
         }
         if (hidden && wentOut(beat.rostersWhenHidden(), sending.rosterAttempts())) {
-            out.append("    !! A ROSTER WENT OUT WHILE THIS CLIENT WAS HIDDEN.\n"
-                            + "       The roster count above has moved by ")
+            out.append("    !! A ROSTER WENT OUT WHILE THIS CLIENT WAS HIDDEN:\n"
+                            + "       the roster count moved by ")
                     .append(sending.rosterAttempts() - beat.rostersWhenHidden())
-                    .append(" since the last record\n"
-                            + "       that was also hidden: the gate did not hold."
-                            + " Every player listed\n"
-                            + "       below as REPORTED was published from beside somebody"
-                            + " who cannot see\n"
-                            + "       this client.\n");
+                    .append(" since the last hidden record.\n");
         }
         if (hidden && wentOut(beat.positionsWhenHidden(), sending.positionAttempts())) {
-            out.append("    !! A POSITION WAS SENT WHILE THIS CLIENT WAS HIDDEN.\n"
-                            + "       The position count above has moved by ")
+            out.append("    !! A POSITION WAS SENT WHILE THIS CLIENT WAS HIDDEN:\n"
+                            + "       the position count moved by ")
                     .append(sending.positionAttempts() - beat.positionsWhenHidden())
-                    .append(" since the last record\n"
-                            + "       that was also hidden: the gate did not hold."
-                            + " This client's own\n"
-                            + "       position was sent to the collector while you"
-                            + " could not be seen.\n");
+                    .append(" since the last hidden record.\n");
         }
 
         if (hidden && wentOut(beat.groundWhenHidden(), sending.groundTaken())) {
-            out.append("    !! SURVEYED GROUND WENT ONTO THE UPLOAD ROAD WHILE THIS CLIENT"
-                            + " WAS HIDDEN.\n"
-                            + "       The accepted count above has moved by ")
+            out.append("    !! GROUND WAS SENT WHILE THIS CLIENT WAS HIDDEN.\n"
+                            + "       The accepted count moved by ")
                     .append(sending.groundTaken() - beat.groundWhenHidden())
-                    .append(" since the last record\n"
-                            + "       that was also hidden. Nothing reaches that road past the "
-                            + "gate;\n"
-                            + "       this is the gate itself failing, not the already-queued ground\n"
-                            + "       that is meant to keep going. It makes a PERMANENT record "
-                            + "in a\n"
-                            + "       replicated ledger naming this account, the chunk and the "
-                            + "minute,\n"
-                            + "       and unvanishing does not withdraw it: the failure this file\n"
-                            + "       exists to catch.\n"
-                            + ""
-                            + ""
-                            + ""
-                            + "");
+                    .append(" since the last hidden record.\n"
+                            + "       A PERMANENT record"
+                            + " names this account.\n");
         }
     }
 
@@ -1079,11 +1021,10 @@ class VanishProbe implements AutoCloseable {
         return recorded >= 0 && now > recorded;
     }
 
-    // A counter and its movement since the last record, or the first reading.
     private static void moved(StringBuilder out, String label, long now, long saw) {
         out.append(label).append(now);
         if (saw < 0) {
-            out.append(" (first record: no earlier reading to compare)");
+            out.append(" (first record: nothing to compare)");
         } else {
             long delta = now - saw;
             out.append("  (").append(delta >= 0 ? "+" : "").append(delta)
@@ -1091,7 +1032,6 @@ class VanishProbe implements AutoCloseable {
         }
     }
 
-    // Quoted: a newline in reason stays inside its record.
     private static void said(StringBuilder out, String which, String reason) {
         out.append("        ").append(which).append(": ");
         if (reason == null || reason.isEmpty()) {
@@ -1106,10 +1046,10 @@ class VanishProbe implements AutoCloseable {
         out.append("    player ").append(read.id()).append('\n');
         name(out, "profile ", read.name(), read.profileMarked(), null);
         name(out, "tab     ", read.shown(), read.tabMarked(),
-                "the server has sent no UPDATE_DISPLAY_NAME for this player");
+                "the server sent no UPDATE_DISPLAY_NAME for this player");
         name(out, "overhead", read.nearby(), read.headMarked(),
-                "this client has no loaded entity for this player, or it has no "
-                        + "display name");
+                "this client has no loaded entity or no display name"
+                        + " for this player");
         out.append("        located=").append(read.located())
                 .append(" spectator=").append(read.spectator());
         if (read.located()) {
@@ -1118,7 +1058,7 @@ class VanishProbe implements AutoCloseable {
         out.append('\n');
         out.append("        VERDICT ");
         if (read.derived()) {
-            out.append("REPORTED: no marker on any of the three names");
+            out.append("REPORTED: no marker on the three names");
         } else if (read.unusable() != null) {
             out.append("excluded, not by a marker: ").append(read.unusable());
         } else {
@@ -1126,13 +1066,12 @@ class VanishProbe implements AutoCloseable {
             signals(out, read);
         }
         if (read.derived() != read.reported()) {
-            out.append("   !! but the filter actually ")
+            out.append("   !! the filter actually ")
                     .append(read.reported() ? "REPORTED" : "excluded").append(" it");
         }
         out.append('\n');
     }
 
-    // Every signal that fired, not only the first.
     private static void signals(StringBuilder out, Read read) {
         int at = out.length();
         if (read.profileMarked()) {
@@ -1148,7 +1087,6 @@ class VanishProbe implements AutoCloseable {
         }
     }
 
-    // The stripped form is shown only when it differs.
     private static void name(StringBuilder out, String label, String raw,
                              boolean marked, String whyNull) {
         out.append("        ").append(label).append(' ');
@@ -1170,7 +1108,6 @@ class VanishProbe implements AutoCloseable {
         }
     }
 
-    // Escapes control characters and newlines so a name cannot split a record.
     private static void quoted(StringBuilder out, String raw) {
         out.append('"');
         int length = raw.length();
@@ -1208,33 +1145,17 @@ class VanishProbe implements AutoCloseable {
         return "GeoSurvey vanish probe\n"
                 + "opened " + STAMP.format(LocalDateTime.now()) + "\n"
                 + "\n"
-                + "This file records what the vanish filter saw and decided, read on\n"
-                + "every survey scan: twice a second, and written out only when the\n"
-                + "picture changes, or on the heartbeat below. Nothing in it leaves\n"
-                + "this machine.\n"
-                + ""
                 + "\n"
-                + "Names every listed player, INCLUDING vanished ones. Do not hand it\n"
+                + "This file names every listed player, vanished or not, and stays on this machine: do not hand it\n"
                 + "round.\n"
                 + "\n"
-                + "Each record has two halves: everybody else, then, under \"own\", YOU:\n"
-                + "what the game served your own tab entry while vanished, and what\n"
-                + "the self-gate made of it. \"**\" marks a reading worth a second\n"
-                + "look. \"!!\" marks something that should not have happened.\n"
-                + ""
-                + ""
-                + ""
                 + "\n"
-                + "Each name is shown as the server sent it. Where that differs from\n"
-                + "the stripped form, the stripped form is shown underneath. Both\n"
-                + "forms are checked for markers.\n"
-                + ""
                 + "\n"
-                + "A record is written when the picture changes, and otherwise every\n"
+                + "The probe reads every survey scan, twice a second, and records when the picture changes, or every\n"
                 + HEARTBEAT_MILLIS / MILLIS_PER_SECOND + " seconds."
                 + " Recording stops at " + MAX_BYTES / MEGABYTE + " MB.\n"
                 + "\n"
-                + "Turn it off by setting shareVanishProbe to false.\n";
+                + "Set shareVanishProbe to false to turn it off.\n";
     }
 
     private void drain() {
@@ -1244,7 +1165,7 @@ class VanishProbe implements AutoCloseable {
                 written = open.size();
             }
             write(header());
-            while (!stopped) {
+            while (!stopped && !Thread.currentThread().isInterrupted()) {
                 boolean stopping = closing;
                 Object next = stopping ? due.poll()
                         : due.poll(DRAIN_POLL_MILLIS, TimeUnit.MILLISECONDS);
@@ -1259,7 +1180,7 @@ class VanishProbe implements AutoCloseable {
             Thread.currentThread().interrupt();
         } catch (Throwable trouble) {
             stopped = true;
-            LOGGER.error("The vanish probe stopped recording after a failure."
+            LOGGER.error("The vanish probe stopped after a failure."
                     + " The filter is unaffected.", trouble);
         } finally {
             due.clear();
@@ -1276,10 +1197,10 @@ class VanishProbe implements AutoCloseable {
             long now = clock.getAsLong();
             if (faults == 1 || now - faultSaidAt >= FAULT_SAY_NANOS) {
                 faultSaidAt = now;
-                LOGGER.warn("The vanish probe could not write one record to {}; that"
-                        + " record is missing from the file ({}). The probe is still"
-                        + " armed and will keep trying; {} records have been lost to"
-                        + " write failures so far.", file, oneRecord.toString(),
+                LOGGER.warn("The vanish probe could not write a record to {}"
+                        + " ({}). It keeps trying;"
+                        + " {} records are lost"
+                        + " so far.", file, oneRecord.toString(),
                         faults, oneRecord);
             }
         }
@@ -1320,8 +1241,8 @@ class VanishProbe implements AutoCloseable {
         }
         stopped = true;
         close();
-        LOGGER.warn("The vanish probe reached its size ceiling and stopped"
-                + " recording. The file is {}.", file);
+        LOGGER.warn("The vanish probe reached its size ceiling and stopped."
+                + " The file is {}.", file);
     }
 
     private static long put(SeekableByteChannel open, ByteBuffer bytes)

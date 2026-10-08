@@ -15,7 +15,7 @@ import net.minecraft.world.level.chunk.ChunkSource;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
-// Reads bedrock from chunks already loaded; never fetches new ones.
+// Reads bedrock from loaded chunks only.
 public final class WorldHandshake {
 
     private WorldHandshake() {
@@ -69,7 +69,7 @@ public final class WorldHandshake {
             return nextChunk >= prints.length;
         }
 
-        // Meaningful only once done() is true.
+        // Valid when done() is true.
         public WorldPrint.Reading reading() {
             return new WorldPrint.Reading(
                     WorldPrint.signature(prints, held, region.minX(), region.minZ()),
@@ -82,7 +82,7 @@ public final class WorldHandshake {
                 || !WorldAsk.probesBedrock(region.dimension()) ? null : new Progress(region);
     }
 
-    // Separates one column's biome key from the next in a chunk's digest.
+    // Separates biome keys in a chunk's digest.
     private static final char SEPARATOR = (char) 10;
 
     private static final int BIOME_REACH = 2;
@@ -150,7 +150,7 @@ public final class WorldHandshake {
     }
 
     // Tick thread only.
-    // Returns true once the whole rectangle has been walked.
+    // Returns true when done.
     public static boolean step(Level level, Progress progress) {
         if (progress == null || progress.done()) {
             return true;
@@ -179,7 +179,7 @@ public final class WorldHandshake {
         int here = (toX - fromX + 1) * (toZ - fromZ + 1);
         int width = toX - fromX + 1;
 
-        // false: never load; ChunkStatus.FULL: fully generated chunks only.
+        // false: never load.
         ChunkAccess chunk =
                 level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false);
         if (chunk == null) {
@@ -253,7 +253,6 @@ public final class WorldHandshake {
                 progress.bits[col] = (byte) (packed | (floor ? FLOOR_BIT : 0x00));
                 if (progress.biomes != null) {
 
-                    // "?" marks a biome with no key.
                     at.set(x, bottom, z);
                     Holder<Biome> biome = level.getBiome(at);
                     if (biome != lastBiome) {

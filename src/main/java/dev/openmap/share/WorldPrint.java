@@ -56,7 +56,6 @@ public final class WorldPrint {
 
         private static final char[] HEX = "0123456789abcdef".toCharArray();
 
-        // Held per thread.
         private static final class Digester {
             private final MessageDigest sha;
             private final byte[] prefix = new byte[PREFIX_BYTES];
@@ -67,7 +66,7 @@ public final class WorldPrint {
                 try {
                     sha = MessageDigest.getInstance("SHA-256");
                 } catch (NoSuchAlgorithmException impossible) {
-                    throw new IllegalStateException("SHA-256 is required by the platform",
+                    throw new IllegalStateException("no SHA-256",
                             impossible);
                 }
             }
@@ -172,7 +171,7 @@ public final class WorldPrint {
             try {
                 d.sha.digest(d.out, 0, d.out.length);
             } catch (DigestException impossible) {
-                throw new IllegalStateException("SHA-256 is always 32 bytes", impossible);
+                throw new IllegalStateException("SHA-256 buffer is too small", impossible);
             }
             long value = 0L;
             for (int i = 0; i < Long.BYTES; i++) {
@@ -327,43 +326,6 @@ public final class WorldPrint {
         }
     }
 
-    private static final class WalkWords {
-
-        private WalkWords() {
-        }
-
-        static String saying(List<Region> owed) {
-            if (owed.isEmpty()) {
-                return "Handshake complete. You are now contributing.";
-            }
-            if (owed.size() == 1) {
-                return "Go to " + owed.get(0).name()
-                        + " and walk around until the handshake is complete.";
-            }
-            return "To contribute, " + walkTo(owed);
-        }
-
-        static String walkTo(List<Region> owed) {
-            StringBuilder out = new StringBuilder("go to ");
-            int count = owed.size();
-            for (int i = 0; i < count; i++) {
-                if (i > 0) {
-                    out.append(i == count - 1 ? ", then go to " : ", ");
-                }
-                out.append(owed.get(i).name());
-            }
-            return out.append(" and walk around.").toString();
-        }
-
-        static String accepted(String region, List<Region> left) {
-            if (left.isEmpty()) {
-                return saying(left);
-            }
-            return "Ground accepted at " + region + ". " + left.size() + " to go: "
-                    + walkTo(left);
-        }
-    }
-
     public static final int SCHEME_BEDROCK = 1;
 
     public static final int SCHEME_BEDROCK_AND_BIOME = 2;
@@ -382,7 +344,7 @@ public final class WorldPrint {
             }
             if (maxX < minX || maxZ < minZ) {
                 throw new IllegalArgumentException("region " + name
-                        + " has a maximum corner below its minimum");
+                        + " has corners out of order");
             }
         }
 
@@ -468,22 +430,26 @@ public final class WorldPrint {
     }
 
     public static String saying(List<Region> owed) {
-        return WalkWords.saying(owed);
-    }
-
-    public static String walkTo(List<Region> owed) {
-        return WalkWords.walkTo(owed);
+        return HandshakeWords.saying(owed);
     }
 
     public static String accepted(String region, List<Region> left) {
-        return WalkWords.accepted(region, left);
+        return HandshakeWords.accepted(region, left);
+    }
+
+    public static String acceptedAt(String region) {
+        return HandshakeWords.acceptedAt(region);
+    }
+
+    public static String leftToWalk(List<Region> left) {
+        return HandshakeWords.leftToWalk(left);
     }
 
     public static int chunkOf(int block) {
         return block >> CHUNK_BLOCK_SHIFT;
     }
 
-    // The chunk walk order must match the digest's chunk order.
+    // Walk order must match the digest's chunk order.
     public static int walkX(int n, int wide) {
         return n % wide;
     }
@@ -496,7 +462,7 @@ public final class WorldPrint {
         return Fingerprints.digest(bits, x, z);
     }
 
-    // Null biomes when unused, else each column's biome key, newline joined, in bits' walk order.
+    // Null biomes when unused, else each column's key, newline joined, in bits' walk order.
     public static long digest(byte[] bits, String biomes, int x, int z) {
         return Fingerprints.digest(bits, biomes, x, z);
     }
@@ -510,7 +476,7 @@ public final class WorldPrint {
         return Fingerprints.signature(prints, minX, minZ);
     }
 
-    // minX and minZ are block coordinates; length is a count of prints, not bytes.
+    // minX and minZ are block coordinates; length counts prints, not bytes.
     public static String signature(long[] prints, int length, int minX, int minZ) {
         return Fingerprints.signature(prints, length, minX, minZ);
     }

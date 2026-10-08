@@ -92,8 +92,6 @@ public final class LabelText {
         boolean more = at < len;
         String result;
         if (more && drawn == maxDrawn && end == len && !moreToDraw(raw, at, end)) {
-            // Valid only when end == len: only then has moreToDraw scanned
-            // the whole rest of the string.
             if (cleaned == null) {
                 result = raw.substring(0, at);
             } else {

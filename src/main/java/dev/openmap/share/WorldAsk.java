@@ -12,12 +12,11 @@ public final class WorldAsk {
 
     public static final int VERSION = 1;
 
-    // Matches Directory.MAX_BODY.
     public static final int MAX_BODY = Directory.MAX_BODY;
 
     public static final int MAX_REGIONS = 32;
 
-    // Bounded by the client's maximum render distance.
+    // Bounded by the maximum render distance.
     public static final int MAX_REGION_SPAN = 2_048;
 
     private WorldAsk() {
@@ -112,6 +111,8 @@ public final class WorldAsk {
 
         private boolean accepted = false;
 
+        private boolean refused = false;
+
         private boolean listed = false;
 
         private int count = 0;
@@ -120,6 +121,11 @@ public final class WorldAsk {
 
         public boolean accepted() {
             return accepted;
+        }
+
+        // The reply says accepted is false.
+        public boolean refused() {
+            return refused;
         }
 
         public boolean listed() {
@@ -146,6 +152,7 @@ public final class WorldAsk {
             reply.clear();
             boolean read = parsed(body, reply);
             accepted = read && reply.accepted;
+            refused = read && reply.refusedAnswer;
             listed = accepted && reply.namesListed && (reply.seenNames <= MAX_REGIONS)
                     && !reply.refusedName;
             count = listed ? reply.keptNames : 0;
@@ -162,6 +169,10 @@ public final class WorldAsk {
 
         private boolean refusedRow = false;
 
+        private boolean regionsCut = false;
+
+        private List<String> refusedNames = List.of();
+
         private int count = 0;
 
         public boolean understood() {
@@ -170,6 +181,16 @@ public final class WorldAsk {
 
         public boolean refusedRow() {
             return refusedRow;
+        }
+
+        // More than MAX_REGIONS rows listed.
+        public boolean regionsCut() {
+            return regionsCut;
+        }
+
+        // Refused row names; "" when unreadable.
+        public List<String> refusedNames() {
+            return refusedNames;
         }
 
         public int count() {
@@ -197,6 +218,8 @@ public final class WorldAsk {
             boolean listed = read(body, reply) && reply.regionsListed;
             understood = listed;
             refusedRow = listed && reply.refusedRow;
+            regionsCut = listed && reply.regionsCut;
+            refusedNames = listed ? frozen(reply.refusedNames, reply.refusedCount) : List.of();
             count = listed ? reply.keptRows : 0;
             reply.clear();
         }
@@ -376,7 +399,7 @@ public final class WorldAsk {
         return List.copyOf(out);
     }
 
-    // Null when the row cannot be read as a region.
+    // Null when the row is not a region.
     private static WorldPrint.Region region(Reply row) {
         String name = row.rowName;
         if (name == null || name.length() > WorldProof.MAX_NAME || name.isBlank()) {
@@ -466,17 +489,26 @@ public final class WorldAsk {
 
         private boolean accepted;
 
+        private boolean refusedAnswer = false;
+
         private boolean regionsListed;
 
         private boolean namesListed;
 
         private boolean refusedRow;
 
+        private boolean regionsCut = false;
+
         private boolean refusedName;
 
         private WorldPrint.Region[] keptRegions;
 
         private String[] foundNames;
+
+        // Null until a refusal.
+        private String[] refusedNames = null;
+
+        private int refusedCount = 0;
 
         private String rowName;
 
@@ -542,7 +574,7 @@ public final class WorldAsk {
                 case DOCUMENT -> beginMemberArray();
                 case REGION_LIST -> {
                     seenRows++;
-                    refusedRow = true;
+                    refuseRow(null);
                     push(Where.UNREAD);
                 }
                 case NAME_LIST -> {
@@ -575,20 +607,38 @@ public final class WorldAsk {
 
         @Override
         public void stringValue(String text) {
-            scalar(text);
+            if ((here() == Where.ROW) && readsInteger()) {
+                rowInteger(NO_INTEGER);
+            } else {
+                scalar(text);
+            }
         }
 
         @Override
         public void numberValue(String token) {
-            scalar(token);
+            if ((here() == Where.DOCUMENT) && (member == Member.VERSION)) {
+                versionSaysOne = WireVersion.is(token, VERSION);
+            } else if (here() == Where.ROW) {
+                if (readsInteger()) {
+                    rowInteger(integer(token));
+                } else {
+                    rowValue(null);
+                }
+            } else {
+                scalar(token);
+            }
         }
 
         @Override
         public void numberValue(CharSequence document, int start, int end) {
             if ((here() == Where.DOCUMENT) && (member == Member.VERSION)) {
-                version(exactIntegerIn(document, start, end));
-            } else if ((here() == Where.ROW) && readsInteger()) {
-                rowInteger(integer(document, start, end));
+                versionSaysOne = WireVersion.is(document.subSequence(start, end), VERSION);
+            } else if (here() == Where.ROW) {
+                if (readsInteger()) {
+                    rowInteger(integer(document, start, end));
+                } else {
+                    rowValue(null);
+                }
             } else {
                 scalar(document.subSequence(start, end).toString());
             }
@@ -609,7 +659,7 @@ public final class WorldAsk {
                 case DOCUMENT -> memberValue(text);
                 case REGION_LIST -> {
                     seenRows++;
-                    refusedRow = true;
+                    refuseRow(null);
                 }
                 case NAME_LIST -> nameValue(text);
                 case ROW -> rowValue(text);
@@ -621,7 +671,7 @@ public final class WorldAsk {
         private void beginRow() {
             seenRows++;
             if (seenRows > MAX_REGIONS) {
-                refusedRow = true;
+                refuseRow(null);
                 push(Where.UNREAD);
             } else {
                 startRow();
@@ -645,6 +695,7 @@ public final class WorldAsk {
             if (names != null) {
                 Arrays.fill(names, 0, keptNames, null);
             }
+            dropRefused();
             member = Member.NONE;
             field = Field.NONE;
             depth = 0;
@@ -654,9 +705,11 @@ public final class WorldAsk {
             keptNames = 0;
             versionSaysOne = false;
             accepted = false;
+            refusedAnswer = false;
             regionsListed = false;
             namesListed = false;
             refusedRow = false;
+            regionsCut = false;
             refusedName = false;
             startRow();
         }
@@ -664,10 +717,34 @@ public final class WorldAsk {
         private void keepRow() {
             WorldPrint.Region region = region(this);
             if (region == null) {
-                refusedRow = true;
+                refuseRow(rowName);
             } else {
                 store(region);
             }
+        }
+
+        private void refuseRow(String stated) {
+            refusedRow = true;
+            if (seenRows > MAX_REGIONS) {
+                regionsCut = true;
+            } else {
+                String[] room = refusedNames;
+                if (room == null) {
+                    room = new String[MAX_REGIONS];
+                    refusedNames = room;
+                }
+                boolean named = stated != null && !stated.isBlank()
+                        && stated.length() <= WorldProof.MAX_NAME;
+                room[refusedCount++] = named ? stated : "";
+            }
+        }
+
+        private void dropRefused() {
+            String[] room = refusedNames;
+            if (room != null) {
+                Arrays.fill(room, 0, refusedCount, null);
+            }
+            refusedCount = 0;
         }
 
         private WorldPrint.Region regionOf(String name, String dimension, int kind) {
@@ -736,8 +813,11 @@ public final class WorldAsk {
 
         private void memberValue(String text) {
             switch (member) {
-                case VERSION -> version(Directory.exactIntegerOf(text));
-                case ACCEPTED -> accepted = Boolean.parseBoolean(text);
+                case VERSION -> versionSaysOne = false;
+                case ACCEPTED -> {
+                    accepted = Boolean.parseBoolean(text);
+                    refusedAnswer = text != null && !accepted;
+                }
                 case REGIONS -> regionsListed = false;
                 case REMAINING -> namesListed = false;
                 default -> {
@@ -748,7 +828,10 @@ public final class WorldAsk {
         private void memberIsContainer() {
             switch (member) {
                 case VERSION -> versionSaysOne = false;
-                case ACCEPTED -> accepted = false;
+                case ACCEPTED -> {
+                    accepted = false;
+                    refusedAnswer = false;
+                }
                 case REGIONS -> regionsListed = false;
                 case REMAINING -> namesListed = false;
                 default -> {
@@ -764,6 +847,7 @@ public final class WorldAsk {
                 }
                 case ACCEPTED -> {
                     accepted = false;
+                    refusedAnswer = false;
                     push(Where.UNREAD);
                 }
                 case REGIONS -> {
@@ -771,6 +855,8 @@ public final class WorldAsk {
                     seenRows = 0;
                     keptRows = 0;
                     refusedRow = false;
+                    regionsCut = false;
+                    dropRefused();
                     push(Where.REGION_LIST);
                 }
                 case REMAINING -> {
@@ -792,10 +878,6 @@ public final class WorldAsk {
                 default -> {
                 }
             }
-        }
-
-        private void version(long exact) {
-            versionSaysOne = exact == VERSION;
         }
 
         private boolean readsInteger() {

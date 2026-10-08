@@ -15,10 +15,8 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 
-// Bounds or repairs one unresolvable name so it cannot stretch the tab list.
-// Changes only the overlay's own copy; PlayerInfo.getTabListDisplayName, which
-// the vanish filter reads, is untouched. Runs at RETURN, after vanilla's own
-// decoration.
+// Bounds or repairs an unresolvable tab list name.
+// Changes only the overlay's copy, never PlayerInfo.getTabListDisplayName.
 @Mixin(PlayerTabOverlay.class)
 public abstract class PlayerTabOverlayMixin {
 
@@ -29,7 +27,6 @@ public abstract class PlayerTabOverlayMixin {
     private final IdentityHashMap<PlayerInfo, Component> landnav$settled =
             new IdentityHashMap<>(landnav$SETTLED_CEILING);
 
-    // The Language active when the matching entry was cached.
     @Unique
     private final IdentityHashMap<PlayerInfo, Language> landnav$settledLanguage =
             new IdentityHashMap<>(landnav$SETTLED_CEILING);

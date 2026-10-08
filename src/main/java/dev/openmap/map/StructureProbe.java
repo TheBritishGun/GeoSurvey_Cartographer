@@ -6,7 +6,7 @@ public final class StructureProbe {
 
         WOOD,
 
-        // Reads as a roof, not a floor.
+        // A roof, not a floor.
         CANOPY,
 
         AIR,
@@ -51,8 +51,7 @@ public final class StructureProbe {
         boolean naturalSeen = false;
         boolean found = false;
         // Canopy is not a floor.
-        // Furniture below already-read natural ground does not settle the
-        // column.
+        // Furniture below natural ground does not settle the column.
         for (int i = at; i < column.length && !found; i++) {
             Kind kind = column[i];
             boolean natural = kind == Kind.NATURAL;

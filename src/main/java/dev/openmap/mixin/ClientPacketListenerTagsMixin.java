@@ -8,8 +8,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-// Tells ChunkSampler and LandCoverClassifier when tags change while still in
-// PLAY, such as a server reload. Runs at TAIL, after vanilla applies the update.
+// Notifies ChunkSampler and LandCoverClassifier when tags update in PLAY.
 @Mixin(ClientPacketListener.class)
 public abstract class ClientPacketListenerTagsMixin {
 

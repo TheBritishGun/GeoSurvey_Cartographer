@@ -1,6 +1,7 @@
 package dev.openmap.client;
 
 import dev.sandpaper.Sandpaper;
+import dev.sandpaper.core.Background;
 import dev.sandpaper.core.WorkPool;
 import dev.openmap.LandNav;
 import dev.openmap.config.LandNavConfig;
@@ -13,6 +14,7 @@ import dev.openmap.share.Directory;
 import dev.openmap.share.MapCard;
 import dev.openmap.share.SpawnPrint;
 import java.io.File;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -21,8 +23,11 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
@@ -34,14 +39,19 @@ import net.minecraft.world.level.storage.LevelData;
 public final class CollectorFinder {
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
-    // At most one search runs at a time.
     private static final AtomicBoolean ASKING = new AtomicBoolean();
 
     private static final AtomicReference<Search> RUNNING = new AtomicReference<>();
 
-    private static final int FIXED_SEED_COUNT = 3;
+    private static final long CHECK_TIMEOUT_MILLIS = 3_000L;
+
+    private static final AtomicLong LATEST_CHECK = new AtomicLong();
+
+    private static volatile Consumer<Runnable> completionRunnerForTests;
+
+    private static final int FIXED_SEED_COUNT = 4;
 
     private static final int LINES_BESIDE_ADDRESSES = 8;
 
@@ -65,18 +75,17 @@ public final class CollectorFinder {
     }
 
     private static final String CUT_SHORT =
-            "The search stopped before every address was asked.";
+            "The search stopped early.";
 
     private CollectorFinder() {
     }
 
-    // Asks the seeds, then prints what came back. Returns at once; the search runs
-    // on a background thread.
+    // Returns at once; a thread searches.
     public static int offer(FabricClientCommandSource source, LandNavConfig config) {
         ShareSender sender = ShareSender.live();
         int result;
         if (sender == null) {
-            say(source, "The sender is not running. Join a server and try again.");
+            say(source, "Join a server first.");
             result = 0;
         } else {
             WorkPool pool = Sandpaper.workPool();
@@ -84,14 +93,14 @@ public final class CollectorFinder {
             releaseIfDroppedUnrun();
             releaseIfLeft(session);
             if (!ASKING.compareAndSet(false, true)) {
-                say(source, "One search is running. Wait for it to answer.");
+                say(source, "One search runs. Wait for it.");
                 result = 0;
             } else {
                 ClientRead client = readClient(config);
                 WorkPool.Receipt receipt = new WorkPool.Receipt();
                 Search mine = new Search(receipt, session);
                 RUNNING.set(mine);
-                boolean taken = pool.submit(LandNav.MOD_ID, () -> {
+                boolean taken = pool.submit(CollectorMod.MOD_ID, () -> {
                     try {
                         run(source, session, client, config, sender, mine);
                     } catch (RuntimeException whatever) {
@@ -104,8 +113,8 @@ public final class CollectorFinder {
                 }, done -> { }, receipt);
                 if (!taken) {
                     release(mine);
-                    say(source, "Nothing asked: every worker is busy and"
-                            + " the queue is full. No setting changed. Try again"
+                    say(source, "Nothing asked: every worker is busy."
+                            + " Try again"
                             + " shortly.");
                     result = 0;
                 } else {
@@ -116,9 +125,129 @@ public final class CollectorFinder {
         return result;
     }
 
+    static int check(FabricClientCommandSource source, LandNavConfig config, String typed,
+                     ShareCommand.Persist persist) {
+        ShareCommand.CollectorAddress requested = ShareCommand.collectorAddress(typed);
+        if (!requested.accepted()) {
+            say(source, new ShareCommand.Answer(false, requested.refusal()));
+            return 0;
+        }
+        ShareSender sender = ShareSender.live();
+        if (sender == null) {
+            say(source, new ShareCommand.Answer(false,
+                    "Join a server first."));
+            return 0;
+        }
+        long number = LATEST_CHECK.incrementAndGet();
+        say(source, "GeoSurvey checks that address.");
+        check(sender, requested.address(), answered -> completeOnClientThread(
+                () -> finishCheck(source, config, requested.address(), persist, number, answered)));
+        return 1;
+    }
+
+    private static void finishCheck(FabricClientCommandSource source, LandNavConfig config,
+                                    String address, ShareCommand.Persist persist, long number,
+                                    boolean answered) {
+        if (number != LATEST_CHECK.get()) {
+            return;
+        }
+        if (!answered) {
+            say(source, new ShareCommand.Answer(false,
+                    "Nothing was set. That address does not answer as a collector."));
+            return;
+        }
+        ShareCommand.Answer result = ShareCommand.collector(config, address, persist);
+        say(source, result);
+    }
+
+    interface Answered {
+
+        void accept(boolean answered);
+    }
+
+    static void check(ShareSender sender, String address, CollectorAddressCheck waiting) {
+        check(sender, address, answered -> completeOnClientThread(
+                () -> waiting.heard(address, answered)));
+    }
+
+    static String askOrigin(String address) {
+        URI endpoint = ShareSender.endpointOf(address, "");
+        if (endpoint == null || endpoint.getScheme() == null || endpoint.getHost() == null
+                || endpoint.getHost().isEmpty()) {
+            return address;
+        }
+        StringBuilder origin = new StringBuilder();
+        origin.append(endpoint.getScheme()).append("://").append(endpoint.getHost());
+        if (endpoint.getPort() >= 0) {
+            origin.append(':').append(endpoint.getPort());
+        }
+        return origin.toString();
+    }
+
+    static void runWithCompletionRunnerForced(Consumer<Runnable> runner, Runnable work) {
+        completionRunnerForTests = runner;
+        try {
+            work.run();
+        } finally {
+            completionRunnerForTests = null;
+        }
+    }
+
     private static void run(FabricClientCommandSource source, LandNavConfig config,
                             ShareSender sender) {
         run(source, currentSession(), readClient(config), config, sender, null);
+    }
+
+    private static void check(ShareSender sender, String address, Answered result) {
+        Thread checking = Background.thread(() -> {
+            try {
+                result.accept(answers(sender, address));
+            } catch (RuntimeException failed) {
+                LOGGER.warn("collector check stopped", failed);
+            }
+        }, "geosurvey-collector-check");
+        StoppableWorkers.thread("geosurvey-collector-check", checking);
+        checking.start();
+    }
+
+    private static boolean answers(ShareSender sender, String address) {
+        AtomicReference<Directory.Found> found = new AtomicReference<>(Directory.Found.nothing());
+        Thread probe = Background.thread(() -> {
+            try {
+                found.set(sender.discover(List.of(askOrigin(address))));
+            } catch (RuntimeException failed) {
+                LOGGER.warn("collector check could not read the reply", failed);
+            }
+        }, "geosurvey-collector-probe");
+        StoppableWorkers.thread("geosurvey-collector-probe", probe);
+        probe.start();
+        boolean overdue;
+        boolean answered;
+        try {
+            probe.join(CHECK_TIMEOUT_MILLIS);
+            overdue = probe.isAlive();
+            answered = !overdue && !found.get().answered().isEmpty();
+        } catch (InterruptedException stopped) {
+            Thread.currentThread().interrupt();
+            overdue = true;
+            answered = false;
+        }
+        if (overdue) {
+            probe.interrupt();
+        }
+        return answered;
+    }
+
+    private static void completeOnClientThread(Runnable completion) {
+        Consumer<Runnable> runner = completionRunnerForTests;
+        if (runner != null) {
+            runner.accept(completion);
+            return;
+        }
+        Minecraft client = Minecraft.getInstance();
+        if (client != null) {
+            client.execute(completion);
+        }
     }
 
     private static void run(FabricClientCommandSource source, ClientPacketListener session,
@@ -126,6 +255,10 @@ public final class CollectorFinder {
                             Search mine) {
         CardScan scan = scanCards(client);
         List<String> spoken = new ArrayList<>(cardLines(scan));
+        String known = ChunkCapture.knownCollector(scan.server());
+        if (!known.isEmpty()) {
+            spoken.add(0, "This server's known collector: " + known + ".");
+        }
         List<String> seeds = seeds(client.collector(), CardCheck.usableOrigins(scan.results()), scan.server(),
                 client.directorySeed());
         if (seeds.isEmpty()) {
@@ -134,7 +267,7 @@ public final class CollectorFinder {
             speakLater(source, session, () -> speak(source, spoken));
         } else {
             spoken.add("Asking " + seeds.size() + " addresses which collectors they"
-                    + " publish. No position and no player list goes with it.");
+                    + " publish. No position or player list goes with it.");
             speakProgress(source, session, spoken);
             if (!abandoned(mine)) {
                 Directory.Found found = sender.discover(seeds, () -> abandoned(mine));
@@ -168,8 +301,8 @@ public final class CollectorFinder {
                     speech.run();
                     return;
                 }
-                say(source, "That search belonged to a world you have left. Its answer"
-                        + " is not shown. No setting changed.");
+                say(source, "That search was for a world you left. Its answer"
+                        + " is not shown.");
             });
         }
     }
@@ -186,9 +319,9 @@ public final class CollectorFinder {
     }
 
     private static List<String> stoppedPartWay(RuntimeException whatever) {
-        LOGGER.warn("collector find stopped part way through", whatever);
-        return List.of("The search stopped part way through."
-                + " No setting changed. The client log has the"
+        LOGGER.warn("collector find failed", whatever);
+        return List.of("The search failed."
+                + " The client log has the"
                 + " detail.");
     }
 
@@ -247,13 +380,11 @@ public final class CollectorFinder {
         ASKING.set(false);
     }
 
-    // The addresses worth asking when no map card was checked.
     static List<String> seeds(LandNavConfig config) {
         return seeds(config, List.of());
     }
 
-    // The addresses worth asking, most likely first.
-    // fromCards: matched cards only; a near miss or a mismatch contributes nothing.
+    // Most likely first; fromCards: matched cards only.
     static List<String> seeds(LandNavConfig config, List<String> fromCards) {
         Minecraft client = Minecraft.getInstance();
         String server = client == null ? null : ChunkCapture.shareServer(client);
@@ -267,8 +398,9 @@ public final class CollectorFinder {
     private static List<String> seeds(String collector, List<String> fromCards, String server,
                                       String directorySeed) {
         String[] candidates = new String[FIXED_SEED_COUNT + fromCards.size()];
-        candidates[0] = collector;
-        int at = 1;
+        candidates[0] = ChunkCapture.knownCollector(server);
+        candidates[1] = collector;
+        int at = 2;
         for (String card : fromCards) {
             candidates[at++] = card;
         }
@@ -277,8 +409,7 @@ public final class CollectorFinder {
         return Directory.seeds(candidates);
     }
 
-    // results holds one entry per readable card, not per read.
-    // server and spawnNote are empty, not null, when there is none.
+    // results has 1 entry per readable card; server and spawnNote are never null.
     record CardScan(List<MapCard.Read> reads, List<CardCheck.Result> results,
             String server, String spawnNote, int entries) {
 
@@ -292,7 +423,7 @@ public final class CollectorFinder {
         }
     }
 
-    // Checks each map card against the saved survey; off a server every card reads NO_MAP.
+    // Off a server every card reads NO_MAP.
     static CardScan scanCards(LandNavConfig config) {
         return scanCards(readClient(config));
     }
@@ -317,7 +448,6 @@ public final class CollectorFinder {
                 if (survey != null) {
                     results.add(CardCheck.of(read.card(), survey.apply(read.card().dimension())));
                 } else if (onServer) {
-                    // Joined, but nothing surveyed yet for this server.
                     results.add(new CardCheck.Result(read.card(), CardCheck.Verdict.NOT_SURVEYED,
                             SpawnPrint.Agreement.NONE));
                 } else {
@@ -329,7 +459,7 @@ public final class CollectorFinder {
         return scan;
     }
 
-    // This client's own saved survey of one server, by dimension. Null when never surveyed.
+    // Null when nothing is saved.
     static Function<String, ChunkSource> surveyOf(Path dataDir, String server) {
         return surveyOf(dataDir, server, FreshGround.NONE);
     }
@@ -339,7 +469,6 @@ public final class CollectorFinder {
         if (dataDir == null) {
             return null;
         }
-        // Resolves the folder the same way the writer does (ChunkCapture.serverWorldDir).
         Path root = ChunkCapture.serverWorldDir(dataDir, server);
         if (!Files.isDirectory(root)) {
             return null;
@@ -364,7 +493,6 @@ public final class CollectorFinder {
         };
     }
 
-    // Live samples for one already-stored dimension key; FreshGround.NONE when there are none.
     static FreshGround freshGround(ChunkCapture live, List<MapCard.Read> reads) {
         if (live == null || reads.isEmpty()) {
             return FreshGround.NONE;
@@ -404,7 +532,6 @@ public final class CollectorFinder {
         return byChunk == null ? FreshGround.NONE : new FreshGround(stored, byChunk);
     }
 
-    // Where the server says its spawn point is, or empty when it has not said.
     private static String spawnNote(Minecraft client) {
         ClientLevel level = client == null ? null : client.level;
         if (level == null) {
@@ -414,18 +541,16 @@ public final class CollectorFinder {
         if (spawn == null || spawn.equals(LevelData.RespawnData.DEFAULT)) {
             return "";
         }
-        return "This server puts its spawn point at chunk " + (spawn.pos().getX() >> ChunkSource.CHUNK_SHIFT)
+        return "Server spawn: chunk " + (spawn.pos().getX() >> ChunkSource.CHUNK_SHIFT)
                 + ", " + (spawn.pos().getZ() >> ChunkSource.CHUNK_SHIFT) + " in "
                 + spawn.dimension().identifier() + ".";
     }
 
-    // What the player reads about their map cards, one line each; empty when none are set.
     static List<String> cardLines(CardScan scan) {
         if (scan == null || scan.reads().isEmpty()) {
             return new ArrayList<>();
         }
         List<String> out = new ArrayList<>();
-        // Counts cards, not unique origins (unlike usableOrigins).
         int matched = 0;
         for (CardCheck.Result result : scan.results()) {
             if (result != null && result.usable()) {
@@ -467,13 +592,12 @@ public final class CollectorFinder {
             out.add("  " + scan.spawnNote());
         }
         if (matched > 0) {
-            out.add("A card that matches adds one address to the list below."
+            out.add("A matching card adds its address to the list below."
                     + " It switches nothing on.");
         }
         return out;
     }
 
-    // What the player reads, as separate lines.
     static List<String> lines(Directory.Found found, LandNavConfig config) {
         List<String> out = new ArrayList<>(found.published().size() + found.answered().size()
                 + LINES_BESIDE_ADDRESSES);
@@ -485,8 +609,8 @@ public final class CollectorFinder {
             out.add("Ask the server operator for an address, then run"
                     + " /geosurvey collector <address>.");
         } else {
-            out.add("Each address below is a host that would receive your position, not"
-                    + " the players you can see.");
+            out.add("Each address below would receive your position,"
+                    + " not other players.");
             if (found.cutShort()) {
                 out.add(CUT_SHORT);
             }
@@ -498,7 +622,6 @@ public final class CollectorFinder {
                 }
             }
 
-            // Addresses that answered but were not part of a published list.
             if (!found.answered().isEmpty()) {
                 List<String> saidNothing = new ArrayList<>();
                 List<String> ownList = new ArrayList<>();
@@ -520,8 +643,8 @@ public final class CollectorFinder {
                     }
                 }
                 if (!ownList.isEmpty()) {
-                    out.add("These answered as collectors and published a list that does not"
-                            + " name them, " + ownList.size() + ":");
+                    out.add("These answered as collectors; their list omits"
+                            + " them, " + ownList.size() + ":");
                     for (String address : ownList) {
                         out.add(mark(address, mine));
                     }
@@ -534,17 +657,16 @@ public final class CollectorFinder {
                     }
                 }
             }
-            out.add("To use one, run /geosurvey collector <address>. That sets the"
-                    + " address and starts contributing. Stop it with /geosurvey share"
-                    + " off.");
-            out.add("A collector can refuse a contributor without saying so. Nothing here"
-                    + " tries another address for you.");
+            out.add("To use one, run /geosurvey collector <address>,"
+                    + " then /geosurvey share on.");
+            out.add("A collector can refuse you without saying so."
+                    + " Nothing here tries another address.");
         }
         return out;
     }
 
     private static String mark(String address, String mine) {
-        return "  " + address + (address.equals(mine) ? "  (set now)" : "");
+        return "  " + address + (address.equals(mine) ? "  (current)" : "");
     }
 
     private static void speak(FabricClientCommandSource source, List<String> lines) {
@@ -556,5 +678,10 @@ public final class CollectorFinder {
     private static void say(FabricClientCommandSource source, String line) {
         source.sendFeedback(
                 Component.literal(line).withStyle(ChatFormatting.GRAY));
+    }
+
+    private static void say(FabricClientCommandSource source, ShareCommand.Answer answer) {
+        String text = answer.ok() ? answer.text() : "ERROR " + answer.text();
+        ShareCommand.eachLine(text, line -> say(source, line));
     }
 }

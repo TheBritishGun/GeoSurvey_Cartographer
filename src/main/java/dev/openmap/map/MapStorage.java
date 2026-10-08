@@ -1,5 +1,8 @@
 package dev.openmap.map;
 
+import dev.openmap.api.GroundChunk;
+import dev.openmap.json.AtomicFileReplace;
+import dev.openmap.share.UtcClock;
 import dev.sandpaper.core.WorkPool;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -41,7 +44,7 @@ public final class MapStorage {
     private record FolderName(String name, boolean markerWasNull) {
     }
 
-    private final class RegionLoad implements MapCodec.ChunkGate {
+    private final class RegionLoad implements MapCodec.ColumnGate {
 
         private final WorkPool.Receipt receipt = new WorkPool.Receipt();
 
@@ -60,7 +63,7 @@ public final class MapStorage {
         private final java.util.function.Consumer<RegionLoad> discard =
                 MapStorage.this::regionLoadDiscarded;
 
-        private final java.util.function.Consumer<ChunkSample> sink = samples::add;
+        private final java.util.function.Consumer<ChunkSample> sink = this::take;
 
         private boolean taken;
 
@@ -85,6 +88,12 @@ public final class MapStorage {
         private volatile ChunkSample[] resident;
 
         private volatile boolean failed;
+
+        private ChunkSample fresh;
+
+        private long diskCapturedAt;
+
+        private int diskCaptureVersion;
 
         private MapStore store() {
             return store;
@@ -166,7 +175,30 @@ public final class MapStorage {
 
         @Override
         public boolean keeps(int chunkX, int chunkZ, long captured, int captureVersion) {
-            return wantsResidentOrNewer(resident, chunkX, chunkZ, captured, captureVersion);
+            fresh = residentSlot(chunkX, chunkZ);
+            diskCapturedAt = captured;
+            diskCaptureVersion = captureVersion;
+            return fresh == null || mayOutrank(captured, captureVersion, fresh);
+        }
+
+        @Override
+        public boolean keepsColumns(byte[] columns, int version,
+                                    java.util.function.IntFunction<LandCover> legacy) {
+            return fresh == null || mayOutrank(diskCapturedAt, diskCaptureVersion, fresh, columns,
+                    version, legacy);
+        }
+
+        private ChunkSample residentSlot(int chunkX, int chunkZ) {
+            if (resident == null) {
+                return null;
+            }
+            return resident[MapStore.regionSlot(chunkX, chunkZ)];
+        }
+
+        private void take(ChunkSample sample) {
+            if (wantsResidentOrNewer(resident, sample)) {
+                samples.add(sample);
+            }
         }
 
         @Override
@@ -360,7 +392,7 @@ public final class MapStorage {
         return dropped;
     }
 
-    // How many samples one pass of drainPendingFolds folds into a store before yielding.
+    // Samples folded per fold in one drainPendingFolds pass.
     private static final int FOLD_SLICE = 128;
 
     private static final class PendingFold {
@@ -654,11 +686,14 @@ public final class MapStorage {
     private final java.util.Map<Path, Long> landmarkLastWritten =
             new java.util.concurrent.ConcurrentHashMap<>();
 
-    // Files whose background save was coalesced away, keyed to the dimension that needs a follow-up snapshot.
+    // Coalesced-away saves: file to the dimension that needs a follow-up snapshot.
     private final java.util.Map<Path, String> landmarksWantedAgain =
             new java.util.concurrent.ConcurrentHashMap<>();
 
-    // How many chunks every dimension may hold between them before the coldest is flushed.
+    // Told after each landmark save, on the client thread; null: nobody.
+    private volatile Markers.Saved landmarksSavedListener;
+
+    // Chunks all dimensions may hold together before the coldest flushes.
     private final long residentBudget;
 
     private long residentChunks;
@@ -678,61 +713,84 @@ public final class MapStorage {
         this.residentBudget = STORES_KEPT_RESIDENT * capacity;
     }
 
-    // The file naming which raw world key a directory was claimed for.
+    // The file naming the raw key that claimed a directory.
     public static final String MARKER = "world.id";
 
     public static final String DIMENSION_MARKER = "dimension.id";
 
+    // The key GeoSurvey knows a folder by now; this class reads it and never writes it.
+    private static final String CURRENT_MARKER = "world.current";
+
+    private static final String SAVE_KEY_PREFIX = "singleplayer-";
+
     private static final String[] NO_PRIOR_KEYS = new String[0];
 
+    // The start of the key of a single-player save.
+    public static String saveKeyPrefix() {
+        return SAVE_KEY_PREFIX;
+    }
 
-    // The directory holding one world's map, and no other world's.
+
+    // The directory holding one world's map only.
     public static Path worldDir(Path dataDir, String rawKey) {
         return worldDir(dataDir, rawKey, NO_PRIOR_KEYS);
     }
 
-    // The same, but also told this world's older spellings, priorKeys newest first.
+    // priorKeys: this world's older spellings, newest first.
     public static Path worldDir(Path dataDir, String rawKey, String... priorKeys) {
         String stripped = stripUnsafe(rawKey);
         String name = guardDevice(stripped);
         Path first = dataDir.resolve(name);
         String held = markerOf(first);
         String key = rawKey == null ? "" : rawKey.strip();
-        if (held != null && held.equals(key)) {
+        if (held != null && (held.equals(key) || spellsSameServer(held, key))) {
             return first;
         }
+        Path current = key.isEmpty() ? null : currentKeyDir(dataDir, key);
+        if (current != null) {
+            return current;
+        }
 
-        // Same folder, older spelling: two keys that sanitise alike; only the marker tells them apart.
         boolean heldBefore = held != null && heldUnderAPrior(held, priorKeys);
 
-        // A folder under an older name, checked before the unmarked adopt below.
         Path found = heldBefore ? first : null;
         for (int at = 0; at < priorKeys.length && found == null; at++) {
             String prior = priorKeys[at];
-            String priorName = sanitise(prior);
-            Path was = dataDir.resolve(priorName);
             String priorKey = prior == null ? "" : prior.strip();
-            if (!was.equals(first)) {
-                String there = markerOf(was);
-                if (there != null && there.equals(priorKey)) {
-                    found = was;
-                }
-            }
-            if (found == null) {
-                Path diverted = dataDir.resolve(priorName + "-" + shortHash(prior));
-                if (!diverted.equals(first)) {
-                    String divertedMarker = markerOf(diverted);
-                    if (divertedMarker != null && divertedMarker.equals(priorKey)) {
-                        found = diverted;
-                    }
-                }
-            }
+            found = priorFolder(new WorldSearch(dataDir, first, held, priorKey, NO_PRIOR_KEYS), sanitise(prior),
+                    prior);
         }
         if (found == null) {
-            if (held == null) {
-                found = unmarkedFolder(dataDir, stripped, first, key);
-            } else {
-                found = worldDivert(dataDir, name, rawKey, key);
+            found = ownFolder(new WorldSearch(dataDir, first, held, key, priorKeys), stripped, name, rawKey);
+        }
+        return found;
+    }
+
+    // A server key written in another letter case is the same server; a save key is exact.
+    private static boolean spellsSameServer(String marker, String key) {
+        return !key.startsWith(SAVE_KEY_PREFIX) && marker.equalsIgnoreCase(key);
+    }
+
+    // This world's marker: its key, the same server in another letter case, or an older spelling.
+    private static boolean markerIsThisWorld(String marker, String key, String[] priorKeys) {
+        return marker.equals(key) || spellsSameServer(marker, key) || heldUnderAPrior(marker, priorKeys);
+    }
+
+    // The directory whose current marker names this key, or null.
+    private static Path currentKeyDir(Path dataDir, String key) {
+        Path found = null;
+        if (Files.isDirectory(dataDir)) {
+            try (java.nio.file.DirectoryStream<Path> directories = Files.newDirectoryStream(dataDir)) {
+                java.util.Iterator<Path> each = directories.iterator();
+                while (found == null && each.hasNext()) {
+                    Path directory = each.next();
+                    if (Files.isRegularFile(directory.resolve(CURRENT_MARKER))
+                            && key.equals(markerOf(directory, CURRENT_MARKER))) {
+                        found = directory;
+                    }
+                }
+            } catch (IOException | RuntimeException unreadable) {
+                found = null;
             }
         }
         return found;
@@ -747,38 +805,189 @@ public final class MapStorage {
         return matched;
     }
 
-    private static Path unmarkedFolder(Path dataDir, String stripped, Path first, String key) {
-        Path unguarded = dataDir.resolve(stripped);
-        boolean adopted = !unguarded.equals(first) && key.equals(markerOf(unguarded));
-        return adopted ? unguarded : first;
+    // A folder search over both collision chains: where it looks, how it reads a marker, and whose marker counts.
+    private interface Search {
+
+        Path dataDir();
+
+        String markerAt(Path dir);
+
+        boolean isOurs(String marker);
+    }
+
+    // One key's folder search: the first folder, its marker, the key and its older spellings.
+    private record WorldSearch(Path dataDir, Path first, String held, String key, String[] priorKeys)
+            implements Search {
+
+        // The first folder's marker is already held.
+        @Override
+        public String markerAt(Path dir) {
+            return dir.equals(first) ? held : markerOf(dir);
+        }
+
+        @Override
+        public boolean isOurs(String marker) {
+            return marker != null && markerIsThisWorld(marker, key, priorKeys);
+        }
+    }
+
+    // One dimension's folder search: the world folder its folders lie in, and the dimension id.
+    private record DimensionSearch(Path dataDir, String id) implements Search {
+
+        @Override
+        public String markerAt(Path dir) {
+            return markerOf(dir, DIMENSION_MARKER);
+        }
+
+        @Override
+        public boolean isOurs(String marker) {
+            return id.equals(marker);
+        }
+    }
+
+    // ours: a folder whose marker counts; unmarked: one with no marker; free: where a new folder goes.
+    private record Collisions(Path ours, Path unmarked, Path free) {
+    }
+
+    // An older spelling's own folder, else its collision folder; null when neither holds that spelling.
+    private static Path priorFolder(WorldSearch prior, String priorName, String rawPrior) {
+        Path was = prior.dataDir().resolve(priorName);
+        String there = was.equals(prior.first()) ? null : markerOf(was);
+        Path found;
+        if (there != null && there.equals(prior.key())) {
+            found = was;
+        } else {
+            found = collisions(prior, priorName + "-" + shortHash(rawPrior)).ours();
+        }
+        return found;
+    }
+
+    // The folder from before the device guard, then this key's collision folders, then the first folder.
+    private static Path ownFolder(WorldSearch own, String stripped, String name, String rawKey) {
+        Path unguarded = own.dataDir().resolve(stripped);
+        Path found;
+        if (!unguarded.equals(own.first()) && own.isOurs(markerOf(unguarded))) {
+            found = unguarded;
+        } else {
+            Collisions chains = collisions(own, name + "-" + shortHash(rawKey));
+            found = own.held() == null ? ownOrFirst(chains, own.first()) : ownOrFree(chains);
+        }
+        return found;
+    }
+
+    // The hashed collision folder, then the collector's chain after it, then GeoSurvey's numbered chain.
+    private static Collisions collisions(Search search, String stem) {
+        Path hashed = search.dataDir().resolve(stem);
+        String there = search.markerAt(hashed);
+        Collisions found;
+        if (there == null) {
+            found = new Collisions(null, null, hashed);
+        } else if (search.isOurs(there)) {
+            found = new Collisions(hashed, null, null);
+        } else {
+            found = pastTheHashedFolder(search, stem);
+        }
+        return found;
+    }
+
+    // Each chain stops at a folder with no marker; the collector's chain is asked first.
+    private static Collisions pastTheHashedFolder(Search search, String stem) {
+        Collisions collectors = collectorChain(search, stem);
+        Collisions found;
+        if (collectors.ours() != null) {
+            found = collectors;
+        } else {
+            Collisions numbered = numberedChain(search, stem);
+            found = new Collisions(numbered.ours(), collectors.unmarked(),
+                    numbered.free() == null ? collectors.free() : numbered.free());
+        }
+        return found;
+    }
+
+    // The collector's own chain: each name adds a dash and the hash of the name before it.
+    private static Collisions collectorChain(Search search, String stem) {
+        Path ours = null;
+        Path stopped = null;
+        String divert = stem;
+        for (int looked = 1; looked < MAX_FOLDER_DIVERTS && ours == null && stopped == null; looked++) {
+            divert = divert + "-" + shortHash(divert);
+            Path at = search.dataDir().resolve(divert);
+            String there = search.markerAt(at);
+            if (there == null) {
+                stopped = at;
+            }
+            if (search.isOurs(there)) {
+                ours = at;
+            }
+        }
+        boolean exhausted = ours == null && stopped == null;
+        Path free = exhausted ? search.dataDir().resolve(divert + "-" + shortHash(divert)) : stopped;
+        Path unmarked = (stopped != null && Files.isDirectory(stopped)) ? stopped : null;
+        return new Collisions(ours, unmarked, free);
+    }
+
+    // GeoSurvey's numbered chain: the hashed name, a dash, and 1 to NUMBERED_COLLISIONS.
+    private static Collisions numberedChain(Search search, String stem) {
+        Path ours = null;
+        Path free = null;
+        for (int probe = 1; probe <= NUMBERED_COLLISIONS && ours == null && free == null; probe++) {
+            Path at = search.dataDir().resolve(stem + "-" + probe);
+            String there = search.markerAt(at);
+            if (there == null) {
+                free = at;
+            }
+            if (search.isOurs(there)) {
+                ours = at;
+            }
+        }
+        return new Collisions(ours, null, free);
+    }
+
+    // The first folder says nothing: this world's collision folder, else the first folder.
+    private static Path ownOrFirst(Collisions chains, Path first) {
+        return chains.ours() == null ? first : chains.ours();
+    }
+
+    // Another world or dimension holds the first folder: its own collision folder, an unmarked one, else a free one.
+    private static Path ownOrFree(Collisions chains) {
+        Path found;
+        if (chains.ours() != null) {
+            found = chains.ours();
+        } else if (chains.unmarked() != null) {
+            found = chains.unmarked();
+        } else {
+            found = chains.free();
+        }
+        return found;
     }
 
     private static final int MAX_FOLDER_DIVERTS = 28;
 
-    private static Path worldDivert(Path dataDir, String name, String rawKey, String key) {
-        String divert = name + "-" + shortHash(rawKey);
-        for (int looked = 0; looked < MAX_FOLDER_DIVERTS
-                && !worldFolderIsFree(dataDir.resolve(divert), key); looked++) {
-            divert = divert + "-" + shortHash(divert);
-        }
-        return dataDir.resolve(divert);
-    }
+    // GeoSurvey's numbered collision folders after the hashed one.
+    private static final int NUMBERED_COLLISIONS = 8;
 
-    private static boolean worldFolderIsFree(Path dir, String key) {
-        String held = markerOf(dir);
-        return held == null || held.equals(key);
-    }
+    private static final String STORED_DIMENSION = "ResourceKey[minecraft:dimension / ";
 
-    // Converts a dimension id into the ResourceKey spelling the stores and files use.
+    private static final String STORED_END = "]";
+
     public static String asStored(String dimension) {
         String id = dimension == null ? "" : dimension.trim();
         if (id.isEmpty() || id.startsWith("ResourceKey[")) {
             return id;
         }
-        return "ResourceKey[minecraft:dimension / " + id + "]";
+        return STORED_DIMENSION + id + STORED_END;
     }
 
-    // The raw key a directory was claimed for, or null if it says nothing.
+    // The resource id text of a stored key, such as minecraft:overworld; other text comes back trimmed.
+    public static String dimensionIdOf(String stored) {
+        String key = stored == null ? "" : stored.trim();
+        if (!key.startsWith(STORED_DIMENSION) || !key.endsWith(STORED_END)) {
+            return key;
+        }
+        return key.substring(STORED_DIMENSION.length(), key.length() - STORED_END.length());
+    }
+
+    // The raw key that claimed the directory, or null.
     public static String markerOf(Path dir) {
         return markerOf(dir, MARKER);
     }
@@ -787,16 +996,14 @@ public final class MapStorage {
         String held;
         try {
             Path at = dir.resolve(marker);
-            // Files.readAllBytes, not readString: some Android API levels lack readString.
             held = new String(Files.readAllBytes(at), StandardCharsets.UTF_8).strip();
         } catch (IOException | RuntimeException e) {
-            // An unreadable marker is not a mismatch.
             held = null;
         }
         return held;
     }
 
-    // Records which world this directory holds, if it does not already say; never overwrites.
+    // Never overwrites an existing marker.
     public static void claim(Path dir, String rawKey) {
         claim(dir, rawKey, MARKER);
     }
@@ -806,12 +1013,10 @@ public final class MapStorage {
             Files.createDirectories(dir);
             Path at = dir.resolve(marker);
             if (!Files.exists(at)) {
-                // getBytes, not writeString; see markerOf above.
                 Files.write(at, (rawKey == null ? "" : rawKey)
                         .getBytes(StandardCharsets.UTF_8));
             }
         } catch (IOException | RuntimeException e) {
-            // Swallowed on purpose.
         }
     }
 
@@ -1031,7 +1236,7 @@ public final class MapStorage {
             flushQuietly(sharedWrites != null);
         } catch (RuntimeException | Error failed) {
             note.accept("geosurvey: could not flush the world on exit."
-                    + " Ground not yet on disk is"
+                    + " Unsaved ground is"
                     + " lost (" + failed.getClass().getSimpleName() + ").");
         } finally {
             endNoWaitScope(noWait);
@@ -1077,7 +1282,7 @@ public final class MapStorage {
         rootGeneration++;
     }
 
-    // Drops the store without writing anything; the caller is responsible for what was in it.
+    // Drops the store without writing; the caller owns its content.
     public void unload(String dimensionId) {
         MapStore going = stores.remove(dimensionId);
         if (going != null) {
@@ -1104,8 +1309,7 @@ public final class MapStorage {
         }
         FolderName picked = resolveFolder(at, id);
         Folder settled = settleFolder(at, id, picked.name(), picked.markerWasNull());
-        return settled != null ? settled
-                : divertFolder(at, id, picked.name() + "-" + shortHash(id));
+        return settled != null ? settled : divertFolder(at, id);
     }
 
     private Folder settleFolder(Path at, String id, String name, boolean ownerMatters) {
@@ -1128,9 +1332,14 @@ public final class MapStorage {
         }
     }
 
-    private Folder divertFolder(Path at, String id, String first) {
-        String candidate = first;
-        Folder settled = freeFolder(at, id, candidate);
+    // The hashed folder, then GeoSurvey's numbered chain, then the collector's: the first no other dimension holds.
+    private Folder divertFolder(Path at, String id) {
+        String stem = dimensionFolder(id) + "-" + shortHash(id);
+        Folder settled = freeFolder(at, id, stem);
+        for (int probe = 1; settled == null && probe <= NUMBERED_COLLISIONS; probe++) {
+            settled = freeFolder(at, id, stem + "-" + probe);
+        }
+        String candidate = stem;
         for (int looked = 1; settled == null && looked < MAX_FOLDER_DIVERTS; looked++) {
             candidate = candidate + "-" + shortHash(candidate);
             settled = freeFolder(at, id, candidate);
@@ -1152,22 +1361,52 @@ public final class MapStorage {
         return held == null || held.equals(id);
     }
 
+    public static String dimensionFolder(String dimensionId) {
+        return guardDevice(dev.openmap.live.WorldMapping.publishedFolder(dimensionId));
+    }
+
+    // An older spelling's folder, else its collision folder of either chain; null when neither says this dimension.
+    private static String keptFolder(DimensionSearch search, String name, String hash) {
+        String was = sanitise(search.id());
+        if (was.equals(name)) {
+            return null;
+        }
+        String kept;
+        if (search.isOurs(search.markerAt(search.dataDir().resolve(was)))) {
+            kept = was;
+        } else {
+            kept = nameOf(collisions(search, was + "-" + hash).ours());
+        }
+        return kept;
+    }
+
     private static FolderName resolveFolder(Path at, String id) {
-        String name = sanitise(id);
+        String name = dimensionFolder(id);
         String held = markerOf(at.resolve(name), DIMENSION_MARKER);
-        if (held == null || held.equals(id)) {
-            return new FolderName(name, held == null);
+        FolderName picked;
+        if (id.equals(held)) {
+            picked = new FolderName(name, false);
+        } else if (held == null) {
+            picked = unmarkedFolder(new DimensionSearch(at, id), name, shortHash(id));
+        } else {
+            Collisions chains = collisions(new DimensionSearch(at, id), name + "-" + shortHash(id));
+            picked = new FolderName(nameOf(ownOrFree(chains)), chains.ours() == null);
         }
-        String divert = name + "-" + shortHash(id);
-        String there = markerOf(at.resolve(divert), DIMENSION_MARKER);
-        for (int looked = 1; looked < MAX_FOLDER_DIVERTS && there != null && !there.equals(id);
-                looked++) {
-            divert = divert + "-" + shortHash(divert);
-            there = markerOf(at.resolve(divert), DIMENSION_MARKER);
+        return picked;
+    }
+
+    // Its own folder says nothing: an older spelling's folder, a collision folder marked for it, else its own.
+    private static FolderName unmarkedFolder(DimensionSearch search, String name, String hash) {
+        String kept = keptFolder(search, name, hash);
+        if (kept == null) {
+            kept = nameOf(collisions(search, name + "-" + hash).ours());
         }
-        boolean stillTaken = there != null && !there.equals(id);
-        return stillTaken ? new FolderName(divert + "-" + shortHash(divert), true)
-                : new FolderName(divert, there == null);
+        return kept == null ? new FolderName(name, true) : new FolderName(kept, false);
+    }
+
+    // The folder's name; null for a null folder.
+    private static String nameOf(Path folder) {
+        return folder == null ? null : folder.getFileName().toString();
     }
 
     private static final long CLAIM_WAIT_NANOS =
@@ -1366,8 +1605,8 @@ public final class MapStorage {
                 try {
                     Files.deleteIfExists(spool);
                 } catch (IOException | RuntimeException leftBehind) {
-                    damage.accept(spool.getFileName() + " could not be deleted and"
-                            + " was left behind (" + leftBehind.getClass().getSimpleName()
+                    damage.accept(spool.getFileName() + " could not be deleted"
+                            + " (" + leftBehind.getClass().getSimpleName()
                             + ")");
                 }
             }
@@ -1638,8 +1877,8 @@ public final class MapStorage {
                     note.accept("geosurvey stopped converting "
                             + migration.legacy.getFileName() + " into region files after "
                             + migration.runs + " attempts failed. Old map untouched;"
-                            + " its ground is not in the new map."
-                            + " Retry at the next"
+                            + " its ground is not in the new map;"
+                            + " retry at the next"
                             + " game start.");
                 } else {
                     migration.failed = false;
@@ -1671,7 +1910,7 @@ public final class MapStorage {
         }
     }
 
-    private static final int REGION_STORE_CAPACITY = MapRegion.CHUNKS * MapRegion.CHUNKS * 2;
+    private static final int REGION_STORE_CAPACITY = MapRegion.CHUNKS * MapRegion.CHUNKS;
 
     private static MapStore newRegionStore() {
         return new MapStore(REGION_STORE_CAPACITY);
@@ -1681,23 +1920,61 @@ public final class MapStorage {
 
     private boolean loadRegion(String dimensionId, MapStore store, int regionX, int regionZ) {
         Path file = regionFileIn(root, dimensionId, regionX, regionZ);
-        if (file == null || !Files.isRegularFile(file)) {
+        if (file == null) {
             return true;
         }
-        restoreQueuedWrite(dimensionId, store, regionX, regionZ);
         boolean read;
         try {
-            MapCodec.stream(file, legacyColourToCover, (chunkX, chunkZ, captured,
-                                                       captureVersion) -> {
-                ChunkSample held = store.peek(chunkX, chunkZ);
-                return held == null || outranks(captured, captureVersion, held);
-            }, store::putClean, MAX_REGION_CHUNKS, damage);
+            if (MapCodec.present(file)) {
+                restoreQueuedWrite(dimensionId, store, regionX, regionZ);
+                LoadedRegionGate gate = new LoadedRegionGate(store);
+                MapCodec.stream(file, legacyColourToCover, gate,
+                        sample -> putUnlessOutranked(store, sample), MAX_REGION_CHUNKS, damage);
+            }
             read = true;
         } catch (IOException unreadable) {
             sayUnreadable(file);
             read = false;
         }
         return read;
+    }
+
+    private static final class LoadedRegionGate implements MapCodec.ColumnGate {
+
+        private final MapStore store;
+
+        private ChunkSample fresh;
+
+        private long diskCapturedAt;
+
+        private int diskCaptureVersion;
+
+        private LoadedRegionGate(MapStore store) {
+            this.store = store;
+        }
+
+        @Override
+        public boolean keeps(int chunkX, int chunkZ, long capturedAt, int captureVersion) {
+            fresh = store.peek(chunkX, chunkZ);
+            diskCapturedAt = capturedAt;
+            diskCaptureVersion = captureVersion;
+            return fresh == null || mayOutrank(capturedAt, captureVersion, fresh);
+        }
+
+        @Override
+        public boolean keepsColumns(byte[] columns, int version,
+                                    java.util.function.IntFunction<LandCover> legacy) {
+            return fresh == null
+                    || mayOutrank(diskCapturedAt, diskCaptureVersion, fresh, columns, version,
+                            legacy);
+        }
+    }
+
+    private static void putUnlessOutranked(MapStore store, ChunkSample sample) {
+        ChunkSample held = store.peekValue(sample.chunkX, sample.chunkZ);
+        if (held == null || outranks(sample, held)) {
+            store.putClean(sample);
+        }
     }
 
     private ChunkSample[] queuedWriteSnapshot(String dimensionId, MapStore store,
@@ -1779,13 +2056,12 @@ public final class MapStorage {
         }
     }
 
-    private static boolean wantsResidentOrNewer(ChunkSample[] resident, int chunkX, int chunkZ,
-                                                long captured, int captureVersion) {
+    private static boolean wantsResidentOrNewer(ChunkSample[] resident, ChunkSample sample) {
         if (resident == null) {
             return true;
         }
-        ChunkSample held = resident[MapStore.regionSlot(chunkX, chunkZ)];
-        return held == null || outranks(captured, captureVersion, held);
+        ChunkSample held = resident[MapStore.regionSlot(sample.chunkX, sample.chunkZ)];
+        return held == null || outranks(sample, held);
     }
 
     private ChunkSample[] heldRegionSlots(RegionLoad load, MapStore store, int regionX,
@@ -1871,14 +2147,12 @@ public final class MapStorage {
 
     private void boundResidentStores(String keep) {
         if (root == null) {
-            // No root, so nothing may be dropped yet.
             return;
         }
         boolean evicting = true;
         while (evicting && stores.size() > 1 && residentChunks > residentBudget) {
             String coldest = null;
             MapStore going = null;
-            // No stores.get(): that would count as a use and move the entry being evicted.
             for (Map.Entry<String, MapStore> entry : stores.entrySet()) {
                 if (!entry.getKey().equals(keep)) {
                     coldest = entry.getKey();      // access order: eldest first
@@ -1951,13 +2225,12 @@ public final class MapStorage {
         return handed;
     }
 
-    // Called from the client tick thread; the write itself happens on another thread.
-    // Never returns SAVED: nothing here writes on the caller's thread.
+    // Tick thread only; another thread writes.
+    // Never returns SAVED.
     MapStore.Handoff writeRegionSoon(String dimensionId, MapStore store,
                                      int regionX, int regionZ) {
         takeBackFailedWrites();
         countAsUse(dimensionId, store);
-        // Refuses if the store is detached, so ground cannot land in the new world's directory.
         return holds(dimensionId, store) ? handOff(dimensionId, store, regionX, regionZ)
                 : MapStore.Handoff.REFUSED;
     }
@@ -2010,7 +2283,6 @@ public final class MapStorage {
         java.util.concurrent.atomic.AtomicBoolean landed =
                 new java.util.concurrent.atomic.AtomicBoolean();
         java.util.function.IntFunction<LandCover> legacy = legacyColourToCover;
-        // Captured now, not inside the job: the world may change before the job runs.
         java.util.function.BooleanSupplier droppedUnrun = writeInBackground(shared, () -> {
             ChunkSample[] taken = unwritten.getAndSet(null);
             boolean done = taken == null;
@@ -2020,7 +2292,6 @@ public final class MapStorage {
                     done = true;
                 }
             } catch (IOException | RuntimeException unwritable) {
-                // Deliberately silent.
             } finally {
                 if (!done) {
                     failedWrites.add(new Unwritten(dimensionId, store, regionX, regionZ,
@@ -2120,7 +2391,7 @@ public final class MapStorage {
         return writing;
     }
 
-    // A region write that did not land; the writer thread leaves it here instead of touching MapStore itself.
+    // A region write that did not land; the writer thread leaves it here.
     private record Unwritten(String dimensionId, MapStore store,
                              int regionX, int regionZ, MapStore ground, Path file,
                              boolean dropped) {
@@ -2198,7 +2469,7 @@ public final class MapStorage {
         }
     }
 
-    // How many times regionStore has built a throwaway store. Test-only.
+    // Test-only.
     private static final java.util.concurrent.atomic.AtomicLong REGION_STORE_BUILDS =
             new java.util.concurrent.atomic.AtomicLong();
 
@@ -2310,11 +2581,10 @@ public final class MapStorage {
             }
             if (dropped) {
                 note.accept("geosurvey: the work pool dropped the write of " + handed.dimensionId()
-                        + " region " + handed.regionX() + "," + handed.regionZ() + ""
-                        + "."
+                        + " region " + handed.regionX() + "," + handed.regionZ() + "."
                         + (done
                                 ? " Written to " + handed.file() + " on the way out."
-                                : " Also failed writing to " + handed.file() + " on the way out"
+                                : " Failed writing to " + handed.file() + " on the way out"
                                   + " too."));
             }
         }
@@ -2332,20 +2602,17 @@ public final class MapStorage {
                     lost.file(), lost.ground());
             String cause = lost.dropped()
                     ? "geosurvey: the work pool dropped the write of " + lost.dimensionId()
-                            + " region " + lost.regionX() + "," + lost.regionZ() + ""
-                            + "."
+                            + " region " + lost.regionX() + "," + lost.regionZ() + "."
                     : "geosurvey: could not write the ground of "
                             + lost.dimensionId() + " region " + lost.regionX() + ","
                             + lost.regionZ() + " and the write FAILED.";
             countAsUse(lost.dimensionId(), lost.store());
             if (!holds(lost.dimensionId(), lost.store())) {
                 note.accept(cause + " World already left"
-                        + ""
                         + (kept
-                                ? ": kept aside for "
-                                  + "" + lost.file() + " at the next"
+                                ? ": kept aside for " + lost.file() + " at the next"
                                   + " flush."
-                                : ". " + MAX_QUEUED_REGION_WRITES
+                                : "; " + MAX_QUEUED_REGION_WRITES
                                   + " other regions already kept aside;"
                                   + " unwritten chunks are lost,"
                                   + " " + lost.file()
@@ -2355,7 +2622,7 @@ public final class MapStorage {
                 markDirty(lost.dimensionId());
                 if (!kept) {
                     note.accept(cause + " Requeued for"
-                            + " " + lost.file() + ". "
+                            + " " + lost.file() + "; "
                             + MAX_QUEUED_REGION_WRITES + " other regions already kept aside;"
                             + " its chunks no longer in memory"
                             + " are lost.");
@@ -2364,13 +2631,12 @@ public final class MapStorage {
         }
     }
 
-    // Must run before stores are dropped, not after.
+    // Must run before stores are dropped.
     private void takeBackDroppedWrites() {
         for (int at = handedOver.size() - 1; at >= 0; at--) {
             Handed handed = handedOver.get(at);
             if (!handed.droppedUnrun().getAsBoolean()) {
                 if (handed.settled().get()) {
-                    // Ran and already settled.
                     handedOver.remove(at);
                 }
             } else {
@@ -2390,13 +2656,11 @@ public final class MapStorage {
                     if (!holds(handed.dimensionId(), handed.store())) {
                         note.accept("geosurvey: the work pool dropped the write of "
                                 + handed.dimensionId() + " region " + handed.regionX() + ","
-                                + handed.regionZ() + ""
-                                + "."
+                                + handed.regionZ() + "."
                                 + (kept
-                                        ? " World already left: kept aside for "
-                                          + "" + handed.file() + " at the next"
+                                        ? " World already left: kept aside for " + handed.file() + " at the next"
                                           + " flush."
-                                        : " World already left. " + MAX_QUEUED_REGION_WRITES
+                                        : " World already left; " + MAX_QUEUED_REGION_WRITES
                                           + " other regions already kept aside;"
                                           + " unwritten chunks are lost,"
                                           + " " + handed.file()
@@ -2405,14 +2669,13 @@ public final class MapStorage {
                         handed.store().markRegionDirty(handed.regionX(), handed.regionZ());
                         markDirty(handed.dimensionId());
                         note.accept("geosurvey: the work pool dropped the write of " + handed.dimensionId()
-                                + " region " + handed.regionX() + "," + handed.regionZ() + ""
-                                + ". Requeued for"
+                                + " region " + handed.regionX() + "," + handed.regionZ() + ". Requeued for"
                                 + " "
                                 + handed.file()
                                 + (kept
                                         ? "."
                                         : "; " + MAX_QUEUED_REGION_WRITES + " other regions"
-                                          + " already kept aside. Chunks no longer in memory"
+                                          + " already kept aside; chunks no longer in memory"
                                           + " are lost."));
                     }
                 }
@@ -2420,8 +2683,6 @@ public final class MapStorage {
         }
     }
 
-    // No logger: this class is dexed into the Android node, which has none.
-    // Defaults to doing nothing.
     private volatile java.util.function.Consumer<String> note = message -> { };
 
     // Set once, at start-up.
@@ -2471,29 +2732,25 @@ public final class MapStorage {
                 + ")";
     }
 
-    // How many region writes may be waiting for the writer thread at once.
     private static final int MAX_QUEUED_REGION_WRITES = 8;
 
     private static final long REGION_WRITER_IDLE_SECONDS = 30L;
 
-    // The one thread region writes go to when the tick thread cannot afford them.
+    // The one thread for region writes.
     private java.util.concurrent.ThreadPoolExecutor regionWrites;
 
-    // The shared pool to write through, or null to keep this class's own thread.
+    // The shared pool to write through; null keeps this class's own thread.
     private volatile Writes sharedWrites;
 
-    // Somewhere to run a region write that is not this class's own thread.
     public interface Writes {
 
-        // Runs the write off the calling thread.
-        // null: refused, caller keeps the ground.
+        // null: refused, caller keeps the ground;
         // WILL_RUN: taken, no way to report a later discard.
         // otherwise: a probe, true once the work is thrown away unrun.
         java.util.function.BooleanSupplier off(Runnable write);
     }
 
-    // Returned by Writes.off() when the work is taken but a later discard can never be reported.
-    // Compare by identity; calling it answers false, which is not a promise.
+    // Compare by identity; calling it answers false.
     public static final java.util.function.BooleanSupplier WILL_RUN = () -> false;
 
     // Set once, at start-up, before any world is opened.
@@ -2520,14 +2777,14 @@ public final class MapStorage {
     private boolean noWaitScope() {
         boolean noWait = driver != Driver.WORKER;
         if (noWait) {
-            FileReplace.beginNoWait();
+            AtomicFileReplace.beginNoWait();
         }
         return noWait;
     }
 
     private static void endNoWaitScope(boolean began) {
         if (began) {
-            FileReplace.endNoWait();
+            AtomicFileReplace.endNoWait();
         }
     }
 
@@ -2549,7 +2806,6 @@ public final class MapStorage {
         }
     }
 
-    // Returns null if refused, WILL_RUN if taken but unreportable, otherwise the sink's probe.
     private java.util.function.BooleanSupplier writeInBackground(Writes shared,
             Runnable write, java.util.concurrent.atomic.AtomicBoolean settled) {
         if (shared != null) {
@@ -2575,7 +2831,7 @@ public final class MapStorage {
             return droppedUnrun;
         }
         if (regionWrites == null) {
-            // Daemon: a queued write must never keep the client from closing.
+            // Daemon threads.
             regionWrites = new java.util.concurrent.ThreadPoolExecutor(
                     1, 1, REGION_WRITER_IDLE_SECONDS, java.util.concurrent.TimeUnit.SECONDS,
                     new java.util.concurrent.ArrayBlockingQueue<>(
@@ -2636,10 +2892,10 @@ public final class MapStorage {
                     note.accept("geosurvey held the game thread " + heldMillis
                             + " ms for " + waitingFor + " write(s)."
                             + (stillGoing > 0
-                                    ? " Gave up at 1s with "
-                                      + stillGoing + " still going. A failed region"
+                                    ? " Gave up at 1s, "
+                                      + stillGoing + " still going; a failed"
                                       + " write is"
-                                      + " kept aside for the next"
+                                      + " kept for the next"
                                       + " flush, up to "
                                       + MAX_QUEUED_REGION_WRITES + " regions."
                                     : ""));
@@ -2647,14 +2903,12 @@ public final class MapStorage {
             }
         } else if (regionWrites != null) {
             try {
-            // A no-op, queued last, so finishing it means the queue has drained.
                 regionWrites.submit(() -> { }).get(1, java.util.concurrent.TimeUnit.SECONDS);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             } catch (java.util.concurrent.ExecutionException
                     | java.util.concurrent.TimeoutException
                     | java.util.concurrent.RejectedExecutionException waited) {
-            // Swallowed on purpose; lost regions are bounded by MAX_QUEUED_REGION_WRITES.
             }
         }
     }
@@ -2721,7 +2975,7 @@ public final class MapStorage {
         try {
             store.save(file);
         } catch (IOException refused) {
-            kept = refused instanceof FileReplace.Refused;
+            kept = refused instanceof AtomicFileReplace.Refused;
             String why = refused.getMessage();
             StringBuilder detail = new StringBuilder("geosurvey could not save the overlay for ")
                     .append(dimensionId)
@@ -2765,6 +3019,36 @@ public final class MapStorage {
         return landmarks.computeIfAbsent(dimensionId, id -> landmarksAt(landmarkFileFor(id)));
     }
 
+    // Null while the dimension's markers are not loaded; it never loads them.
+    public LandmarkStore loadedLandmarks(String dimensionId) {
+        return landmarks.get(dimensionId);
+    }
+
+    // listener may be null: nobody is told. It runs on the client thread, after the markers were saved or queued.
+    public void afterLandmarksSaved(Markers.Saved listener) {
+        landmarksSavedListener = listener;
+    }
+
+    private void tellLandmarksSaved(String dimensionId, LandmarkStore store) {
+        Markers.Saved listener = landmarksSavedListener;
+        if (listener != null) {
+            try {
+                listener.saved(landmarkSource(dimensionId), dimensionIdOf(dimensionId), store);
+            } catch (RuntimeException fromListener) {
+                String why = fromListener.getMessage();
+                note.accept("geosurvey: a marker listener failed for " + dimensionId + " ("
+                        + fromListener.getClass().getSimpleName() + (why == null ? "" : ": " + why)
+                        + ").");
+            }
+        }
+    }
+
+    // The dimension's folder, then its stored key.
+    private String landmarkSource(String dimensionId) {
+        Path at = root;
+        return at == null ? "" : regionDirFor(at, dimensionId).toString() + "/" + asStored(dimensionId);
+    }
+
     private LandmarkStore landmarksAt(Path file) {
         LandmarkWrite kept = keptLandmarkSave(file);
         LandmarkStore loaded;
@@ -2789,11 +3073,11 @@ public final class MapStorage {
     public void saveLandmarksQuietly(String dimensionId) {
         try {
             saveLandmarks(dimensionId);
-        } catch (FileReplace.Refused unwaited) {
+        } catch (AtomicFileReplace.Refused unwaited) {
             saveLandmarksLater(dimensionId);
         } catch (IOException refused) {
             String why = refused.getMessage();
-            note.accept("geosurvey could not save landmarks for " + dimensionId
+            note.accept("geosurvey could not save the markers for " + dimensionId
                     + " (" + refused.getClass().getSimpleName()
                     + (why == null ? "" : ": " + why)
                     + ")");
@@ -2810,6 +3094,7 @@ public final class MapStorage {
             } finally {
                 endNoWaitScope(noWait);
             }
+            tellLandmarksSaved(dimensionId, store);
         }
     }
 
@@ -2818,14 +3103,13 @@ public final class MapStorage {
             saveLandmarksInBackground(dimensionId);
         } catch (IOException refused) {
             String why = refused.getMessage();
-            note.accept("geosurvey could not save landmarks for " + dimensionId
+            note.accept("geosurvey could not save the markers for " + dimensionId
                     + " (" + refused.getClass().getSimpleName()
                     + (why == null ? "" : ": " + why)
                     + ")");
         }
     }
 
-    // sequence: a stale ticket means this save is dropped, not written.
     private void saveLandmarks(LandmarkStore store, Path file, long sequence) throws IOException {
         LandmarkTicket ticket = new LandmarkTicket(file, sequence);
         if (ticket.stillWanted()) {
@@ -2833,14 +3117,14 @@ public final class MapStorage {
             long revision = store.revision();
             Path aside = store.writeAside(file, false);
             if (aside == null) {
-                FileReplace.settle(file, ticket);
+                AtomicFileReplace.settle(file, ticket);
             } else {
                 store.moveInto(aside, file, revision, ticket);
             }
         }
     }
 
-    private final class LandmarkTicket implements FileReplace.Turn {
+    private final class LandmarkTicket implements AtomicFileReplace.Turn {
 
         private final Path file;
 
@@ -2867,8 +3151,10 @@ public final class MapStorage {
         landmarkSnapshots++;
         LandmarkStore snapshot = new LandmarkStore();
         for (Landmark landmark : store.all()) {
-            snapshot.add(new Landmark(landmark.name(), landmark.x(), landmark.z(), landmark.colour(),
-                    landmark.affiliation(), landmark.icon()));
+            Landmark copy = new Landmark(landmark.name(), landmark.x(), landmark.z(), landmark.colour(),
+                    landmark.affiliation(), landmark.icon());
+            copy.setShared(landmark.shared());
+            snapshot.add(copy);
         }
         return snapshot;
     }
@@ -2944,8 +3230,8 @@ public final class MapStorage {
         String unreadable = store.unreadable();
         if (!unreadable.isEmpty()) {
             note.accept("geosurvey: could not save the markers for " + dimensionId + ". "
-                    + file.getFileName() + " could not be read (" + unreadable + "); not saved over."
-                    + " Nothing written.");
+                    + file.getFileName() + " could not be read (" + unreadable + "); nothing is"
+                    + " written.");
             return;
         }
         Writes shared = sharedWrites;
@@ -2959,6 +3245,7 @@ public final class MapStorage {
         } else {
             queueLandmarkSave(shared, dimensionId, store, file);
         }
+        tellLandmarksSaved(dimensionId, store);
     }
 
     private void queueLandmarkSave(Writes shared, String dimensionId, LandmarkStore store,
@@ -3077,7 +3364,6 @@ public final class MapStorage {
         return handedOut(dimensionId);
     }
 
-    // Every loaded dimension and its store, in one pass.
     public void forEachLoadedStore(java.util.function.BiConsumer<String, MapStore> action) {
         for (Map.Entry<String, MapStore> entry : stores.entrySet()) {
             action.accept(entry.getKey(), entry.getValue());
@@ -3090,7 +3376,7 @@ public final class MapStorage {
         }
     }
 
-    // Whether this is still the store this storage hands out for that dimension.
+    // Whether store is the one handed out for the dimension.
     public boolean holds(String dimensionId, MapStore store) {
         boolean held;
         if (store == null) {
@@ -3141,278 +3427,50 @@ public final class MapStorage {
 
         public static final Turn ALWAYS = () -> true;
 
-        private static final int FIRST_LOCKS = 16;
+        public interface Turn extends AtomicFileReplace.Turn {
+        }
 
-        private static final int GROWTH = 2;
+        public static final class Moved {
 
-        private static final int MOST_REFUSALS = 100;
+            public static final AtomicFileReplace.Moved WITHOUT_ATOMIC_MOVE =
+                    AtomicFileReplace.Moved.WITHOUT_ATOMIC_MOVE;
 
-        private static final long PATIENCE_NANOS =
-                java.util.concurrent.TimeUnit.SECONDS.toNanos(1L);
-
-        private static final int LONGEST_PAUSE_SHIFT = 4;
-
-        private static final int LONGEST_DOT_NAME = 2;
-
-        private static final Object LOCKS_GUARD = new Object();
-
-        private static final ThreadLocal<int[]> NO_WAIT_SCOPES =
-                ThreadLocal.withInitial(() -> new int[1]);
-
-        public interface Turn {
-
-            boolean stillWanted();
-
-            default void landed() {
+            private Moved() {
             }
         }
 
-        public enum Moved {
-            ATOMICALLY,
-            WITHOUT_ATOMIC_MOVE,
-            UNWANTED
-        }
-
-        static final class FileLock {
-
-            private String name;
-
-            private int users;
-
-            private FileLock() {
-            }
-        }
-
-        public static final class Refused extends java.nio.file.FileSystemException {
+        public static final class Refused extends AtomicFileReplace.Refused {
 
             private static final long serialVersionUID = 1L;
 
-            private Refused(Path file, IOException refused) {
-                super(file.toString(), null, "the replace was refused, and this thread may not"
-                        + " wait to try it again");
-                initCause(refused);
+            private Refused(AtomicFileReplace.Refused refused) {
+                super(refused.getFile(), refused.getOtherFile(), refused.getReason());
+                initCause(refused.getCause());
+                setStackTrace(refused.getStackTrace());
+                for (Throwable also : refused.getSuppressed()) {
+                    addSuppressed(also);
+                }
             }
         }
-
-        private static FileLock[] locks = new FileLock[FIRST_LOCKS];
 
         private FileReplace() {
         }
 
-        public static Moved replace(Path temp, Path file, boolean atomic, Turn turn)
+        public static AtomicFileReplace.Moved replace(Path temp, Path file, boolean atomic, Turn turn)
                 throws IOException {
-            long deadline = System.nanoTime() + PATIENCE_NANOS;
-            int refusals = 0;
-            Moved moved = null;
-            while (moved == null) {
-                IOException refused = null;
-                RuntimeException broken = null;
-                FileLock lock = take(file);
-                try {
-                    synchronized (lock) {
-                        if (turn.stillWanted()) {
-                            try {
-                                moved = move(temp, file, atomic);
-                                turn.landed();
-                            } catch (IOException thrown) {
-                                refused = thrown;
-                            } catch (RuntimeException thrown) {
-                                broken = thrown;
-                            }
-                        } else {
-                            moved = Moved.UNWANTED;
-                        }
-                    }
-                } finally {
-                    give(lock);
-                }
-                if (broken != null) {
-                    throw dropping(temp, broken);
-                }
-                if (refused != null) {
-                    refusals++;
-                    pauseOrThrow(temp, file, refused, refusals, deadline);
-                }
-            }
-            if (moved == Moved.UNWANTED) {
-                Files.deleteIfExists(temp);
+            AtomicFileReplace.Moved moved;
+            try {
+                moved = AtomicFileReplace.replace(temp, file, atomic, turn);
+            } catch (AtomicFileReplace.Refused refused) {
+                throw new Refused(refused);
             }
             return moved;
         }
 
-        static void replaceHeld(Path temp, Path file) throws IOException {
-            long deadline = System.nanoTime() + PATIENCE_NANOS;
-            int refusals = 0;
-            boolean landed = false;
-            while (!landed) {
-                try {
-                    move(temp, file, true);
-                    landed = true;
-                } catch (IOException refused) {
-                    refusals++;
-                    pauseOrThrow(temp, file, refused, refusals, deadline);
-                } catch (RuntimeException broken) {
-                    throw dropping(temp, broken);
-                }
-            }
-        }
-
-        static void settle(Path file, Turn turn) {
-            FileLock lock = take(file);
-            try {
-                synchronized (lock) {
-                    if (turn.stillWanted()) {
-                        turn.landed();
-                    }
-                }
-            } finally {
-                give(lock);
-            }
-        }
-
-        static FileLock take(Path file) {
-            String name = nameOf(file);
-            FileLock lock;
-            synchronized (LOCKS_GUARD) {
-                lock = held(name);
-                if (lock == null) {
-                    lock = free();
-                    lock.name = name;
-                }
-                lock.users++;
-            }
-            return lock;
-        }
-
-        static void give(FileLock lock) {
-            synchronized (LOCKS_GUARD) {
-                lock.users--;
-                if (lock.users == 0) {
-                    lock.name = null;
-                }
-            }
-        }
-
-        private static FileLock held(String name) {
-            FileLock found = null;
-            for (int at = 0; found == null && at < locks.length; at++) {
-                FileLock lock = locks[at];
-                if (lock != null && lock.users > 0 && name.equalsIgnoreCase(lock.name)) {
-                    found = lock;
-                }
-            }
-            return found;
-        }
-
-        private static FileLock free() {
-            FileLock found = null;
-            int at = 0;
-            while (found == null && at < locks.length) {
-                if (locks[at] == null) {
-                    locks[at] = new FileLock();
-                }
-                if (locks[at].users == 0) {
-                    found = locks[at];
-                }
-                at++;
-            }
-            if (found == null) {
-                locks = java.util.Arrays.copyOf(locks, locks.length * GROWTH);
-                found = new FileLock();
-                locks[at] = found;
-            }
-            return found;
-        }
-
-        private static String nameOf(Path file) {
-            String spelled = file.toString();
-            return namesADot(spelled) ? file.normalize().toString() : spelled;
-        }
-
-        private static boolean namesADot(String spelled) {
-            boolean dotted = false;
-            int start = 0;
-            int end = spelled.length();
-            for (int at = 0; at <= end && !dotted; at++) {
-                if (at == end || isSeparator(spelled.charAt(at))) {
-                    int length = at - start;
-                    dotted = length > 0 && length <= LONGEST_DOT_NAME
-                            && spelled.charAt(start) == '.' && spelled.charAt(at - 1) == '.';
-                    start = at + 1;
-                }
-            }
-            return dotted;
-        }
-
-        private static boolean isSeparator(char c) {
-            return c == '/' || c == '\\';
-        }
-
-        private static Moved move(Path temp, Path file, boolean atomic) throws IOException {
-            Moved moved = atomic ? atomicMove(temp, file) : Moved.WITHOUT_ATOMIC_MOVE;
-            if (moved == Moved.WITHOUT_ATOMIC_MOVE) {
-                Files.move(temp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            }
-            return moved;
-        }
-
-        private static Moved atomicMove(Path temp, Path file) throws IOException {
-            Moved moved = Moved.ATOMICALLY;
-            try {
-                Files.move(temp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-            } catch (java.nio.file.AtomicMoveNotSupportedException noAtomicMove) {
-                moved = Moved.WITHOUT_ATOMIC_MOVE;
-            }
-            return moved;
-        }
-
-        public static void beginNoWait() {
-            NO_WAIT_SCOPES.get()[0]++;
-        }
-
-        public static void endNoWait() {
-            NO_WAIT_SCOPES.get()[0]--;
-        }
-
-        private static void pauseOrThrow(Path temp, Path file, IOException refused, int refusals,
-                                         long deadline) throws IOException {
-            if (!worthAnotherTry(refused, file, refusals, deadline)) {
-                throw dropping(temp, refused);
-            }
-            if (NO_WAIT_SCOPES.get()[0] > 0) {
-                throw dropping(temp, new Refused(file, refused));
-            }
-            pause(refusals);
-        }
-
-        private static boolean worthAnotherTry(IOException refused, Path file, int refusals,
-                                               long deadline) {
-            return refusals < MOST_REFUSALS && System.nanoTime() - deadline < 0L
-                    && !(refused instanceof java.nio.file.NoSuchFileException)
-                    && !Thread.currentThread().isInterrupted() && !Files.isDirectory(file);
-        }
-
-        private static void pause(int refusals) {
-            try {
-                Thread.sleep(1L << Math.min(refusals - 1, LONGEST_PAUSE_SHIFT));
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            }
-        }
-
-        private static <T extends Exception> T dropping(Path temp, T failed) {
-            try {
-                Files.deleteIfExists(temp);
-            } catch (IOException | RuntimeException undeletable) {
-                failed.addSuppressed(undeletable);
-            }
-            return failed;
-        }
     }
 
     // Merges a region snapshot into its file; the better copy of each chunk wins.
-    // The file's lock is held for the whole read, merge and write.
+    // The file's lock is held throughout.
     public static void writeRegionFile(MapStore prepared, Path file,
                                        java.util.function.IntFunction<LandCover> legacy)
             throws IOException {
@@ -3423,18 +3481,18 @@ public final class MapStorage {
                                        java.util.function.IntFunction<LandCover> legacy,
                                        java.util.function.Consumer<String> damage)
             throws IOException {
-        FileReplace.FileLock lock = FileReplace.take(file);
+        AtomicFileReplace.FileLock lock = AtomicFileReplace.take(file);
         try {
             writeRegionFile(prepared, file, legacy, damage, lock);
         } finally {
-            FileReplace.give(lock);
+            AtomicFileReplace.give(lock);
         }
     }
 
     private static void writeRegionFile(MapStore prepared, Path file,
                                         java.util.function.IntFunction<LandCover> legacy,
                                         java.util.function.Consumer<String> damage,
-                                        FileReplace.FileLock lock)
+                                        AtomicFileReplace.FileLock lock)
             throws IOException {
         synchronized (lock) {
             int had = prepared.size();
@@ -3443,20 +3501,10 @@ public final class MapStorage {
                 original.add(MapStore.key(sample.chunkX, sample.chunkZ));
             }
             java.util.Set<Long> covered = new java.util.HashSet<>(Math.max(KEY_SET_FLOOR, had * SLOTS_PER_KEY));
-            boolean[] preparedOutranked = {false};
-            MapCodec.stream(file, legacy, (chunkX, chunkZ, capturedAt, captureVersion) -> {
-                ChunkSample fresh = prepared.peek(chunkX, chunkZ);
-                if (fresh == null) {
-                    return true;
-                }
-                covered.add(MapStore.key(chunkX, chunkZ));
-                boolean diskWins = outranks(capturedAt, captureVersion, fresh);
-                if (!diskWins) {
-                    preparedOutranked[0] = true;
-                }
-                return diskWins;
-            }, prepared::putClean, MAX_REGION_CHUNKS, damage);
-            if (!preparedOutranked[0] && covered.containsAll(original)) {
+            int[] preparedOutranked = {0};
+            PreparedRegionGate gate = new PreparedRegionGate(prepared, covered, preparedOutranked);
+            MapCodec.stream(file, legacy, gate, gate::sink, MAX_REGION_CHUNKS, damage);
+            if (preparedOutranked[0] == 0 && covered.containsAll(original)) {
                 REDUNDANT_REGION_WRITES_SKIPPED.incrementAndGet();
             } else {
                 REGION_FILE_WRITES.incrementAndGet();
@@ -3465,27 +3513,84 @@ public final class MapStorage {
         }
     }
 
-    // Like writeRegionFile(MapStore, ...), for ground already held as a region-slot array.
+    private static final class PreparedRegionGate implements MapCodec.ColumnGate {
+
+        private final MapStore prepared;
+
+        private final java.util.Set<Long> covered;
+
+        private final int[] outranked;
+
+        private ChunkSample fresh;
+
+        private long diskCapturedAt;
+
+        private int diskCaptureVersion;
+
+        private PreparedRegionGate(MapStore prepared, java.util.Set<Long> covered,
+                                  int[] outranked) {
+            this.prepared = prepared;
+            this.covered = covered;
+            this.outranked = outranked;
+        }
+
+        @Override
+        public boolean keeps(int chunkX, int chunkZ, long capturedAt, int captureVersion) {
+            fresh = prepared.peek(chunkX, chunkZ);
+            if (fresh == null) {
+                return true;
+            }
+            covered.add(MapStore.key(chunkX, chunkZ));
+            boolean diskWinsByAge = outranks(capturedAt, captureVersion, fresh);
+            if (!diskWinsByAge) {
+                outranked[0]++;
+            }
+            diskCapturedAt = capturedAt;
+            diskCaptureVersion = captureVersion;
+            return mayOutrank(capturedAt, captureVersion, fresh);
+        }
+
+        @Override
+        public boolean keepsColumns(byte[] columns, int version,
+                                    java.util.function.IntFunction<LandCover> legacy) {
+            return fresh == null || mayOutrank(diskCapturedAt, diskCaptureVersion, fresh, columns,
+                    version, legacy);
+        }
+
+        private void sink(ChunkSample sample) {
+            ChunkSample held = prepared.peekValue(sample.chunkX, sample.chunkZ);
+            if (held == null) {
+                prepared.putClean(sample);
+                return;
+            }
+            boolean diskWins = outranks(sample, held);
+            if (diskWins) {
+                prepared.putClean(sample);
+            }
+            outranked[0] -= groundTurn(sample, held, diskWins);
+        }
+    }
+
     static void writeRegionFile(ChunkSample[] prepared, Path file,
                                 java.util.function.IntFunction<LandCover> legacy,
                                 java.util.function.Consumer<String> damage)
             throws IOException {
-        FileReplace.FileLock lock = FileReplace.take(file);
+        AtomicFileReplace.FileLock lock = AtomicFileReplace.take(file);
         try {
             writeRegionFile(prepared, file, legacy, damage, lock);
         } finally {
-            FileReplace.give(lock);
+            AtomicFileReplace.give(lock);
         }
     }
 
     private static void writeRegionFile(ChunkSample[] prepared, Path file,
                                         java.util.function.IntFunction<LandCover> legacy,
                                         java.util.function.Consumer<String> damage,
-                                        FileReplace.FileLock lock)
+                                        AtomicFileReplace.FileLock lock)
             throws IOException {
         synchronized (lock) {
             boolean redundant;
-            if (Files.isRegularFile(file)) {
+            if (MapCodec.present(file)) {
                 java.util.BitSet uncovered =
                         new java.util.BitSet(MapRegion.CHUNKS * MapRegion.CHUNKS);
                 for (int slot = 0; slot < prepared.length; slot++) {
@@ -3495,25 +3600,11 @@ public final class MapStorage {
                 }
                 java.util.BitSet matched =
                         new java.util.BitSet(MapRegion.CHUNKS * MapRegion.CHUNKS);
-                boolean[] preparedOutranked = {false};
-                MapCodec.stream(file, legacy, (chunkX, chunkZ, capturedAt,
-                                               captureVersion) -> {
-                    int slot = MapStore.regionSlot(chunkX, chunkZ);
-                    ChunkSample fresh = prepared[slot];
-                    if (fresh == null) {
-                        return true;
-                    }
-                    matched.set(slot);
-                    boolean diskWins = outranks(capturedAt, captureVersion, fresh);
-                    if (!diskWins) {
-                        preparedOutranked[0] = true;
-                    }
-                    return diskWins;
-                }, sample -> {
-                    prepared[MapStore.regionSlot(sample.chunkX, sample.chunkZ)] = sample;
-                }, MAX_REGION_CHUNKS, damage);
+                int[] preparedOutranked = {0};
+                RegionSlotGate gate = new RegionSlotGate(prepared, matched, preparedOutranked);
+                MapCodec.stream(file, legacy, gate, gate::sink, MAX_REGION_CHUNKS, damage);
                 uncovered.andNot(matched);
-                redundant = !preparedOutranked[0] && uncovered.isEmpty();
+                redundant = preparedOutranked[0] == 0 && uncovered.isEmpty();
             } else {
                 redundant = false;
             }
@@ -3526,7 +3617,66 @@ public final class MapStorage {
         }
     }
 
-    // Like MapCodec.write(MapStore, Path), for a region-slot array instead of a store.
+    private static final class RegionSlotGate implements MapCodec.ColumnGate {
+
+        private final ChunkSample[] prepared;
+
+        private final java.util.BitSet matched;
+
+        private final int[] outranked;
+
+        private ChunkSample fresh;
+
+        private long diskCapturedAt;
+
+        private int diskCaptureVersion;
+
+        private RegionSlotGate(ChunkSample[] prepared, java.util.BitSet matched,
+                               int[] outranked) {
+            this.prepared = prepared;
+            this.matched = matched;
+            this.outranked = outranked;
+        }
+
+        @Override
+        public boolean keeps(int chunkX, int chunkZ, long capturedAt, int captureVersion) {
+            int slot = MapStore.regionSlot(chunkX, chunkZ);
+            fresh = prepared[slot];
+            if (fresh == null) {
+                return true;
+            }
+            matched.set(slot);
+            boolean diskWinsByAge = outranks(capturedAt, captureVersion, fresh);
+            if (!diskWinsByAge) {
+                outranked[0]++;
+            }
+            diskCapturedAt = capturedAt;
+            diskCaptureVersion = captureVersion;
+            return mayOutrank(capturedAt, captureVersion, fresh);
+        }
+
+        @Override
+        public boolean keepsColumns(byte[] columns, int version,
+                                    java.util.function.IntFunction<LandCover> legacy) {
+            return fresh == null || mayOutrank(diskCapturedAt, diskCaptureVersion, fresh, columns,
+                    version, legacy);
+        }
+
+        private void sink(ChunkSample sample) {
+            int slot = MapStore.regionSlot(sample.chunkX, sample.chunkZ);
+            ChunkSample held = prepared[slot];
+            if (held == null) {
+                prepared[slot] = sample;
+                return;
+            }
+            boolean diskWins = outranks(sample, held);
+            if (diskWins) {
+                prepared[slot] = sample;
+            }
+            outranked[0] -= groundTurn(sample, held, diskWins);
+        }
+    }
+
     private static void writeRegionArray(ChunkSample[] region, Path path) throws IOException {
         Path parent = path.getParent();
         if (parent != null) {
@@ -3543,15 +3693,12 @@ public final class MapStorage {
                     }
                 }
             }
-        } catch (IOException | RuntimeException failed) {
-            try {
-                Files.deleteIfExists(temp);
-            } catch (IOException | RuntimeException undeletable) {
-                failed.addSuppressed(undeletable);
-            }
-            throw failed;
+        } catch (IOException failed) {
+            throw AtomicFileReplace.dropped(temp, failed);
+        } catch (RuntimeException failed) {
+            throw AtomicFileReplace.dropped(temp, failed);
         }
-        FileReplace.replaceHeld(temp, path);
+        AtomicFileReplace.replaceHeld(temp, path);
     }
 
     private static void writeRegionStore(MapStore region, Path path) throws IOException {
@@ -3559,15 +3706,12 @@ public final class MapStorage {
                 path.getFileName() + "." + Thread.currentThread().threadId() + ".tmp");
         try (java.io.OutputStream out = openRegionTemp(temp, path.getParent())) {
             MapCodec.write(region, out);
-        } catch (IOException | RuntimeException failed) {
-            try {
-                Files.deleteIfExists(temp);
-            } catch (IOException | RuntimeException undeletable) {
-                failed.addSuppressed(undeletable);
-            }
-            throw failed;
+        } catch (IOException failed) {
+            throw AtomicFileReplace.dropped(temp, failed);
+        } catch (RuntimeException failed) {
+            throw AtomicFileReplace.dropped(temp, failed);
         }
-        FileReplace.replaceHeld(temp, path);
+        AtomicFileReplace.replaceHeld(temp, path);
     }
 
     private static java.io.OutputStream openRegionTemp(Path temp, Path parent)
@@ -3594,8 +3738,7 @@ public final class MapStorage {
         return counted;
     }
 
-    // Like writeRegionFile, for ground from somewhere other than this client's own survey.
-    // Returns how many incoming chunks the file's own copy outranked and kept.
+    // Returns how many incoming chunks the file's copy outranked.
     public static int mergeRegionFile(MapStore incoming, Path file,
                                       java.util.function.IntFunction<LandCover> legacy)
             throws IOException {
@@ -3606,12 +3749,12 @@ public final class MapStorage {
                                       java.util.function.IntFunction<LandCover> legacy,
                                       java.util.function.Consumer<String> damage)
             throws IOException {
-        FileReplace.FileLock lock = FileReplace.take(file);
+        AtomicFileReplace.FileLock lock = AtomicFileReplace.take(file);
         int kept;
         try {
             kept = mergeRegionFile(incoming, file, legacy, damage, lock);
         } finally {
-            FileReplace.give(lock);
+            AtomicFileReplace.give(lock);
         }
         return kept;
     }
@@ -3619,10 +3762,9 @@ public final class MapStorage {
     private static int mergeRegionFile(MapStore incoming, Path file,
                                        java.util.function.IntFunction<LandCover> legacy,
                                        java.util.function.Consumer<String> damage,
-                                       FileReplace.FileLock lock)
+                                       AtomicFileReplace.FileLock lock)
             throws IOException {
         int[] kept = {0};
-        // The same per-file lock the periodic save takes.
         synchronized (lock) {
             int had = incoming.size();
             java.util.Set<Long> original = new java.util.HashSet<>(Math.max(KEY_SET_FLOOR, had * SLOTS_PER_KEY));
@@ -3630,22 +3772,10 @@ public final class MapStorage {
                 original.add(MapStore.key(sample.chunkX, sample.chunkZ));
             }
             java.util.Set<Long> matched = new java.util.HashSet<>(Math.max(KEY_SET_FLOOR, had * SLOTS_PER_KEY));
-            boolean[] incomingOutranked = {false};
-            MapCodec.stream(file, legacy, (chunkX, chunkZ, capturedAt, captureVersion) -> {
-                ChunkSample fresh = incoming.peek(chunkX, chunkZ);
-                if (fresh == null) {
-                    return true;
-                }
-                matched.add(MapStore.key(chunkX, chunkZ));
-                boolean diskWins = outranks(capturedAt, captureVersion, fresh);
-                if (diskWins) {
-                    kept[0]++;
-                } else {
-                    incomingOutranked[0] = true;
-                }
-                return diskWins;
-            }, incoming::putClean, MAX_REGION_CHUNKS, damage);
-            if (!incomingOutranked[0] && matched.containsAll(original)) {
+            int[] incomingOutranked = {0};
+            MergedRegionGate gate = new MergedRegionGate(incoming, matched, kept, incomingOutranked);
+            MapCodec.stream(file, legacy, gate, gate::sink, MAX_REGION_CHUNKS, damage);
+            if (incomingOutranked[0] == 0 && matched.containsAll(original)) {
                 REDUNDANT_REGION_WRITES_SKIPPED.incrementAndGet();
             } else {
                 REGION_FILE_WRITES.incrementAndGet();
@@ -3655,9 +3785,78 @@ public final class MapStorage {
         return kept[0];
     }
 
-    // Whether the sample already on disk outranks the incoming one by age.
+    private static final class MergedRegionGate implements MapCodec.ColumnGate {
+
+        private final MapStore incoming;
+
+        private final java.util.Set<Long> matched;
+
+        private final int[] kept;
+
+        private final int[] outranked;
+
+        private ChunkSample fresh;
+
+        private long diskCapturedAt;
+
+        private int diskCaptureVersion;
+
+        private MergedRegionGate(MapStore incoming, java.util.Set<Long> matched, int[] kept,
+                                 int[] outranked) {
+            this.incoming = incoming;
+            this.matched = matched;
+            this.kept = kept;
+            this.outranked = outranked;
+        }
+
+        @Override
+        public boolean keeps(int chunkX, int chunkZ, long capturedAt, int captureVersion) {
+            fresh = incoming.peek(chunkX, chunkZ);
+            if (fresh == null) {
+                return true;
+            }
+            matched.add(MapStore.key(chunkX, chunkZ));
+            boolean diskWinsByAge = outranks(capturedAt, captureVersion, fresh);
+            if (diskWinsByAge) {
+                kept[0]++;
+            } else {
+                outranked[0]++;
+            }
+            diskCapturedAt = capturedAt;
+            diskCaptureVersion = captureVersion;
+            return mayOutrank(capturedAt, captureVersion, fresh);
+        }
+
+        @Override
+        public boolean keepsColumns(byte[] columns, int version,
+                                    java.util.function.IntFunction<LandCover> legacy) {
+            return fresh == null || mayOutrank(diskCapturedAt, diskCaptureVersion, fresh, columns,
+                    version, legacy);
+        }
+
+        private void sink(ChunkSample sample) {
+            ChunkSample held = incoming.peekValue(sample.chunkX, sample.chunkZ);
+            if (held == null) {
+                incoming.putClean(sample);
+                return;
+            }
+            boolean diskWins = outranks(sample, held);
+            if (diskWins) {
+                incoming.putClean(sample);
+            }
+            int turn = groundTurn(sample, held, diskWins);
+            kept[0] += turn;
+            outranked[0] -= turn;
+        }
+    }
+
+    // Whether the sample on disk outranks the incoming one: ground first, then age.
     // Undated (pre-wall-clock) samples always lose to dated ones; two undated samples compare by raw tick.
-    private static boolean outranks(ChunkSample existing, ChunkSample fresh) {
+    public static boolean outranks(ChunkSample existing, ChunkSample fresh) {
+        boolean ground = existing.holdsGround();
+        if (ground != fresh.holdsGround()) {
+            return ground;
+        }
         return outranks(existing.capturedAt(), existing.captureVersion(), fresh);
     }
 
@@ -3667,7 +3866,38 @@ public final class MapStorage {
         if (dated != fresh.hasWallClockCapture()) {
             return dated;
         }
+        if (dated && existingCapturedAt > UtcClock.collector().nowMillis()) {
+            return false;
+        }
         return existingCapturedAt > fresh.capturedAt();
+    }
+
+    private static boolean mayOutrank(long existingCapturedAt, int existingCaptureVersion,
+                                      ChunkSample fresh) {
+        return outranks(existingCapturedAt, existingCaptureVersion, fresh) || !fresh.holdsGround();
+    }
+
+    private static boolean mayOutrank(long existingCapturedAt, int existingCaptureVersion,
+                                      ChunkSample fresh, byte[] columns, int columnsVersion,
+                                      java.util.function.IntFunction<LandCover> legacy) {
+        if (outranks(existingCapturedAt, existingCaptureVersion, fresh)) {
+            return true;
+        }
+        return !fresh.holdsGround()
+                && MapCodec.columnsHoldGround(columns, columnsVersion, legacy);
+    }
+
+    // How ground turned the counted age verdict: 1 to existing, -1 to fresh, else 0.
+    private static int groundTurn(ChunkSample existing, ChunkSample fresh, boolean existingWins) {
+        int turn;
+        if (existingWins == outranks(existing.capturedAt(), existing.captureVersion(), fresh)) {
+            turn = 0;
+        } else if (existingWins) {
+            turn = 1;
+        } else {
+            turn = -1;
+        }
+        return turn;
     }
 
     public static MapStore snapshotRegion(MapStore store, int regionX, int regionZ) {
@@ -3708,6 +3938,127 @@ public final class MapStorage {
         return prepared;
     }
 
+    private static final byte UNKNOWN_COVER_CODE = (byte) LandCover.UNKNOWN.code();
+
+    // A stored copy of the chunk; heights and cover are scratch columns of ChunkSample.COLUMNS.
+    public static ChunkSample copyOf(GroundChunk chunk, short[] heights, byte[] cover) {
+        java.util.Arrays.fill(heights, ChunkSample.NO_HEIGHT);
+        java.util.Arrays.fill(cover, UNKNOWN_COVER_CODE);
+        chunk.copyHeights(heights);
+        chunk.copyCoverCodes(cover);
+        ChunkSample copy = ChunkSample.forFullWriter(chunk.chunkX(), chunk.chunkZ());
+        copy.setColumns(heights, cover);
+        copy.setCapturedAt(chunk.capturedAt());
+        copy.setCaptureVersion(chunk.captureVersion());
+        return copy;
+    }
+
+    // One region of an import: the ground the collector held for it, and its file.
+    public static final class RegionImport {
+
+        private final String dimensionId;
+
+        private final Path root;
+
+        private final Path file;
+
+        // The import writer's thread's until the import is written; the client thread's after.
+        private final MapStore ground;
+
+        private final Unlanded kept;
+
+        private final java.util.function.IntFunction<LandCover> legacy;
+
+        private final java.util.function.Consumer<String> damage;
+
+        // Null until the import is written.
+        private volatile ChunkSample[] imported;
+
+        private RegionImport(String dimensionId, Path root, Path file, MapStore ground, Unlanded kept,
+                             java.util.function.IntFunction<LandCover> legacy,
+                             java.util.function.Consumer<String> damage) {
+            this.dimensionId = dimensionId;
+            this.root = root;
+            this.file = file;
+            this.ground = ground;
+            this.kept = kept;
+            this.legacy = legacy;
+            this.damage = damage;
+        }
+    }
+
+    // Client thread; null outside a world, or when the dimension's folder cannot be claimed.
+    public RegionImport prepareImport(String dimensionId, int regionX, int regionZ) {
+        Path at = root;
+        Path file = at == null ? null : regionFileFor(dimensionId, regionX, regionZ);
+        if (file == null) {
+            return null;
+        }
+        MapStore resident = handedOut(dimensionId);
+        MapStore ground = resident == null ? newRegionStore() : snapshotRegion(resident, regionX, regionZ);
+        Unlanded kept = keptAside(file);
+        return new RegionImport(dimensionId, at, file, foldKeptAside(ground, kept), kept,
+                legacyColourToCover, damage);
+    }
+
+    // Any thread but the client thread; returns how many imported chunks the file holds now.
+    public static int writeImport(RegionImport region, ChunkSample[] imported) throws IOException {
+        MapStore ground = region.ground;
+        for (ChunkSample sample : imported) {
+            if (sample == null) {
+                continue;
+            }
+            ChunkSample held = ground.peekValue(sample.chunkX, sample.chunkZ);
+            if (held == null || importTakes(held, sample)) {
+                ground.putClean(sample);
+            }
+        }
+        writeRegionFile(ground, region.file, region.legacy, region.damage);
+        region.imported = imported;
+        int written = 0;
+        for (ChunkSample sample : imported) {
+            if (sample != null && ground.peekValue(sample.chunkX, sample.chunkZ) == sample) {
+                written++;
+            }
+        }
+        return written;
+    }
+
+    // Client thread; puts the written import over resident ground it outranks or ties.
+    // False when its world was left.
+    public boolean landImport(RegionImport region) {
+        if (region.root != root) {
+            return false;
+        }
+        MapStore resident = handedOut(region.dimensionId);
+        ChunkSample[] imported = region.imported;
+        if (resident != null && imported != null) {
+            for (ChunkSample sample : imported) {
+                if (sample != null && region.ground.peekValue(sample.chunkX, sample.chunkZ) == sample) {
+                    ChunkSample held = resident.peek(sample.chunkX, sample.chunkZ);
+                    if (held != null && importTakes(held, sample)) {
+                        resident.putClean(sample);
+                    }
+                }
+            }
+        }
+        if (region.kept != null && unlanded.get(region.file) == region.kept) {
+            unlanded.remove(region.file);
+        }
+        return true;
+    }
+
+    // An import takes a held chunk it outranks, or one with the same ground, dated form and time.
+    private static boolean importTakes(ChunkSample held, ChunkSample sample) {
+        return outranks(sample, held) || ties(held, sample);
+    }
+
+    private static boolean ties(ChunkSample held, ChunkSample sample) {
+        return (held.holdsGround() == sample.holdsGround())
+                && (held.hasWallClockCapture() == sample.hasWallClockCapture())
+                && (held.capturedAt() == sample.capturedAt());
+    }
+
     public void rememberRegionWrite(MapStore store,
             java.util.concurrent.atomic.AtomicBoolean landed,
             java.util.function.BooleanSupplier droppedUnrun) {
@@ -3740,7 +4091,6 @@ public final class MapStorage {
     }
 
     public void save(String dimensionId) throws IOException {
-        // Must run before the drain below, not after.
         takeBackFailedWrites();
         MapStore store = handedOut(dimensionId);
         countAsUse(dimensionId, store);
@@ -3763,7 +4113,7 @@ public final class MapStorage {
                             if (kept != null && unlanded.get(file) == kept) {
                                 unlanded.remove(file);
                             }
-                        } catch (FileReplace.Refused unwaited) {
+                        } catch (AtomicFileReplace.Refused unwaited) {
                             failedWrites.add(new Unwritten(dimensionId, store, rx, rz, ground, file));
                         }
                         done++;
@@ -4017,7 +4367,6 @@ public final class MapStorage {
         }
     }
 
-    // Sweeps unstarted writes first, so a quit does not skip marking them dirty again.
     private void flushQuietly(boolean sharing) {
         long started = System.nanoTime();
         long until = started + java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
@@ -4032,12 +4381,10 @@ public final class MapStorage {
             }
         } catch (IOException ignored) {
         }
-        // After the sweep, so the writer's work has landed before the caller relies on it.
         awaitRegionWrites(sharing, until, started);
         stopRegionWrites();
         takeBackFailedWrites();
         try {
-            // The last chance this ground gets before its store is dropped.
             if (anyDirty()) {
                 saveDirty();
             }
@@ -4052,8 +4399,8 @@ public final class MapStorage {
                 }
             }
             note.accept("geosurvey: could not write the last save of " + still
-                    + " on exit; no further save runs."
-                    + " Ground not on disk is lost ("
+                    + " on exit."
+                    + " Unsaved ground is lost ("
                     + unwritten.getClass().getSimpleName() + ").");
         }
         writeUnlanded();
@@ -4077,7 +4424,7 @@ public final class MapStorage {
             } catch (IOException | RuntimeException failed) {
                 note.accept("geosurvey: could not save the markers for " + refused.dimensionId()
                         + "; the write pool refused them.");
-                if (!(failed instanceof FileReplace.Refused)) {
+                if (!(failed instanceof AtomicFileReplace.Refused)) {
                     keeping.remove(refused.file(), refused);
                 }
             }

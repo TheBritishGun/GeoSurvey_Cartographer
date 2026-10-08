@@ -32,23 +32,20 @@ public enum LandCover {
 
     TERRACOTTA(Codes.TERRACOTTA, Colours.TERRACOTTA, Page.OVERWORLD.bit),
 
-    // Matched by block, not colour: shares MapColor.STONE with too much
-    // else.
+    // Matched by block, not colour.
     BEDROCK(Codes.BEDROCK, Colours.BEDROCK, Page.OVERWORLD.bit | Page.NETHER.bit),
 
-    // Matched by block, not colour: shares MapColor.SAND with too much
-    // else.
+    // Matched by block, not colour.
     END_STONE(Codes.END_STONE, Colours.END_STONE, Page.END.bit),
 
-    // The crimson forest's ground, not its canopy (which stays FOREST).
+    // The crimson forest's ground; its canopy stays FOREST.
     // Matched by block, not colour.
     CRIMSON(Codes.CRIMSON, Colours.CRIMSON, Page.NETHER.bit),
 
     // An overworld cave biome. Matched by block, not colour.
     SULFUR(Codes.SULFUR, Colours.SULFUR, Page.OVERWORLD.bit);
 
-    // New covers must be appended, never inserted: the ordinal is the byte
-    // written to region files.
+    // Append new covers only; the ordinal is stored in region files.
     private final int code;
 
     private final int colour;
@@ -61,8 +58,7 @@ public enum LandCover {
         this.pages = pages;
     }
 
-    // Which dimensions' legends print this cover: whether walking that
-    // dimension can produce it, not whether it is common there.
+    // A dimension's legend prints the covers that walking there can produce.
     public enum Page {
 
         OVERWORLD(1),
@@ -79,7 +75,7 @@ public enum LandCover {
             this.bit = bit;
         }
 
-        // The page a dimension id names. Unrecognised or null gets ANYWHERE.
+        // Null or unrecognised gets ANYWHERE.
         public static Page of(String dimensionId) {
             if (dimensionId == null) {
                 return ANYWHERE;
@@ -194,7 +190,6 @@ public enum LandCover {
         return this != UNKNOWN;
     }
 
-    // Whether this cover belongs on page.
     public boolean onPage(Page page) {
         return (pages & page.bit) != 0;
     }

@@ -8,20 +8,17 @@ public final class TabName {
     // Longest tab-list name drawn, in glyphs.
     public static final int MAX_CHARS = 48;
 
-    // How far into a name to read for those glyphs, in characters.
+    // How far into a name to read, in characters.
     public static final int MAX_SCAN = MAX_CHARS * 3;
 
-    // Longest name a marker filter reads, in characters. Wider than
-    // MAX_CHARS on purpose: this bounds the search, not the draw.
+    // Longest name a marker filter reads, in characters.
     public static final int MAX_FILTER_CHARS = 1024;
 
-    // Whether shown is longer than MAX_FILTER_CHARS.
     public static boolean pastReading(String shown) {
         return shown != null && shown.length() > MAX_FILTER_CHARS;
     }
 
-    // Shortest run that could hold either UUID shape: 32 hex digits, no
-    // dashes.
+    // Shortest UUID text: 32 hex digits, no dashes.
     private static final int SHORTEST_ID = 32;
 
     private static final int HEX_DIGIT_BITS = 4;
@@ -50,8 +47,7 @@ public final class TabName {
         return dashedProbeCount;
     }
 
-    // Whether shown carries id's account id (a failed substitution). id
-    // may be null.
+    // Whether shown carries id's account id. id can be null.
     public static boolean damaged(String shown, UUID id) {
         if (shown == null || shown.length() < SHORTEST_ID) {
             return false;
@@ -155,7 +151,7 @@ public final class TabName {
         return c < HEX_TABLE_SIZE ? HEX[c] : -1;
     }
 
-    // shown, cut to MAX_CHARS glyphs, marked with an ellipsis if cut.
+    // shown, cut to MAX_CHARS glyphs, with an ellipsis if cut.
     public static String bounded(String shown) {
         return LabelText.clean(shown, MAX_CHARS, MAX_SCAN, true);
     }

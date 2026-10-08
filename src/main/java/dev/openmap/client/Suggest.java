@@ -75,8 +75,7 @@ final class Suggest {
     }
 
     static SuggestionProvider<FabricClientCommandSource> filtered(
-            Function<CommandContext<FabricClientCommandSource>,
-                    Collection<String>> values) {
+            Function<CommandContext<FabricClientCommandSource>, Collection<String>> values) {
         return (context, builder) -> {
             String matching = builder.getRemainingLowerCase();
             for (String value : values.apply(context)) {

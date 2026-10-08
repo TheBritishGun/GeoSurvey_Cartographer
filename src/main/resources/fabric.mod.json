@@ -3,7 +3,7 @@
   "id": "openmap-collect",
   "version": "${version}",
   "name": "GeoSurvey Cartographer",
-  "description": "Contributes surveyed ground to a shared map and draws nothing. Use it beside another map mod, such as Xaero's or JourneyMap. Install it instead of the GeoSurvey map mod, not with it. Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft.",
+  "description": "Contributes surveyed ground to a shared map; with claim greetings on, it draws greetings from web maps and avience.live. Use it beside another map mod, such as Xaero's or JourneyMap, and instead of the GeoSurvey map mod. Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft.",
   "license": "AGPL-3.0-or-later",
   "icon": "assets/openmap-collect/icon.png",
   "authors": ["BritishGun"],
@@ -33,7 +33,7 @@
     "sandpaper": ">=${sandpaper_version}"
   },
   "breaks": {
-    "geosurvey": "*"
+    "geosurvey": "<0.1.12-i"
   },
   "suggests": {
     "modmenu": "*"

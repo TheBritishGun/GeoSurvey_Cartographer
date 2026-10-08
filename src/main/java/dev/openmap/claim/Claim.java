@@ -1,6 +1,7 @@
 package dev.openmap.claim;
 
 import dev.openmap.draw.MarkerColour;
+import dev.openmap.map.LabelText;
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -34,7 +35,7 @@ public final class Claim {
     // Descriptive only; not authorisation.
     private final String owner;
 
-    // Empty when the client had none to give.
+    // Empty when the client has none.
     private final String ownerId;
 
     // e.g. minecraft:overworld.
@@ -58,47 +59,51 @@ public final class Claim {
     // Epoch milliseconds UTC.
     private final long revised;
 
+    private final boolean shared;
+
     public Claim(String id, String name, String owner, String ownerId,
                  String dimension, double[] xs, double[] zs,
                  MarkerColour colour, long revised) {
-        this(id, name, owner, ownerId, dimension, xs, zs, colour, revised, true);
+        this(id, name, owner, ownerId, dimension, xs, zs, colour, revised, true, false);
+        requireGround(this);
     }
 
     static Claim fromPen(Identity who, String name, double[] xs, double[] zs,
                          MarkerColour colour, long revised) {
-        return fromOwnedArrays(who, name, xs, zs, colour, revised);
+        Claim drawn = fromOwnedArrays(who, name, xs, zs, colour, revised, false);
+        requireGround(drawn);
+        return drawn;
     }
 
-    // Keeps the given arrays; the caller must not read or write them again.
+    // Keeps the given arrays; the caller must not use them again. A stored claim may enclose no ground.
     static Claim fromOwnedArrays(Identity who, String name, double[] xs, double[] zs,
-                                 MarkerColour colour, long revised) {
+                                 MarkerColour colour, long revised, boolean shared) {
         return new Claim(who.id(), name, who.owner(), who.ownerId(), who.dimension(),
-                xs, zs, colour, revised, false);
+                xs, zs, colour, revised, false, shared);
     }
 
     private Claim(String id, String name, String owner, String ownerId,
                   String dimension, double[] xs, double[] zs,
-                  MarkerColour colour, long revised, boolean copyCorners) {
+                  MarkerColour colour, long revised, boolean copyCorners, boolean shared) {
         Objects.requireNonNull(xs, "xs");
         Objects.requireNonNull(zs, "zs");
         this.id = trimmed(id, "id");
-        this.name = trimmed(name, "name");
+        this.name = trimmed(cleaned(name), "name");
         this.owner = owner == null ? "" : owner.trim();
         this.ownerId = ownerId == null ? "" : ownerId.trim();
         this.dimension = trimmed(dimension, "dimension");
         this.colour = colour == null ? MarkerColour.BLACK : colour;
         if (xs.length != zs.length) {
-            throw new IllegalArgumentException("a boundary with " + xs.length
-                    + " x values and " + zs.length + " z values is not a boundary"
-                    + "");
+            throw new IllegalArgumentException("boundary has " + xs.length
+                    + " x values but " + zs.length + " z values");
         }
         if (xs.length < MIN_CORNERS) {
-            throw new IllegalArgumentException(xs.length + " corners cannot enclose"
-                    + " anything. A claim wants at least " + MIN_CORNERS);
+            throw new IllegalArgumentException(xs.length + " corners; the minimum"
+                    + " is " + MIN_CORNERS);
         }
         if (xs.length > MAX_CORNERS) {
-            throw new IllegalArgumentException(xs.length + " corners is more than the"
-                    + " " + MAX_CORNERS + " the map viewer will draw");
+            throw new IllegalArgumentException(xs.length + " corners; at most"
+                    + " " + MAX_CORNERS + " are allowed");
         }
         double[] copyX = copyCorners ? xs.clone() : xs;
         checked(copyX[0], 0, "x");
@@ -135,15 +140,12 @@ public final class Claim {
         this.maxX = maxX;
         this.maxZ = maxZ;
         this.revised = revised;
-        if (enclosesNothing(copyX, copyZ, copyX.length)) {
-            throw new IllegalArgumentException("these " + copyX.length
-                    + " corners enclose no ground. A claim wants an inside");
-        }
+        this.shared = shared;
     }
 
-    private Claim(Claim source, String name, MarkerColour colour, long revised) {
+    private Claim(Claim source, String name, MarkerColour colour, long revised, boolean clean) {
         this.id = source.id;
-        this.name = trimmed(name, "name");
+        this.name = trimmed(clean ? cleaned(name) : name, "name");
         this.owner = source.owner;
         this.ownerId = source.ownerId;
         this.dimension = source.dimension;
@@ -155,6 +157,24 @@ public final class Claim {
         this.maxZ = source.maxZ;
         this.colour = colour == null ? MarkerColour.BLACK : colour;
         this.revised = revised;
+        this.shared = source.shared;
+    }
+
+    private Claim(Claim source, boolean shared) {
+        this.id = source.id;
+        this.name = source.name;
+        this.owner = source.owner;
+        this.ownerId = source.ownerId;
+        this.dimension = source.dimension;
+        this.xs = source.xs;
+        this.zs = source.zs;
+        this.minX = source.minX;
+        this.minZ = source.minZ;
+        this.maxX = source.maxX;
+        this.maxZ = source.maxZ;
+        this.colour = source.colour;
+        this.revised = source.revised;
+        this.shared = shared;
     }
 
     public String id() {
@@ -201,11 +221,19 @@ public final class Claim {
         return revised;
     }
 
+    public boolean shared() {
+        return shared;
+    }
+
+    Claim sharedAs(boolean on) {
+        return on == shared ? this : new Claim(this, on);
+    }
+
     public int corners() {
         return xs.length;
     }
 
-    // The stroke colour, opaque.
+    // Opaque.
     public int lineColour() {
         return colour.colour();
     }
@@ -221,11 +249,22 @@ public final class Claim {
 
     // Copy with a new name; same id and corners.
     public Claim named(String other, long now) {
-        return new Claim(this, other, colour, now);
+        return new Claim(this, other, colour, nextRevision(now), true);
     }
 
     public Claim coloured(MarkerColour other, long now) {
-        return new Claim(this, name, other, now);
+        return new Claim(this, name, other, nextRevision(now), true);
+    }
+
+    // Copy under the name as stored: trimmed, not cleaned.
+    Claim storedAs(String stored) {
+        String kept = trimmed(stored, "name");
+        return kept.equals(name) ? this : new Claim(this, kept, colour, revised, false);
+    }
+
+    // The revision of a copy: the clock reading, or one past this revision if that is later.
+    private long nextRevision(long now) {
+        return Math.max(now, (revised == Long.MAX_VALUE) ? revised : revised + 1L);
     }
 
     // Case-insensitive and padding-insensitive.
@@ -237,11 +276,23 @@ public final class Claim {
         return trimmedHandle != null && name.equalsIgnoreCase(trimmedHandle);
     }
 
+    // The name without line breaks, format codes or direction marks; a name with nothing left is kept as it is.
+    static String cleaned(String raw) {
+        String cleaned = LabelText.clean(raw, LabelText.UNBOUNDED_READ, LabelText.UNBOUNDED_READ, false);
+        return cleaned.isBlank() ? raw : cleaned;
+    }
+
+    private static void requireGround(Claim made) {
+        if (enclosesNothing(made.xs, made.zs, made.xs.length)) {
+            throw new IllegalArgumentException("these " + made.xs.length + " corners enclose no ground");
+        }
+    }
+
     private static String trimmed(String value, String field) {
         String out = value == null ? "" : value.trim();
         if (out.isEmpty()) {
-            throw new IllegalArgumentException("a claim needs a " + field
-                    + "; a blank one names nothing");
+            throw new IllegalArgumentException("claim " + field
+                    + " is blank");
         }
         return out;
     }
@@ -254,7 +305,7 @@ public final class Claim {
             }
             throw new IllegalArgumentException("corner " + corner + " has " + axis
                     + " = " + value + ", outside the world border at "
-                    + (long) LIMIT + "; no tile is ever painted there");
+                    + (long) LIMIT);
         }
     }
 

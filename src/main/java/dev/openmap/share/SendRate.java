@@ -13,7 +13,7 @@ public final class SendRate {
         if (!Double.isFinite(burst) || !Double.isFinite(perSecond)
                 || burst < 1.0 || perSecond <= 0) {
             throw new IllegalArgumentException(
-                    "burst must be finite and at least 1; perSecond must be finite and positive");
+                    "burst and perSecond must be finite; burst at least 1, perSecond above 0");
         }
         this.capacity = burst;
         this.refillPerNano = perSecond / NANOS_PER_SECOND;

@@ -1,6 +1,7 @@
 package dev.openmap.share;
 
 import dev.openmap.map.ChunkSample;
+import dev.openmap.map.LabelText;
 import dev.openmap.map.MapCodec;
 import dev.openmap.mgrs.Streams;
 import java.io.ByteArrayInputStream;
@@ -10,6 +11,8 @@ import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Objects;
 import java.util.zip.Deflater;
@@ -29,7 +32,19 @@ public record Batch(
 
     public static final int MAX_NAME = Presence.MAX_NAME;
 
+    private static final String NAMELESS = "unnamed";
+
+    private static final int MAX_DERIVED_NAME = 128;
+
+    private static final int HASH_BYTES = 8;
+
+    private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
     private static final int TRAILER_BYTES = 8;
+
+    private static final int EXTRA_COUNTED_BYTES = 1 << 16;
+
+    private static final int EXTRA_SINK_BYTES = 1 << 9;
 
     private static final int SINK_CEILING_BYTES = 1 << 22;
 
@@ -70,7 +85,6 @@ public record Batch(
         }
     }
 
-    // A gzip member that also counts the compressed bytes it read.
     private static final class Member extends GZIPInputStream {
 
         private long compressed;
@@ -87,8 +101,8 @@ public record Batch(
         @Override
         public int read(byte[] into, int at, int length) throws IOException {
             if (reading) {
-                throw new IOException("a second gzip member follows the batch."
-                        + " One member only.");
+                throw new IOException("a second gzip member"
+                        + " follows the batch.");
             }
             reading = true;
             int read;
@@ -194,12 +208,56 @@ public record Batch(
         }
         if (samples.isEmpty()) {
             throw new IllegalArgumentException(
-                    "an empty batch is not a message; do not send one");
+                    "an empty batch is not a message");
         }
         if (samples.size() > MAX_SAMPLES) {
             throw new IllegalArgumentException(
-                    samples.size() + " samples exceeds the " + MAX_SAMPLES + " limit");
+                    samples.size() + " samples exceed the " + MAX_SAMPLES + " limit");
         }
+    }
+
+    public static String usableServerName(String raw) {
+        if (raw == null || usableName(raw)) {
+            return raw;
+        }
+        String cleaned = LabelText.clean(raw, LabelText.UNBOUNDED_READ,
+                LabelText.UNBOUNDED_READ, false);
+        String kept = cleaned.isBlank() ? NAMELESS : cleaned;
+        String suffix = hashSuffix(raw);
+        int limit = MAX_DERIVED_NAME - suffix.length();
+        if (kept.length() > limit) {
+            int end = limit;
+            if (Character.isHighSurrogate(kept.charAt(end - 1))
+                    && Character.isLowSurrogate(kept.charAt(end))) {
+                end--;
+            }
+            kept = kept.substring(0, end);
+        }
+        String derived = kept + suffix;
+        return usableName(derived) ? derived : NAMELESS + suffix;
+    }
+
+    private static String hashSuffix(String raw) {
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException absent) {
+            throw new IllegalStateException("no SHA-256", absent);
+        }
+        for (int at = 0; at < raw.length(); at++) {
+            char unit = raw.charAt(at);
+            digest.update((byte) (unit >>> Byte.SIZE));
+            digest.update((byte) unit);
+        }
+        byte[] bytes = digest.digest();
+        char[] text = new char[1 + HASH_BYTES * 2];
+        text[0] = '~';
+        for (int at = 0; at < HASH_BYTES; at++) {
+            int value = bytes[at] & 0xFF;
+            text[1 + at * 2] = HEX_DIGITS[value >>> 4];
+            text[2 + at * 2] = HEX_DIGITS[value & 0x0F];
+        }
+        return new String(text);
     }
 
     static int sinkCapacity(int sampleCount) {
@@ -248,7 +306,6 @@ public record Batch(
         return decode(message, header, Long.MAX_VALUE);
     }
 
-    // Also refuses a sample whose capturedAt is later than capturedAtCeiling.
     public static Batch decode(byte[] message, Header header, long capturedAtCeiling)
             throws IOException {
         ByteArrayInputStream body = new ByteArrayInputStream(message);
@@ -277,7 +334,7 @@ public record Batch(
                 byte[] data = new byte[MapCodec.CHUNK_BYTES];
                 byte[] lengthBuf = new byte[Integer.BYTES];
 
-            // A local, never a field: this method runs on several request threads at once.
+            // Runs on several request threads at once.
                 MapCodec.ChunkReader reader = new MapCodec.ChunkReader();
                 for (int i = 0; i < count; i++) {
                     if (Streams.readNBytes(in, lengthBuf, 0, Integer.BYTES) != Integer.BYTES) {
@@ -306,15 +363,15 @@ public record Batch(
                     }
                 }
                 if (in.read() != -1) {
-                    throw new IOException("the batch is followed by more payload."
-                            + " Refusing it.");
+                    throw new IOException(extraBytes(in) + " extra bytes"
+                            + " after the batch.");
                 }
 
             // Ask after that read, never before it.
                 long compressed = member.compressed();
                 if (gzipHeader + compressed + TRAILER_BYTES != message.length) {
                     throw new IOException("the message is " + message.length
-                            + " bytes and the batch in it ends at "
+                            + " bytes; its batch ends at "
                             + (gzipHeader + compressed + TRAILER_BYTES));
                 }
                 result = new Batch(server, dimension, by, sent, List.of(samples));
@@ -323,8 +380,22 @@ public record Batch(
         return result;
     }
 
-    private static boolean usableName(String value) {
-        return value.length() <= MAX_NAME && !value.isBlank();
+    // The bytes left after the one already read, counted up to a ceiling.
+    private static String extraBytes(InputStream in) throws IOException {
+        long extra = 1L;
+        byte[] sink = new byte[EXTRA_SINK_BYTES];
+        int read = 0;
+        while (read >= 0 && extra <= EXTRA_COUNTED_BYTES) {
+            read = in.read(sink);
+            extra += Math.max(read, 0);
+        }
+        return extra > EXTRA_COUNTED_BYTES ? "more than " + EXTRA_COUNTED_BYTES : String.valueOf(extra);
+    }
+
+    public static boolean usableName(String value) {
+        return value.length() <= MAX_NAME && !value.isBlank()
+                && value.equals(LabelText.clean(value, LabelText.UNBOUNDED_READ,
+                        LabelText.UNBOUNDED_READ, false));
     }
 
     private static String name(String value, String what) throws IOException {

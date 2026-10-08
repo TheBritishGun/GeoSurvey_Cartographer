@@ -31,40 +31,37 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         }
     }
 
-    // The digit is the field layout, not the payload version.
+    // The digit is the field layout.
     public static final String PREFIX = "lnmap1";
 
     // Between fields.
     public static final char FIELD = '~';
 
-    // Fields in a card, always.
     public static final int FIELDS = 6;
 
-    // The payload layout this build writes and reads.
+    // The payload layout this build uses.
     public static final int PAYLOAD_VERSION = 1;
 
-    // Mask bit for the SpawnPrint component.
+    // Mask bit for SpawnPrint.
     public static final int SURFACE = 0x01;
 
-    // Check bytes at the end of the payload.
+    // Check bytes at the payload end.
     public static final int CHECK_BYTES = 2;
 
-    // Longest card text read.
+    // Longest card text.
     public static final int MAX_TEXT = 1024;
 
-    // Longest payload decoded.
     public static final int MAX_PAYLOAD = 512;
 
-    // Most cards read out of one settings field.
+    // Maximum cards read from one settings field.
     public static final int MAX_CARDS = 16;
 
     // The world border, in chunks.
     public static final int MAX_ANCHOR = 1_875_000;
 
-    // Namespace a dimension field without one belongs to.
     public static final String DEFAULT_NAMESPACE = "minecraft";
 
-    // Longest dimension identifier accepted.
+    // Longest dimension identifier.
     public static final int MAX_DIMENSION = 64;
 
     private static final int ORIGIN_FIELD = 1;
@@ -97,23 +94,23 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
 
         NONE(""),
 
-        NOT_A_CARD("A map card starts with lnmap1. Check what you pasted."),
+        NOT_A_CARD("A map card starts with lnmap1."),
 
-        WRONG_SHAPE("This map card has the wrong number of parts. Paste it again."),
+        WRONG_SHAPE("It has the wrong number of parts."),
 
-        BAD_ADDRESS("This map card names no address, or names one with a path on it."),
+        BAD_ADDRESS("Its address is missing or has a path."),
 
-        BAD_DIMENSION("This map card names no dimension."),
+        BAD_DIMENSION("It names no dimension."),
 
-        BAD_ANCHOR("This map card names no place in the world."),
+        BAD_ANCHOR("It names no place in the world."),
 
-        DAMAGED("This map card is damaged. Ask for it again and paste the whole line."),
+        DAMAGED("Ask for it again and paste the whole line."),
 
-        UNKNOWN_VERSION("This map card is newer than this mod. Update the mod."),
+        UNKNOWN_VERSION("Update the mod to read this newer card."),
 
-        NO_COMPONENT("This map card describes no ground. Ask the operator for a new one."),
+        NO_COMPONENT("Ask the operator for a card that describes ground."),
 
-        TOO_FLAT("This map card describes flat ground. It identifies no server.");
+        TOO_FLAT("Flat ground identifies no server.");
 
         private final String reason;
 
@@ -121,13 +118,12 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
             this.reason = reason;
         }
 
-        // Empty for NONE.
         public String reason() {
             return reason;
         }
     }
 
-    // card is null when fault is not NONE.
+    // card is null unless fault is NONE.
     public record Read(MapCard card, Fault fault, String text) {
 
         public boolean ok() {
@@ -138,7 +134,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
     public record Scan(List<Read> reads, int entries) {
     }
 
-    // How much of a bad entry is quoted back.
+    // Maximum characters quoted from a bad entry.
     public static final int QUOTE_LIMIT = 40;
 
     // Never throws.
@@ -302,7 +298,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return out;
     }
 
-    // Null when there is no card for this ground.
+    // Null when no card can be made.
     public static MapCard of(String origin, String dimension, int anchorX, int anchorZ,
                              SpawnPrint print) {
         String tidy = Directory.tidy(origin);
@@ -315,7 +311,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return new MapCard(tidy, named, anchorX, anchorZ, SURFACE, print);
     }
 
-    // Splits on the field character, keeping empty trailing fields.
+    // Splits on FIELD, keeping empty trailing fields.
     private static String[] split(String text) {
         String[] parts = new String[FIELDS + 1];
         int count = 0;
@@ -340,7 +336,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return fields;
     }
 
-    // Empty when the field is not a dimension.
+    // Empty when the field is invalid.
     static String dimensionOf(String field) {
         if (field == null) {
             return "";
@@ -368,7 +364,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return text;
     }
 
-    // Minecraft resource location characters, minus the slash.
+    // Resource location characters, except the slash.
     private static boolean plain(String text, int from, int to, boolean path) {
         boolean safe = true;
         for (int i = from; safe && i < to; i++) {
@@ -379,7 +375,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return safe;
     }
 
-    // Integer.MIN_VALUE when the field is not a coordinate.
+    // Integer.MIN_VALUE when the field is invalid.
     static int anchorOf(String field) {
         if (field == null || field.isEmpty() || field.length() > MAX_ANCHOR_TEXT) {
             return Integer.MIN_VALUE;
@@ -407,7 +403,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return anchor;
     }
 
-    // Null when the mask or lengths do not hold up.
+    // Null when the component is not found.
     static byte[] componentOf(byte[] payload, int mask, int wanted) {
         long found = indexOfComponent(payload, mask, wanted);
         if (found < 0) {
@@ -419,7 +415,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return out;
     }
 
-    // High int is the offset, low int is the length; -1 when not found.
+    // High int: offset; low int: length; -1 when not found.
     static long indexOfComponent(byte[] payload, int mask, int wanted) {
         if ((mask & wanted) == 0) {
             return -1;
@@ -473,7 +469,7 @@ public record MapCard(String origin, String dimension, int anchorX, int anchorZ,
         return digest;
     }
 
-    // Covers the address and anchor as well as the payload.
+    // Covers the address, anchor and payload.
     static byte[] checkOf(String origin, String dimension, int anchorX, int anchorZ,
                           byte[] payload, int upTo) {
         int packed = checkPacked(origin, dimension, anchorX, anchorZ, payload, upTo);

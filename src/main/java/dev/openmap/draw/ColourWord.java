@@ -75,7 +75,7 @@ public final class ColourWord {
         return (PALETTE_NAME_LENGTHS & lengthBit(length)) != 0L;
     }
 
-    // ARGB; null when typed names no colour.
+    // ARGB; null when not a colour.
     public static Integer parse(String typed) {
         String word = trimmedWord(typed);
         if (word == null) {

@@ -1,8 +1,8 @@
 package dev.openmap.draw;
 
+import dev.openmap.json.AtomicFileReplace;
 import dev.openmap.json.JsonBind;
 import dev.openmap.json.JsonParseException;
-import dev.openmap.map.MapStorage.FileReplace;
 import java.io.FilterWriter;
 import java.io.IOException;
 import java.io.Reader;
@@ -48,6 +48,15 @@ public final class AnnotationStore {
     private static final double CELL_SIZE = 128;
 
     private static final int MAX_CELLS_PER_ANNOTATION = 256;
+
+    private static final class RecoveryFailure extends IOException {
+
+        private static final long serialVersionUID = 1L;
+
+        private RecoveryFailure(IOException cause) {
+            super(cause.getMessage(), cause);
+        }
+    }
 
     private final ArrayList<Annotation> annotations = new ArrayList<>();
 
@@ -102,7 +111,6 @@ public final class AnnotationStore {
         return true;
     }
 
-    // Sizes both arrays for a document that held count entries.
     private void reserve(int count) {
         int capacity = Math.min(Math.max(count, 0), MAX_FILE_VALUES);
         annotations.ensureCapacity(capacity);
@@ -112,7 +120,6 @@ public final class AnnotationStore {
         }
     }
 
-    // Drops everything a part-read document put in.
     private void discardLoaded() {
         annotations.clear();
         Arrays.fill(gridLists, null);
@@ -210,7 +217,7 @@ public final class AnnotationStore {
         return nearestAmong(null, annotations.size(), x, z, radius);
     }
 
-    // Null entries walks every annotation, index by index.
+    // Null entries means every annotation.
     private Annotation nearestAmong(IntList entries, int count, double x, double z,
             double radius) {
         Annotation nearest = null;
@@ -282,7 +289,6 @@ public final class AnnotationStore {
         return (int) Math.floor(coordinate / CELL_SIZE);
     }
 
-    // Whether cell is the narrowing conversion's own clamp (MIN_VALUE or MAX_VALUE).
     private static boolean isSaturatedCell(int cell) {
         return cell == Integer.MIN_VALUE || cell == Integer.MAX_VALUE;
     }
@@ -366,10 +372,9 @@ public final class AnnotationStore {
         boolean loaded = false;
         if (path != null) {
             store.readFrom = path.toAbsolutePath().normalize();
-            try (Reader file = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            try (Reader file = openRecovering(path)) {
                 Reader reader = new Capped(file);
 
-            // One entry at a time; never the whole document resident.
                 int count = JSON.fromJsonStream(reader, Annotation.class, store::take);
                 if (count >= 0) {
                     store.reserve(count);
@@ -388,16 +393,21 @@ public final class AnnotationStore {
             } catch (IOException bad) {
                 loaded = false;
                 store.discardLoaded();
-                try {
-                    if (!Files.readAttributes(path, BasicFileAttributes.class).isRegularFile()) {
+                if (bad instanceof RecoveryFailure recoveryFailed) {
+                    store.unreadable = describe(recoveryFailed.getCause());
+                    store.recoveryFailed = true;
+                } else {
+                    try {
+                        if (!Files.readAttributes(path, BasicFileAttributes.class).isRegularFile()) {
+                            store.readFrom = null;
+                        } else {
+                            store.unreadable = describe(bad);
+                        }
+                    } catch (NoSuchFileException absent) {
                         store.readFrom = null;
-                    } else {
+                    } catch (IOException attributesUnavailable) {
                         store.unreadable = describe(bad);
                     }
-                } catch (NoSuchFileException absent) {
-                    store.readFrom = null;
-                } catch (IOException attributesUnavailable) {
-                    store.unreadable = describe(bad);
                 }
             } catch (JsonParseException bad) {
                 store.discardLoaded();
@@ -407,10 +417,28 @@ public final class AnnotationStore {
         if (loaded) {
             store.dirty = false;
 
-        // Set to readFrom, so a fresh load already counts as a clean save of that path.
             store.lastWrittenTo = store.readFrom;
         }
         return store;
+    }
+
+    private static Reader openRecovering(Path path) throws IOException {
+        Reader opened;
+        try {
+            opened = Files.newBufferedReader(path, StandardCharsets.UTF_8);
+        } catch (NoSuchFileException absent) {
+            boolean recovered;
+            try {
+                recovered = AtomicFileReplace.recoverStaleAside(path);
+            } catch (IOException recoveryFailed) {
+                throw new RecoveryFailure(recoveryFailed);
+            }
+            if (!recovered) {
+                throw absent;
+            }
+            opened = Files.newBufferedReader(path, StandardCharsets.UTF_8);
+        }
+        return opened;
     }
 
     static String describe(Throwable error) {
@@ -418,7 +446,7 @@ public final class AnnotationStore {
         return error.getClass().getSimpleName() + (message == null ? "" : ": " + message);
     }
 
-    // Why the file this store came from could not be read, or empty.
+    // The read failure, or empty.
     public String unreadable() {
         return unreadable;
     }
@@ -437,13 +465,14 @@ public final class AnnotationStore {
 
     private boolean dirty;
 
-    // Writes the whole overlay, atomically, unless the file it came from was unreadable.
+    private boolean recoveryFailed = false;
+
     public void save(Path path) throws IOException {
         if (!unreadable.isEmpty() && isTheDocumentItCameFrom(path)
-                && Files.isRegularFile(path)) {
+                && (recoveryFailed || Files.isRegularFile(path))) {
             throw new IOException(path + " could not be read (" + unreadable
-                    + "). Writing this overlay would delete what is in it."
-                    + " Move it aside. The next save starts fresh.");
+                    + ")."
+                    + " Move that file aside; the next save starts fresh.");
         }
         if (!dirty && lost == 0 && Files.isRegularFile(path)
                 && isLastWrittenDocument(path)) {
@@ -458,20 +487,12 @@ public final class AnnotationStore {
         tally.refuse("write");
         Path temp = path.resolveSibling(path.getFileName() + "."
                 + Thread.currentThread().threadId() + ".tmp");
-        try {
+        AtomicFileReplace.write(temp, path, written -> {
             try (Writer writer = new Bounded(
-                    Files.newBufferedWriter(temp, StandardCharsets.UTF_8), tally)) {
+                    Files.newBufferedWriter(written, StandardCharsets.UTF_8), tally)) {
                 JSON.toJson(annotations, writer);
             }
-        } catch (IOException | RuntimeException failed) {
-            try {
-                Files.deleteIfExists(temp);
-            } catch (IOException | RuntimeException undeletable) {
-                failed.addSuppressed(undeletable);
-            }
-            throw failed;
-        }
-        FileReplace.replace(temp, path, true, FileReplace.ALWAYS);
+        });
         if (!unreadable.isEmpty() && isTheDocumentItCameFrom(path)) {
             unreadable = "";
         }
@@ -694,11 +715,11 @@ public final class AnnotationStore {
         void refuse(String verb) throws IOException {
             if (chars > MAX_FILE_CHARS) {
                 throw new IOException("longer than " + MAX_FILE_CHARS
-                        + " characters; refusing to " + verb + " it as an overlay");
+                        + " characters; refusing to " + verb + " it");
             }
             if (values > MAX_FILE_VALUES) {
                 throw new IOException("more than " + MAX_FILE_VALUES
-                        + " values; refusing to " + verb + " it as an overlay");
+                        + " values; refusing to " + verb + " it");
             }
         }
     }

@@ -9,6 +9,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.SlabBlock;
@@ -30,28 +31,28 @@ public final class LandCoverClassifier {
             return LandCover.WATER;
         }
         int early = earlyVerdict(state);
-        int verdictOrdinal = early >>> 1;
         LandCover cover;
-        if (verdictOrdinal != 0) {
-            cover = LandCover.byOrdinal(verdictOrdinal - 1);
+        if (early != 0) {
+            cover = LandCover.byOrdinal(early - 1);
         } else {
-            cover = colourOf(state, level, pos, (early & 1) != 0);
+            cover = colourOf(state);
         }
         return cover;
     }
 
-    private static LandCover colourOf(BlockState state, BlockGetter level, BlockPos pos,
-                                      boolean identitySnow) {
-        MapColor material = state.getMapColor(level, pos);
+    private static LandCover colourOf(BlockState state) {
+        MapColor material = state.getMapColor(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         if (material == null || material == MapColor.NONE) {
             return LandCover.URBAN;
         }
         LandCover byColour = fromMaterial(material);
-        if (byColour == LandCover.SNOW && !identitySnow) {
-            byColour = LandCover.URBAN;
+        if (byColour != LandCover.URBAN) {
+            return byColour;
         }
-        return byColour == LandCover.URBAN && !state.blocksMotion()
-                ? LandCover.SCRUB : byColour;
+        if (isBaseStoneGround(state)) {
+            return LandCover.ROCK;
+        }
+        return !state.blocksMotion() ? LandCover.SCRUB : LandCover.URBAN;
     }
 
     private static int earlyVerdict(BlockState state) {
@@ -78,8 +79,8 @@ public final class LandCoverClassifier {
                 verdict = LandCover.SULFUR;
             } else if ((identity & IDENTITY_MYCELIUM) != 0) {
                 verdict = LandCover.MYCELIUM;
-            } else if ((identity & IDENTITY_MUD) != 0) {
-                verdict = LandCover.OPEN;
+            } else if ((identity & IDENTITY_MARSH_GROUND) != 0) {
+                verdict = LandCover.MARSH;
             } else if ((identity & IDENTITY_WATER_PLANT) != 0) {
                 verdict = LandCover.WATER;
             } else if ((identity & IDENTITY_NETHER_VINE) != 0) {
@@ -89,8 +90,7 @@ public final class LandCoverClassifier {
             } else {
                 verdict = verdictFromNames(identity);
             }
-            packed = ((verdict == null ? 0 : verdict.ordinal() + 1) << 1)
-                    | ((identity & IDENTITY_SNOW) != 0 ? 1 : 0);
+            packed = verdict == null ? 0 : verdict.ordinal() + 1;
             if (identityIsCached(block)) {
                 EARLY.put(block, packed);
             }
@@ -113,10 +113,6 @@ public final class LandCoverClassifier {
             verdict = LandCover.TERRACOTTA;
         } else if ((identity & IDENTITY_RED_SAND) != 0) {
             verdict = LandCover.SAND;
-        } else if (looksLikeGraniteOrDiorite(names)) {
-            verdict = LandCover.ROCK;
-        } else if (builtUnderNetherColour(names)) {
-            verdict = LandCover.URBAN;
         } else {
             verdict = null;
         }
@@ -223,21 +219,19 @@ public final class LandCoverClassifier {
     private static boolean isNaturalGround(BlockState state, int identity) {
         boolean natural;
         if (state.is(BlockTags.DIRT) || state.is(BlockTags.SAND)
-                || state.is(BlockTags.BASE_STONE_OVERWORLD)
-                || state.is(BlockTags.BASE_STONE_NETHER)
-                || state.is(BlockTags.TERRACOTTA)) {
+                || isBaseStoneGround(state) || state.is(BlockTags.TERRACOTTA)) {
             natural = true;
         } else if (isOre(state, identity)) {
             natural = true;
         } else {
             if ((identity & (IDENTITY_CAVE_FURNITURE | IDENTITY_BEDROCK
                     | IDENTITY_SULFUR_CAVE | IDENTITY_CRIMSON_FOREST
-                    | IDENTITY_WARPED_NYLIUM | IDENTITY_RED_SAND | IDENTITY_MYCELIUM
-                    | IDENTITY_SNOW | IDENTITY_UNTAGGED_NATURAL)) != 0) {
+                    | IDENTITY_WARPED_NYLIUM)) != 0) {
                 natural = true;
             } else {
                 MapColor material = state.getMapColor(null, null);
-                natural = material == MapColor.GRASS || material == MapColor.PODZOL;
+                natural = material == MapColor.GRASS || material == MapColor.PODZOL
+                        || material == MapColor.SNOW;
             }
         }
         return natural;
@@ -267,7 +261,6 @@ public final class LandCoverClassifier {
                 || block == Blocks.SHROOMLIGHT;
     }
 
-    // End stone and the brick family cut from it.
     static boolean isEndStone(Block block) {
         return block == Blocks.END_STONE || block == Blocks.END_STONE_BRICKS
                 || block == Blocks.END_STONE_BRICK_SLAB
@@ -275,7 +268,6 @@ public final class LandCoverClassifier {
                 || block == Blocks.END_STONE_BRICK_WALL;
     }
 
-    // The crimson forest floor and the trunks standing on it.
     static boolean isCrimsonForest(Block block) {
         return block == Blocks.CRIMSON_NYLIUM
                 || block == Blocks.CRIMSON_STEM
@@ -286,7 +278,6 @@ public final class LandCoverClassifier {
                 || block == Blocks.CRIMSON_FUNGUS;
     }
 
-    // What a sulfur cave is cut out of: sulfur, potent sulfur, the spikes, and cinnabar.
     static boolean isSulfurCave(Block block) {
         return block == Blocks.SULFUR || block == Blocks.POTENT_SULFUR
                 || block == Blocks.SULFUR_SPIKE || block == Blocks.CINNABAR;
@@ -296,15 +287,21 @@ public final class LandCoverClassifier {
         return (names & NAME_TERRACOTTA) != 0;
     }
 
-    static boolean looksLikeGraniteOrDiorite(byte names) {
-        return (names & NAME_GRANITE_DIORITE) != 0;
+    static boolean isMarshGround(Block block) {
+        return block == Blocks.MUD || block == Blocks.MUDDY_MANGROVE_ROOTS;
     }
 
-    static boolean builtUnderNetherColour(byte names) {
-        return (names & NAME_BUILT_UNDER_NETHER_COLOUR) != 0;
+    private static boolean isBaseStone(Block block) {
+        return block == Blocks.STONE || block == Blocks.GRANITE || block == Blocks.DIORITE
+                || block == Blocks.ANDESITE || block == Blocks.TUFF || block == Blocks.DEEPSLATE;
     }
 
-    // Cover that grew rather than being placed.
+    private static boolean isBaseStoneGround(BlockState state) {
+        Block block = state.getBlock();
+        return state.is(BlockTags.BASE_STONE_OVERWORLD) || isBaseStone(block)
+                || state.is(BlockTags.BASE_STONE_NETHER);
+    }
+
     static boolean isTreePart(BlockState state) {
         return state.is(BlockTags.LEAVES) || state.is(BlockTags.LOGS)
                 || looksLikeFoliage(state)
@@ -316,7 +313,6 @@ public final class LandCoverClassifier {
                 || (identity & IDENTITY_FUNGAL_CANOPY) != 0;
     }
 
-    // Backs up the tag before the server has synced it.
     private static boolean looksLikeLeaves(byte names) {
         return (names & NAME_LEAVES) != 0;
     }
@@ -329,23 +325,17 @@ public final class LandCoverClassifier {
         return (names & NAME_FOLIAGE) != 0;
     }
 
-    // One bit per name test, so one map entry answers all of them.
     private static final byte NAME_LEAVES = 1;
 
     private static final byte NAME_FOLIAGE = 2;
 
     private static final byte NAME_TERRACOTTA = 4;
 
-    private static final byte NAME_GRANITE_DIORITE = 8;
-
-    private static final byte NAME_BUILT_UNDER_NETHER_COLOUR = 32;
-
     private static final int NAME_SHIFT = 25;
 
-    private static final int NAME_MASK = (NAME_LEAVES | NAME_FOLIAGE | NAME_TERRACOTTA
-            | NAME_GRANITE_DIORITE | NAME_BUILT_UNDER_NETHER_COLOUR) << NAME_SHIFT;
+    private static final int NAME_MASK = (NAME_LEAVES | NAME_FOLIAGE | NAME_TERRACOTTA)
+            << NAME_SHIFT;
 
-    // The name tests above, worked out once per block and then kept.
     private static byte nameFlags(BlockState state) {
         NAME_FLAGS_CALL_COUNT.incrementAndGet();
         return nameBits(identityFlags(state.getBlock()));
@@ -385,9 +375,7 @@ public final class LandCoverClassifier {
 
     private static final int IDENTITY_WARPED_NYLIUM = 1 << 16;
 
-    private static final int IDENTITY_SNOW = 1 << 17;
-
-    private static final int IDENTITY_MUD = 1 << 18;
+    private static final int IDENTITY_MARSH_GROUND = 1 << 18;
 
     private static final int IDENTITY_TAG_LEAVES = 1 << 19;
 
@@ -400,9 +388,6 @@ public final class LandCoverClassifier {
     private static final int IDENTITY_TAG_WOODEN_SLABS = 1 << 23;
 
     private static final int IDENTITY_TAG_TERRACOTTA = 1 << 24;
-
-    // Outside the name-flag bit range (NAME_MASK).
-    private static final int IDENTITY_UNTAGGED_NATURAL = 1 << 29;
 
     private static final AtomicInteger TAG_TEST_COUNT = new AtomicInteger();
 
@@ -487,8 +472,8 @@ public final class LandCoverClassifier {
         if (block == Blocks.MYCELIUM) {
             flags |= IDENTITY_MYCELIUM;
         }
-        if (block == Blocks.MUD) {
-            flags |= IDENTITY_MUD;
+        if (isMarshGround(block)) {
+            flags |= IDENTITY_MARSH_GROUND;
         }
         if (block == Blocks.LILY_PAD || block == Blocks.FROGSPAWN) {
             flags |= IDENTITY_WATER_PLANT;
@@ -542,14 +527,6 @@ public final class LandCoverClassifier {
         if (block == Blocks.WARPED_NYLIUM) {
             flags |= IDENTITY_WARPED_NYLIUM;
         }
-        if (block == Blocks.MELON || block == Blocks.PUMPKIN || block == Blocks.BAMBOO
-                || block == Blocks.MOSSY_COBBLESTONE) {
-            flags |= IDENTITY_UNTAGGED_NATURAL;
-        }
-        if (block == Blocks.SNOW || block == Blocks.SNOW_BLOCK
-                || block == Blocks.POWDER_SNOW) {
-            flags |= IDENTITY_SNOW;
-        }
         return flags;
     }
 
@@ -586,14 +563,6 @@ public final class LandCoverClassifier {
         if (!path.endsWith("_glazed_terracotta")
                 && (path.equals("terracotta") || path.endsWith("_terracotta"))) {
             flags |= NAME_TERRACOTTA << NAME_SHIFT;
-        }
-        if (path.contains("granite") || path.contains("diorite")) {
-            flags |= NAME_GRANITE_DIORITE << NAME_SHIFT;
-        }
-        if ((path.contains("copper") || path.contains("lightning_rod")
-                || path.equals("tnt") || path.equals("redstone_block"))
-                && !path.endsWith("_ore")) {
-            flags |= NAME_BUILT_UNDER_NETHER_COLOUR << NAME_SHIFT;
         }
         return flags;
     }
@@ -667,8 +636,6 @@ public final class LandCoverClassifier {
                 .register((handler, client) -> tagsChanged());
     }
 
-    // Forgets every cached identity flag and early-verdict entry; the next lookup
-    // recomputes from live tags.
     public static void tagsChanged() {
         forgetIdentityFlags();
         EARLY.clear();

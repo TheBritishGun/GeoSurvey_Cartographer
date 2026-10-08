@@ -1,6 +1,7 @@
 package dev.openmap;
 
 import dev.openmap.config.LandNavConfig;
+import dev.openmap.json.SaveWriter;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicLong;
@@ -12,6 +13,40 @@ public final class LandNav {
     public static final String MOD_ID = "geosurvey";
 
     public static final String DATA_DIR = "geosurvey";
+
+    private static final long SAVE_NOW_BOUND_NANOS = 5_000_000_000L;
+
+    private static final class SettingsKeeper implements SaveWriter.Keeper {
+        @Override
+        public Path file() {
+            return configPath();
+        }
+
+        @Override
+        public SaveWriter.Document document() throws IOException {
+            return config().document();
+        }
+
+        @Override
+        public void write(SaveWriter.Document document) throws IOException {
+            LandNavConfig.writeDocument(file(), document);
+        }
+    }
+
+    private static final class SettingsSaving implements SaveWriter.Saving {
+        private IOException failure;
+
+        @Override
+        public void landed() {
+        }
+
+        @Override
+        public void failed(IOException why) {
+            failure = why;
+        }
+    }
+
+    private static final SettingsKeeper SETTINGS_KEEPER = new SettingsKeeper();
 
     // Client thread only.
     private static LandNavConfig config;
@@ -73,17 +108,23 @@ public final class LandNav {
         return dataDir;
     }
 
-    // Logs a failure; a caller that can tell the player uses saveOrThrow() instead.
-    public static void save() {
-        try {
-            saveOrThrow();
-        } catch (IOException e) {
-            System.err.println("[geosurvey] could not save config: " + e.getMessage());
+    public static void saveOrThrow() throws IOException {
+        SettingsSaving answer = new SettingsSaving();
+        boolean saved = SaveWriter.live().saveNow(SETTINGS_KEEPER, answer, SAVE_NOW_BOUND_NANOS);
+        if (!saved) {
+            if (answer.failure != null) {
+                throw answer.failure;
+            }
+            throw new IOException("the settings file is still being written");
         }
     }
 
-    public static void saveOrThrow() throws IOException {
-        stageWrite().write();
+    public static void saveSoon(SaveWriter.Saving saving) {
+        SaveWriter.live().changed(SETTINGS_KEEPER, saving, SaveWriter.Timing.SOON);
+    }
+
+    public static void saveSettled(SaveWriter.Saving saving) {
+        SaveWriter.live().changed(SETTINGS_KEEPER, saving, SaveWriter.Timing.SETTLED);
     }
 
     public static Write stageWrite() {
@@ -132,4 +173,5 @@ public final class LandNav {
             return taken == writesTaken.get();
         }
     }
+
 }

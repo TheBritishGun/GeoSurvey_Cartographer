@@ -7,8 +7,8 @@ public enum MarkerColour {
     RED(Argb.RED, "Red", "Enemy forces and danger areas"),
     YELLOW(Argb.YELLOW, "Yellow", "Contaminated areas"),
     GREEN(Argb.GREEN, "Green", "Obstacles and engineer works"),
-    BROWN(Argb.BROWN, "Brown", "Terrain features not shown on the map"),
-    ORANGE(Argb.ORANGE, "Orange", "No assigned meaning; yours to use");
+    BROWN(Argb.BROWN, "Brown", "Terrain features not on the map"),
+    ORANGE(Argb.ORANGE, "Orange", "Unassigned; yours to use");
 
     private static final class Argb {
 

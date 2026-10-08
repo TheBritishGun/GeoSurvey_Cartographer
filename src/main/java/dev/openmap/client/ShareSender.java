@@ -7,7 +7,10 @@ import dev.sandpaper.core.Lane;
 import dev.sandpaper.core.Scheduler;
 import dev.sandpaper.core.WorkPool;
 import dev.openmap.LandNav;
+import dev.openmap.claim.NodeAddress;
+import dev.openmap.claim.ServerConfirmation;
 import dev.openmap.config.LandNavConfig;
+import dev.openmap.json.NumberGrammar;
 import dev.openmap.live.PollSchedule;
 import dev.openmap.map.ChunkSample;
 import dev.openmap.map.LabelText;
@@ -19,8 +22,11 @@ import dev.openmap.share.Enroller;
 import dev.openmap.share.Presence;
 import dev.openmap.share.RosterReport;
 import dev.openmap.share.SendRate;
+import dev.openmap.share.SharedRecord;
 import dev.openmap.share.SignedBatch;
+import dev.openmap.share.UtcClock;
 import dev.openmap.share.WorldAsk;
+import dev.openmap.share.WorldPrint;
 import dev.openmap.share.WorldProof;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import java.io.ByteArrayOutputStream;
@@ -31,23 +37,17 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.file.DirectoryStream;
-import java.nio.file.FileVisitResult;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.security.GeneralSecurityException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.SignatureException;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -81,7 +81,6 @@ import java.util.function.Supplier;
 import com.mojang.authlib.GameProfile;
 import com.mojang.authlib.exceptions.AuthenticationException;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.components.toasts.SystemToast;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.PlayerInfo;
@@ -100,27 +99,22 @@ import net.minecraft.world.level.GameType;
 public final class ShareSender {
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
     static final String OBSERVE_PATH = "/observe";
 
     private static final String PRESENCE_PATH = "/here";
 
-    // How often position, clock and weather are posted.
     private static final long PRESENCE_EVERY_MS = PollSchedule.MIN_INTERVAL_MILLIS;
 
-    // Longest gap before beat posts again when the position has not changed.
     static final long PRESENCE_HEARTBEAT_MS = 15 * PollSchedule.MIN_INTERVAL_MILLIS;
 
     static final String ROSTER_PATH = "/roster";
 
-    // Where this client proves the account that holds its key.
     static final String ENROL_PATH = "/enrol";
 
-    // How often the list of visible players is posted.
     static final long ROSTER_EVERY_MS = 15 * PollSchedule.MIN_INTERVAL_MILLIS;
 
-    // Floor on how often a membership change may push a roster out early.
     static final long ROSTER_URGENT_FLOOR_MS = PollSchedule.MIN_INTERVAL_MILLIS;
 
     private static final int ROSTER_HOLD_TRIES = 13;
@@ -146,6 +140,10 @@ public final class ShareSender {
     private static final int HTTP_CLIENT_ERROR_CLASS = 4;
 
     private static final int HTTP_OK = 200;
+
+    private static final int HTTP_UNAUTHORIZED = 401;
+
+    private static final int HTTP_REQUEST_TIMEOUT = 408;
 
     private static final int HTTP_FORBIDDEN = 403;
 
@@ -182,23 +180,14 @@ public final class ShareSender {
     private static final int MAX_HELD_FOLDS =
             NAMES_PER_LISTED_PLAYER * RosterReport.MAX_PLAYERS + NAMES_PER_LISTED_PLAYER;
 
-    // Capacity of the handoff queue from capture to the writer thread.
     static final int QUEUE_LIMIT = 16384;
 
-    // Interval a segment is sealed and posted on.
     static final long FLUSH_INTERVAL_MILLIS = PollSchedule.MIN_INTERVAL_MILLIS;
 
-    // Disk backlog ceiling before new ground is refused.
     static final long MAX_SPOOL_BYTES = 512L << ShareSpool.MIB_SHIFT;
 
-    // The ceiling write() tests against.
     private static final long SPOOL_CEILING =
             MAX_SPOOL_BYTES - ShareSpool.RECORD_BYTES;
-
-    private static final String SPOOL_DIR = "upload";
-
-    // Per-account subdirectory inside the spool root.
-    private static final String ACCOUNT_DIR = "by-account";
 
     private static final double SEND_BURST = 4.0;
     private static final double SEND_PER_SECOND = 1.0;
@@ -217,10 +206,13 @@ public final class ShareSender {
 
     private static final long GROUND_REASK_MILLIS = 60_000L;
 
-    // Why the last ground upload failed.
+    private static final int ENROL_FAILURES_LOGGED = 3;
+
+    private static final long KEY_SETTLE_NANOS = TimeUnit.SECONDS.toNanos(10L);
+
     private volatile String groundReason = "";
 
-    // Consecutive signing failures, reset on success. Share thread only.
+    // Share thread only.
     private int signerFailures;
 
     private volatile long groundComplainedAt;
@@ -231,17 +223,16 @@ public final class ShareSender {
 
     private static final int MAX_REPLY_BYTES = 4096;
 
-    // Id that keeps the migration toast to one instance.
-    private static final SystemToast.SystemToastId PRESENCE_SPLIT_TOAST =
-            new SystemToast.SystemToastId();
-
-    private static final class Outbound {
+    static final class Outbound {
 
         volatile URI endpoint;
         final String server;
+
+        // Batches carry label; server names the spool folder.
+        final String label;
         final String dimension;
 
-        // Null until this world can take ground. Tick thread writes it; spool and share threads read it.
+        // Null until this world can take ground; tick thread writes.
         volatile ArrayBlockingQueue<ChunkSample> queue;
 
         volatile ShareSpool spool;
@@ -260,26 +251,26 @@ public final class ShareSender {
         long openSaidAt;
         long openSaidAbout;
 
-        // The account this holds ground for; null until known. Tick thread claims it, spool thread reads it.
+        // Null until claim binds it, and only once.
         private volatile String account;
 
         Outbound(URI endpoint, String account, String server, String dimension) {
-            this(endpoint, account, server, dimension, true);
+            this(endpoint, account, server, server, dimension, true);
         }
 
-        // False for a world adopted from disk; it gets no queue until rollOver runs.
-        Outbound(URI endpoint, String account, String server, String dimension,
+        // takesGroundNow: false for a world adopted from disk.
+        Outbound(URI endpoint, String account, String server, String label, String dimension,
                  boolean takesGroundNow) {
             this.endpoint = endpoint;
             this.account = account;
             this.server = server;
+            this.label = label;
             this.dimension = dimension;
             if (takesGroundNow) {
                 this.queue = new ArrayBlockingQueue<>(QUEUE_LIMIT);
             }
         }
 
-        // This world's handoff queue, created on first use.
         ArrayBlockingQueue<ChunkSample> takeGround() {
             ArrayBlockingQueue<ChunkSample> handoff = queue;
             if (handoff == null) {
@@ -289,19 +280,16 @@ public final class ShareSender {
             return handoff;
         }
 
-        // Whether this world has ground in hand; no queue counts as none.
         boolean queueIsEmpty() {
             ArrayBlockingQueue<ChunkSample> handoff = queue;
             return handoff == null || handoff.isEmpty();
         }
 
-        // How much ground is in hand; no queue counts as none.
         int queued() {
             ArrayBlockingQueue<ChunkSample> handoff = queue;
             return handoff == null ? 0 : handoff.size();
         }
 
-        // Binds to an account once; returns the account now bound.
         synchronized String claim(String who) {
             String held = account;
             if (held == null) {
@@ -315,13 +303,11 @@ public final class ShareSender {
             return account;
         }
 
-        // Whether this is bound to that account.
         boolean by(String who) {
             String mine = account;
             return mine != null && mine.equals(who);
         }
 
-        // Whether this is the world that account is surveying now.
         boolean isFor(String otherAccount, String otherServer,
                       String otherDimension) {
 
@@ -333,19 +319,12 @@ public final class ShareSender {
             return held == null || held.equals(otherAccount);
         }
 
-        // Whether this is that account's world and is live, ignoring server and dimension.
         boolean mine(String otherAccount) {
             if (retired) {
                 return false;
             }
             String held = account;
             return held == null || held.equals(otherAccount);
-        }
-
-        // How much of this world's ground is already written down.
-        long onDisk() {
-            ShareSpool held = spool;
-            return held == null ? 0 : held.records();
         }
     }
 
@@ -360,18 +339,22 @@ public final class ShareSender {
             return post(endpoint, length == body.length ? body : Arrays.copyOf(body, length));
         }
 
-        // POST that also reads the reply body; only the ground handshake needs it.
+        // POST that reads the reply body.
         default Reply answer(URI endpoint, byte[] body, ByteArrayOutputStream into)
                 throws IOException {
             return post(endpoint, body);
         }
 
-        // GET that reads a body, for the enrolment challenge. Null means 404.
+        default Reply postReading(URI endpoint, byte[] body, ByteArrayOutputStream into)
+                throws IOException {
+            return post(endpoint, body);
+        }
+
+        // Returns the GET body; null means 404.
         default String fetch(URI endpoint) throws IOException {
             return null;
         }
 
-        // Same GET, with a caller-set ceiling on the reply length.
         default String fetch(URI endpoint, int maxBytes) throws IOException {
             return fetch(endpoint);
         }
@@ -483,37 +466,44 @@ public final class ShareSender {
     interface Keys {
 
         Identity current();
+
+        default boolean withoutProfileKey() {
+            return false;
+        }
     }
 
-    // Who the game says is online, already filtered. Null means not connected.
+    // Who the game says is online, filtered. Null means not connected.
     interface Sight {
 
         List<RosterReport.Entry> listed();
 
-        // Whether this client's own tab entry shows as vanished, right now.
+        // The client's tab entry looks vanished.
         boolean hidden();
 
-        // The operator's own entry, signal by signal, for the probe only. Null if this seam has none.
+        // The client is in a world, with a connection and a player.
+        default boolean inWorld() {
+            return true;
+        }
+
+        // The operator's entry, for the probe only; null if none.
         default Self self() {
             return null;
         }
 
-        // Whether this client's own tab entry carries a staff marker, right now.
+        // The client's tab entry has a staff marker.
         default boolean staff() {
             return false;
         }
     }
 
-    // Default comma-separated vanish markers, overridden by config.
     static final String DEFAULT_VANISH_MARKERS = "vanish,[v],(v)";
 
-    // Default staff marker, overridden by config.
     static final String DEFAULT_STAFF_MARKERS = "\u2605";
 
-    // Vanish markers in force; never null or empty. Tick thread only.
+    // Never null or empty. Tick thread only.
     private volatile List<String> vanishMarkers = markersOf(DEFAULT_VANISH_MARKERS);
 
-    // Staff markers in force; may be empty, unlike vanishMarkers.
+    // May be empty.
     private volatile List<String> staffMarkers = staffMarkersOf(DEFAULT_STAFF_MARKERS);
 
     private String vanishFoldedFrom;
@@ -524,80 +514,81 @@ public final class ShareSender {
 
     private List<String> staffFolded;
 
-    // The vanish probe, or null when not probing.
+    // Null when not probing.
     private volatile VanishProbe probe;
 
     private final VanishProbe.MarkedBy markedBy = new VanishProbe.MarkedBy(this::marked, this::markedProfile);
 
-    // Message shown once so a quiet client does not look broken.
     private static final String VANISHED =
-            "This client is vanished. It sends no position, no list of the"
-                    + " players around you, and no new ground. Ground already"
-                    + " queued still goes up."
-                    + ""
-                    + ""
-                    + ""
-                    + ""
-                    + ""
-                    + ""
-                    + ""
-                    + "";
+            "this client is vanished;"
+                    + " only queued ground"
+                    + " goes up";
 
-    // Message shown while the account handshake waits.
     private static final String ENROL_HELD =
-            "This client is vanished. The ground handshake waits until visible."
-                    + ""
-                    + ""
-                    + ""
-                    + "";
+            "vanished; the ground handshake waits until visible";
 
-    // Message shown while ground upload stands down.
     private static final String GROUND_HELD =
-            "geosurvey is not contributing ground: this client is vanished."
-                    + " Ground already queued still goes up. Your map still records"
-                    + " everything."
-                    + ""
-                    + ""
-                    + ""
-                    + "";
+            "geosurvey does not contribute ground: this client is vanished."
+                    + " Your map still records everything.";
 
-    // Message shown while the position beat is off by switch.
     static final String PRESENCE_WITHHELD =
-            "the position switch is off. Ground still goes up. Turn the switch"
-                    + " on in the settings to appear on the map"
-                    + "";
+            "the position switch is off; turn it on"
+                    + " in the settings";
 
-    // The roster beat's version of the switched-off message.
     static final String ROSTER_WITHHELD =
-            "the position switch is off. It also covers the player list."
-                    + " Nothing about them leaves this client"
-                    + "";
+            "the position switch is off;"
+                    + " it also covers the player list";
 
-    // PRESENCE_WITHHELD's build-only wording.
     static final String PRESENCE_WITHHELD_BY_BUILD =
-            "this build publishes ground only. Ground still goes up. No setting"
-                    + " turns on your name or position";
+            "this build sends no position;"
+                    + " only a shared claim or marker sends your player name";
 
-    // ROSTER_WITHHELD's build-only wording.
     static final String ROSTER_WITHHELD_BY_BUILD =
-            "this build publishes ground only. Nothing about nearby players"
-                    + " leaves this client. No setting changes that"
-                    + "";
+            "this build sends no player list";
 
     private static final String ROSTER_HELD =
-            "this client is vanished. The player list is being held, not"
-                    + " sent. It resumes by itself when visible"
-                    + ""
-                    + ""
-                    + "";
+            "this client is vanished;"
+                    + " the player list waits until visible";
 
-    // Configured markers, folded for a plain contains test; empty falls back to the default.
+    static final String PROOF_TURNED_ON =
+            "Prove this account to the collector is on;"
+                    + " it sends your player name to"
+                    + " the collector and to Mojang.";
+
+    private static final String REFUSED_KEPT =
+            " a batch refused 3 times is kept locally. It is retried after "
+                    + SetAsideSchedule.waitHours(1) + " hours, then " + SetAsideSchedule.waitHours(2)
+                    + ", up to " + SetAsideSchedule.longestWaitDays()
+                    + " days; past " + (ShareSpool.MAX_REFUSED_BYTES >> ShareSpool.MIB_SHIFT)
+                    + " MiB the oldest is deleted.";
+
+    static final String REFUSED_KEY =
+            "The collector refused an upload: it does not accept this computer's own key."
+                    + " Run /geosurvey share proof on; it sends"
+                    + " your player name to the collector"
+                    + " and to Mojang.";
+
+    static final String REFUSED_CLOCK =
+            "The collector refused an upload;"
+                    + " check your clock;" + REFUSED_KEPT;
+
+    static final String REFUSED =
+            "The collector refused an upload; run /geosurvey share for more;" + REFUSED_KEPT;
+
+    static final String ENROL_REFUSED = "that collector refused the proof";
+
+    static final String ENROL_UNROUTED = "that collector does not offer the road";
+
+    static final String ENROL_DENIED =
+            "The collector refused this computer's own key: Mojang did not"
+                    + " confirm this account. GeoSurvey asks again after a"
+                    + " restart.";
+
     static List<String> markersOf(String configured) {
         List<String> asked = fold(configured);
         return asked.isEmpty() ? fold(DEFAULT_VANISH_MARKERS) : asked;
     }
 
-    // Configured staff markers, folded the same way; empty stays empty, unlike markersOf.
     static List<String> staffMarkersOf(String configured) {
         return fold(configured);
     }
@@ -646,7 +637,7 @@ public final class ShareSender {
         return out == null ? List.of() : List.copyOf(out);
     }
 
-    // Whether a name carries any configured marker. Too long to read answers true, so excluded.
+    // True for a name too long to read.
     boolean marked(String raw) {
         return marked(heldFold(markedFold, markedFolds, raw));
     }
@@ -655,7 +646,7 @@ public final class ShareSender {
         return markedProfile(heldFold(profileFold, profileFolds, raw));
     }
 
-    // Whether a name carries a staff marker; too long answers false. Not staff status by itself.
+    // False for a name too long to read.
     boolean starred(String raw) {
         return starred(heldFold(starredFold, starredFolds, raw));
     }
@@ -681,7 +672,6 @@ public final class ShareSender {
         return matches(name, staffMarkers, false);
     }
 
-    // Raw-then-stripped test both marker lists use.
     private boolean matches(NameFold name, List<String> markers, boolean wholeWord) {
         if (name.raw == null || name.raw.isEmpty() || markers.isEmpty()) {
             return false;
@@ -776,7 +766,6 @@ public final class ShareSender {
 
     private final WalkMemo<String, NameFold> starredFolds = new WalkMemo<>();
 
-    // Whether this name is too long for a marker filter to read; cached per name.
     private boolean pastReadingOf(NameFold name) {
         if (!name.pastReady) {
             name.past = pastReading(name.raw);
@@ -817,7 +806,6 @@ public final class ShareSender {
         return TabName.pastReading(raw);
     }
 
-    // Name with formatting codes stripped, as this filter reads it.
     static String plain(String raw) {
         StringBuilder withoutControls = null;
         for (int at = 0; at < raw.length(); at++) {
@@ -864,7 +852,7 @@ public final class ShareSender {
                 && Character.isLetterOrDigit(folded.charAt(at));
     }
 
-    // One player from the tab list, before filtering; shown is null until named, nearby is null unless loaded.
+    // One unfiltered tab-list player; shown is null until named, nearby is null unless loaded.
     static final class Seen {
 
         private UUID id;
@@ -942,17 +930,15 @@ public final class ShareSender {
         }
     }
 
-    // This client's own tab entry, signal by signal, for the probe. False connected means nothing else was read.
+    // The client's tab entry for the probe; connected false means nothing else was read.
     record Self(UUID id, String name, String shown, String nearby,
                 boolean connected, boolean found, boolean listed, GameType gameMode) {
 
-        // What a client with no connection and no player can say for itself.
         static Self adrift() {
             return new Self(null, null, null, null, false, false, false, null);
         }
     }
 
-    // What the two beats have done, counted; read on the tick thread, so the fields are volatile.
     interface Sent {
 
         boolean running();
@@ -1083,7 +1069,7 @@ public final class ShareSender {
         }
     }
 
-    // Filters which of these may be reported; excludes on any suspicion signal.
+    // Excludes players on any suspicion signal.
     List<RosterReport.Entry> reportable(List<Seen> seen) {
         List<RosterReport.Entry> out = rosterOut(seen.size());
         Set<UUID> stars = null;
@@ -1256,7 +1242,6 @@ public final class ShareSender {
         }
     }
 
-    // Clears both marker memos when the marker lists change; the only place that does.
     private void forgetFoldsIfMarkersMoved() {
         List<String> vanish = vanishMarkers;
         List<String> staff = staffMarkers;
@@ -1277,10 +1262,9 @@ public final class ShareSender {
 
     private List<String> carriedStaff;
 
-    // Players held back for a too-long name. Running total; written on the tick thread, read from the command thread.
+    // Tick thread writes; command thread reads.
     private volatile long heldForLength;
 
-    // Accounts heldForLength has already counted; cleared only on disconnect.
     private final Set<UUID> heldNames = ConcurrentHashMap.newKeySet();
 
     long heldForLength() {
@@ -1288,13 +1272,11 @@ public final class ShareSender {
     }
 
 
-    // Accounts already counted against the roster cap; cleared with heldNames.
     private final Set<UUID> rosterCapped = ConcurrentHashMap.newKeySet();
 
-    // Accounts the last over-cap scan cut, in that scan's order.
     private UUID[] cutLastScan = new UUID[0];
 
-    // How much of cutLastScan the last scan filled.
+    // Filled entries of cutLastScan.
     private int cutLastCount;
 
     private UUID[] cutKeys = new UUID[0];
@@ -1305,13 +1287,13 @@ public final class ShareSender {
         return rosterCapped.size();
     }
 
-    // The account behind a tab-list entry, or null if it carries none.
+    // Null without an account.
     private static UUID accountOf(PlayerInfo info) {
         GameProfile profile = info == null ? null : info.getProfile();
         return profile == null ? null : profile.id();
     }
 
-    // Tab list cut to what one roster report can carry, in account order; drops counted against the roster cap.
+    // Returns online when it fits, else a new list in account order; counts the cut accounts.
     <T> List<T> withinRosterCap(List<T> online, Function<T, UUID> account) {
         return withinRosterCap(online, account, each -> true);
     }
@@ -1441,7 +1423,6 @@ public final class ShareSender {
             return false;
         }
 
-        // Cached per account, keyed on both names; a changed name gets a fresh answer.
         forgetFoldsIfMarkersMoved();
         TabPlace carried = tabPlaces.get(id);
         boolean takes;
@@ -1463,7 +1444,6 @@ public final class ShareSender {
         return takes;
     }
 
-    // One account's last answer from takesAReportedPlace, and the names it used.
     private static final class TabPlace {
 
         private String name;
@@ -1489,22 +1469,20 @@ public final class ShareSender {
 
     private final WalkMemo<UUID, TabPlace> tabPlaces = new WalkMemo<>();
 
-    // Staff-marked players from the last roster walk. Empty is a real answer, not unasked.
     private volatile Set<UUID> starredSeen = Collections.emptySet();
 
-    // Who this client would vouch for as staff, as of its last roster walk.
+    // From the last roster walk.
     Set<UUID> starredSeen() {
         return starredSeen;
     }
 
-    // Whether this client's own tab entry carried a staff marker on the last scan.
+    // From the last scan.
     boolean selfStarred() {
         return selfStarred;
     }
 
     private final SendingScratch sendingScratch = new SendingScratch();
 
-    // Hands the probe this walk's roster and verdicts, if a probe is armed.
     private void watch(List<Seen> seen, List<RosterReport.Entry> out) {
         VanishProbe armed = probe;
         if (armed == null) {
@@ -1541,30 +1519,53 @@ public final class ShareSender {
     private final PollSchedule schedule =
             new PollSchedule(PollSchedule.MIN_INTERVAL_MILLIS);
 
-    // Back-off schedule for the presence beat, kept apart from the ground schedule.
     private final PollSchedule presenceSchedule =
             new PollSchedule(PRESENCE_EVERY_MS);
 
-    // Back-off schedule for the roster beat, kept apart from the others.
     private final PollSchedule rosterSchedule = new PollSchedule(ROSTER_EVERY_MS);
 
-    // This thread's own scheduler, kept off the game thread.
+    // Runs on the share thread.
     private final Scheduler shareLane = new Scheduler(System::nanoTime);
 
-    // Whether a thread is inside shareLane's pump; keeps the share thread singular.
     private final AtomicBoolean pumping = new AtomicBoolean();
 
     private final WorkPool enrolWork = new WorkPool(1, 1);
+
+    private final StoppableWorkers.Registration enrolWorkStop = stopWork("geosurvey-enrol", enrolWork);
 
     private final AtomicBoolean enrolWorking = new AtomicBoolean();
 
     private final WorkPool groundWork = new WorkPool(1, 1);
 
+    private final StoppableWorkers.Registration groundWorkStop = stopWork("geosurvey-ground", groundWork);
+
     private final AtomicBoolean groundAsking = new AtomicBoolean();
 
     private final WorkPool uploadWork = new WorkPool(1, 1);
 
+    private final StoppableWorkers.Registration uploadWorkStop = stopWork("geosurvey-upload", uploadWork);
+
     private final AtomicBoolean uploadWorking = new AtomicBoolean();
+
+    private final UtcClock utc;
+
+    private final boolean measuresClock;
+
+    private final WorkPool clockWork = new WorkPool(1, 1);
+
+    private final StoppableWorkers.Registration clockWorkStop = stopWork("geosurvey-clock", clockWork);
+
+    private final AtomicBoolean clockMeasuring = new AtomicBoolean();
+
+    private final Supplier<UtcClock> measureClockJob = this::measureClock;
+
+    private final Consumer<UtcClock> measuredClockJob = this::measuredClock;
+
+    // Tick thread only.
+    private boolean proofLineOwed;
+
+    // Set on the share thread, taken on the tick thread; null when no refusal waits.
+    private final AtomicReference<URI> enrolDeniedAt = new AtomicReference<>();
 
     private Handle enrolJob;
     private Handle groundJob;
@@ -1575,14 +1576,21 @@ public final class ShareSender {
 
     private static final Handle[] NO_BEATS = new Handle[0];
 
-    // The five beats, gathered once, for the health line. Empty until the lane is prepared.
+    // Empty until prepared.
     private Handle[] beats = NO_BEATS;
 
-    // Ground handshake proving this client stood on the named server; not persisted across connections.
-    private final GroundWalk walk = new GroundWalk();
+    private final GroundWalk walk;
 
-    // Last server the tick thread reported, for the ground beat. Tick thread writes it; share thread reads it.
+    // Tick thread writes; share thread reads.
     private volatile String groundServer;
+
+    // Tick thread writes; share thread reads.
+    private volatile long worldRolls = 0L;
+
+    // Share thread only; keyMissingSince reads System.nanoTime().
+    private boolean keyMissing = false;
+
+    private long keyMissingSince = 0L;
 
     private final CopyOnWriteArrayList<Outbound> worlds = new CopyOnWriteArrayList<>();
 
@@ -1626,7 +1634,7 @@ public final class ShareSender {
 
     private int scribeIdlePasses;
 
-    // Last scan; null before the first one or with no world loaded. Written only, and wholly, by standing.
+    // Null before the first scan or with no world; only standing writes it.
     private volatile Scan scan;
 
     private final Scan scanFirst = new Scan(RosterReport.MAX_PLAYERS, false);
@@ -1641,6 +1649,9 @@ public final class ShareSender {
 
     private volatile boolean selfHidden;
 
+    // Set by each vanish sample, after selfHidden; cleared out of a world.
+    private volatile boolean selfSampled = false;
+
     // Written only by standing.
     private volatile boolean selfStarred;
 
@@ -1649,18 +1660,17 @@ public final class ShareSender {
 
     private URI beatingAt;
 
-    // Collector the roster beat is posting to, or null. Share thread only.
+    // Share thread only.
     private URI rosterBeatingAt;
 
-    // Position the collector last accepted, or null if the last beat did not land. Share thread only.
+    // Null when the last beat failed. Share thread only.
     private Here lastPosted;
 
     private final Here postedPlace = new Here(null, null, null, 0, 0, 0, false, false);
 
-    // When lastPosted was taken. Share thread only.
+    // System.nanoTime() at lastPosted. Share thread only.
     private long lastPostedAt;
 
-    // Account lastPosted was posted under.
     private UUID lastPostedFor;
 
     private final Presence.Parts presenceParts = new Presence.Parts();
@@ -1677,10 +1687,10 @@ public final class ShareSender {
 
     private long rosterDueAt;
 
-    // Earliest a membership change may push a roster early, and how often. Share thread only, so not volatile.
+    // No early roster before this System.nanoTime(). Share thread only.
     private long rosterUrgentDueAt;
 
-    // Checksum and player count of the last roster the collector took; count is -1 if none has landed.
+    // Checksum and player count of the last roster taken; count is -1 if none.
     private long rosterPostedKey;
 
     private int rosterPostedCount = -1;
@@ -1757,11 +1767,7 @@ public final class ShareSender {
         VanishProbe armed = probe;
         if (where != null) {
 
-            boolean hidden = sight.hidden();
-            if (hidden != selfHidden) {
-                selfHidden = hidden;
-                wakeOnNextPump(rosterJob);
-            }
+            sampleHidden();
 
             boolean starred = armed == null ? false : sight.staff();
             if (starred != selfStarred) {
@@ -1784,6 +1790,36 @@ public final class ShareSender {
             next.hidden = selfHidden;
             scan = next;
         }
+    }
+
+    // Tick thread only; the one sample of whether this client is vanished.
+    private void sampleHidden() {
+        boolean hidden = sight.hidden();
+        if (hidden != selfHidden) {
+            selfHidden = hidden;
+            wakeOnNextPump(rosterJob);
+        }
+        if (!selfSampled) {
+            selfSampled = true;
+        }
+    }
+
+    // Tick thread only.
+    private void forgetHiddenSample() {
+        if (selfSampled) {
+            selfSampled = false;
+        }
+    }
+
+    // Any thread; true while this client is vanished, and before the first vanish sample in a world.
+    boolean vanished() {
+        return !selfSampled || selfHidden;
+    }
+
+    // Any thread; the live sender's answer, and true when no sender exists.
+    static boolean liveVanished() {
+        ShareSender sender = live;
+        return sender == null || sender.vanished();
     }
 
     private List<RosterReport.Entry> walkRoster(Scan next) {
@@ -1831,9 +1867,9 @@ public final class ShareSender {
             heldWhenVanishBegan = heldWhileHidden;
             LOGGER.info(GROUND_HELD);
         } else {
-            LOGGER.info("geosurvey is contributing surveyed ground again. It dropped"
-                    + " {} surveyed chunks while this client was hidden. Your own map"
-                    + " kept every one of them.",
+            LOGGER.info("geosurvey contributes again. It dropped"
+                    + " {} surveyed chunks while vanished;"
+                    + " your map kept them.",
                     heldWhileHidden - heldWhenVanishBegan);
         }
     }
@@ -1847,7 +1883,6 @@ public final class ShareSender {
     private volatile long overrun;
     private volatile long refusedAtCeiling;
 
-    // Surveyed chunks refused while hidden.
     private volatile long heldWhileHidden;
 
     // Tick thread only.
@@ -1864,17 +1899,19 @@ public final class ShareSender {
 
     private volatile URI enrolEndpoint;
 
+    private CollectorWire collectorWire;
+
     private final Consumer<Outbound> pointingAtCollector = this::pointAtCollector;
 
     private volatile boolean proveAccount;
 
-    // Written on the tick thread, read on the share thread.
+    // Tick thread writes; share thread reads.
     private volatile boolean publishPresence;
 
     private volatile boolean withheldByBuild;
 
-    // Written on the share thread, read on the enrol worker thread.
-    private String enrolledAt = "";
+    // Share thread writes; enrol worker and client thread read.
+    private volatile String enrolledAt = "";
 
     private String enrolmentShut = "";
 
@@ -1896,14 +1933,57 @@ public final class ShareSender {
 
     private long groundReaskAt;
 
+    // Share thread only.
+    private final BackoffKey backoffArmedOn = new BackoffKey();
+
+    // Restart count at the last enrolment and ground ask. Share thread only.
+    private long enrolAskedUnder = 0L;
+
+    private long groundAskedUnder = 0L;
+
+    private static final class BackoffKey {
+
+        private URI collector = null;
+
+        private String server = null;
+
+        private long rolls = 0L;
+
+        private Attestation.Credential key = null;
+
+        private long restarts = 0L;
+
+        private BackoffKey() {
+        }
+
+        // True when an input moved; keeps the new inputs and counts a restart.
+        private boolean moved(URI atCollector, String onServer, long atRolls,
+                              Attestation.Credential withKey) {
+            boolean moved = !Objects.equals(collector, atCollector)
+                    || !Objects.equals(server, onServer) || rolls != atRolls || key != withKey;
+            if (moved) {
+                collector = atCollector;
+                server = onServer;
+                rolls = atRolls;
+                key = withKey;
+                restarts++;
+            }
+            return moved;
+        }
+
+        private long restarts() {
+            return restarts;
+        }
+    }
+
     private final Supplier<URI> currentEndpoint = () -> parsedEndpoint;
 
     private final AtomicReference<GroundAsk> spareGroundAsk = new AtomicReference<>();
 
     private volatile String enrolReason = "";
 
-    private volatile Path spoolRoot;
-    private final boolean spoolRootGiven;
+    private final ShareBacklog backlog;
+
 
     private static final long STAMP_HOLD_MILLIS = Attestation.GRACE.toMillis() / 8;
 
@@ -2013,6 +2093,10 @@ public final class ShareSender {
     private volatile long failed;
     private volatile int lastStatus;
 
+    private volatile String lastRefusal = "";
+
+    private volatile boolean uploadUnreached;
+
     private final AtomicReference<byte[]> uploadMessageSpare = new AtomicReference<>();
 
     private final Batch.Room batchRoom = new Batch.Room();
@@ -2041,12 +2125,6 @@ public final class ShareSender {
     private String presenceAnnounced;
 
     // Writer thread only.
-    private String adoptedFor;
-
-    // Writer thread only.
-    private boolean unclaimedSaid;
-
-    // Writer thread only.
     private long spoolHeld;
 
     private static final long SPOOL_HELD_UNTAKEN = -1L;
@@ -2057,21 +2135,16 @@ public final class ShareSender {
 
     private boolean passIdle = true;
 
-    private final SpoolTally spoolTally = new SpoolTally();
-
-    // Written by the writer thread, read by a command.
-    private volatile long unclaimedBytes;
-
     private long complainedAt;
     private long complainedAbout;
 
     private long ceilingComplainedAbout;
 
-    // Written by both loop threads.
+    // Share and writer threads write.
     private volatile long hardFaultSaidAt;
 
     ShareSender() {
-        this(new HttpTransport(), new GameKeys());
+        this(new HttpTransport(), new GameKeys(), null, null, UtcClock.collector());
     }
 
     ShareSender(Transport transport, Keys keys) {
@@ -2084,12 +2157,24 @@ public final class ShareSender {
 
     // sight is null for the running client's own tab list.
     ShareSender(Transport transport, Keys keys, Path spoolRoot, Sight sight) {
+        this(transport, keys, spoolRoot, sight, UtcClock.collector(), false);
+    }
+
+    // sight is null for the running client's own tab list; the share thread measures utc.
+    ShareSender(Transport transport, Keys keys, Path spoolRoot, Sight sight, UtcClock utc) {
+        this(transport, keys, spoolRoot, sight, utc, true);
+    }
+
+    private ShareSender(Transport transport, Keys keys, Path spoolRoot, Sight sight, UtcClock utc,
+                        boolean measuresClock) {
         this.transport = transport;
         this.keys = keys;
         this.sight = sight == null ? new GameSight() : sight;
         this.session = new GameSession();
-        this.spoolRoot = spoolRoot;
-        this.spoolRootGiven = spoolRoot != null;
+        this.backlog = new ShareBacklog(spoolRoot, worlds, worldsLock);
+        this.utc = utc;
+        this.measuresClock = measuresClock;
+        this.walk = new GroundWalk(utc);
         live = this;
     }
 
@@ -2117,39 +2202,21 @@ public final class ShareSender {
         }
     }
 
-    private static void sayPresenceSplit(LandNavConfig config) {
-        Minecraft client = Minecraft.getInstance();
-        if (client == null || client.gui == null) {
-            return;
-        }
-        if (!config.takeSharePresenceSplit()) {
-            return;
-        }
-        SystemToast.addOrUpdate(client.gui.toastManager(), PRESENCE_SPLIT_TOAST,
-                Component.translatableWithFallback(
-                        "geosurvey.toast.presence_split.title",
-                        "Publishing is off"),
-                Component.translatableWithFallback(
-                        "geosurvey.toast.presence_split.body",
-                        "Your name and live position are not published."
-                                + " Ground upload continues."
-                                + " Turn publishing on in the settings."));
-        LOGGER.info("geosurvey publishes your name, UUID and position only when"
-                + " publishing is on. Ground still goes up either way. Turn"
-                + " publishing on in the mod settings to appear on the map."
-                + ""
-                + ""
-                + "");
-    }
-
     void sync(LandNavConfig config, String server, String dimension) {
-        sayPresenceSplit(config);
-
         vanishMarkers = vanishMarkersFor(config.shareVanishMarkers);
 
         staffMarkers = staffMarkersFor(config.shareStaffMarkers);
 
         probe = VanishProbe.armed(config.shareVanishProbe, probe);
+
+        // With no server, sync takes the vanish sample; out of a world, no sample is current.
+        if (server == null) {
+            if (sight.inWorld()) {
+                sampleHidden();
+            } else {
+                forgetHiddenSample();
+            }
+        }
 
         proveAccount = config.shareSessionProof;
 
@@ -2163,19 +2230,23 @@ public final class ShareSender {
             wakeOnNextPump(rosterJob);
         }
 
-        boolean serverOk = usableName(server);
+        server = Batch.usableServerName(server);
+        boolean serverOk = server != null && Batch.usableName(server);
+        boolean dimensionOk = dimension != null && Batch.usableName(dimension);
         groundServer = serverOk ? server : null;
         walk.joined(groundServer);
         URI endpoint = endpointFor(config);
-        if (endpoint == null || !serverOk || !usableName(dimension)) {
+        if (endpoint == null || !serverOk || !dimensionOk) {
             shutDown();
         } else {
             worlds.forEach(pointingAtCollector);
 
             identity = keys.current();
+            proveWithoutProfileKey(config, endpoint);
             String account = accountOf(identity);
             Outbound live = current;
             if (live == null || !live.isFor(account, server, dimension)) {
+                worldRolls++;
                 synchronized (worldsLock) {
                     rollOver(worldFor(endpoint, account, server, dimension));
                 }
@@ -2186,13 +2257,27 @@ public final class ShareSender {
         }
     }
 
-    // Null when there is no identity yet.
-    private static String accountOf(Identity who) {
-        return who == null ? null : who.account();
+    // Tick thread only.
+    private void proveWithoutProfileKey(LandNavConfig config, URI endpoint) {
+        Identity who = identity;
+        if (!config.shareSessionProof && !config.shareSessionProofAutoEnabled && who != null
+                && keys.withoutProfileKey() && LocalKey.isMine(who.credential())) {
+            config.shareSessionProof = true;
+            config.shareSessionProofAutoEnabled = true;
+            proveAccount = true;
+            CollectorOptions.persistLive();
+            proofLineOwed = true;
+            LOGGER.info("geosurvey turned on proving this account to the collector: this client has"
+                    + " no Mojang profile key.");
+        }
+        if (proofLineOwed) {
+            proofLineOwed = !walk.sayAt(endpoint, PROOF_TURNED_ON);
+        }
     }
 
-    private static boolean usableName(String name) {
-        return name != null && name.length() <= Batch.MAX_NAME && !name.isBlank();
+    // Null with no identity.
+    private static String accountOf(Identity who) {
+        return who == null ? null : who.account();
     }
 
     private void pointAtCollector(Outbound out) {
@@ -2201,25 +2286,9 @@ public final class ShareSender {
 
     private Outbound worldFor(URI endpoint, String account, String server,
                               String dimension) {
-        Outbound found = null;
-        Iterator<Outbound> walk = worlds.iterator();
-        while (found == null && walk.hasNext()) {
-            Outbound out = walk.next();
-            if (out.isFor(account, server, dimension)) {
-                out.endpoint = endpoint;
-
-                out.claim(account);
-                found = out;
-            }
-        }
-        if (found == null) {
-            found = new Outbound(endpoint, account, server, dimension);
-            worlds.add(found);
-        }
-        return found;
+        return backlog.worldFor(endpoint, account, server, dimension);
     }
 
-    // Seals the left world's backlog; keeps it.
     private void rollOver(Outbound next) {
 
         if (next != null) {
@@ -2255,9 +2324,9 @@ public final class ShareSender {
             worker = null;
             running = false;
             identity = null;
-            enrolWork.cancelAllFor(LandNav.MOD_ID);
-            uploadWork.cancelAllFor(LandNav.MOD_ID);
-            groundWork.cancelAllFor(LandNav.MOD_ID);
+            enrolWork.cancelAllFor(CollectorMod.MOD_ID);
+            uploadWork.cancelAllFor(CollectorMod.MOD_ID);
+            groundWork.cancelAllFor(CollectorMod.MOD_ID);
             uploadWorking.set(false);
             enrolWorking.set(false);
             groundAsking.set(false);
@@ -2284,11 +2353,11 @@ public final class ShareSender {
         return JobSpec.everyMillis(Lane.TICK, Math.max(1L, millis))
                 .mustRun()
                 .neverDrop()
-                .withOwner(LandNav.MOD_ID)
+                .withOwner(CollectorMod.MOD_ID)
                 .withLabel(label);
     }
 
-    // Written by the share thread, read by a command.
+    // Share thread writes; a command reads.
     private volatile BeatFigures beatsSaid;
 
     private volatile BeatFigures figuresInHand;
@@ -2349,7 +2418,7 @@ public final class ShareSender {
                 line.append(" has never run.");
             } else {
                 line.append(" took ").append(said.peakNanos[row] / NANOS_PER_MILLI)
-                        .append("ms at its worst, against a ")
+                        .append("ms at worst, against a ")
                         .append(said.cadenceMillis[row]).append("ms cadence, in ")
                         .append(runs).append(" run(s).");
             }
@@ -2375,7 +2444,7 @@ public final class ShareSender {
 
                 long cadenceMillis = healthCadenceMillis(job);
                 long periodNanos = cadenceMillis * NANOS_PER_MILLI;
-                if (periodNanos > 0L) {
+                if (periodNanos > 0L && job != enrolJob && job != uploadJob) {
                     long peak = job.peakCostNanos();
                     if (peak > periodNanos) {
                         next.say(said, job.label(), runs, peak, cadenceMillis);
@@ -2433,6 +2502,11 @@ public final class ShareSender {
         return cadence;
     }
 
+    private static StoppableWorkers.Registration stopWork(String name, WorkPool work) {
+        return StoppableWorkers.close(name, work::close,
+                bound -> work.closeWithin(bound, TimeUnit.MILLISECONDS), () -> false);
+    }
+
     private static final long PUMP_BUDGET_NANOS = 0L;
 
     private void start() {
@@ -2440,6 +2514,7 @@ public final class ShareSender {
         prepareLane();
         Thread started = Background.thread(this::run, "geosurvey-share");
         worker = started;
+        StoppableWorkers.thread("geosurvey-share", started);
         started.start();
         ensureScribe();
     }
@@ -2509,7 +2584,7 @@ public final class ShareSender {
         return base.isEmpty() ? null : base;
     }
 
-    // Null when either half refuses.
+    // Null if base is null or base plus path is unusable.
     private static URI endpointAt(String base, String path) {
         if (base == null) {
             return null;
@@ -2518,7 +2593,14 @@ public final class ShareSender {
         try {
             URI endpoint = URI.create(base + path);
             String scheme = endpoint.getScheme();
-            if (endpoint.getHost() == null || scheme == null) {
+            String host = endpoint.getHost();
+            boolean rebuildHost = host == null || !host.equals(NodeAddress.withoutRootDot(host));
+            if (rebuildHost) {
+                endpoint = URI.create(withoutHostRootDot(base) + path);
+                host = endpoint.getHost();
+            }
+            if (host == null || scheme == null
+                    || (rebuildHost && !host.equals(NodeAddress.withoutRootDot(host)))) {
                 usable = null;
             } else if (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https")) {
                 usable = null;
@@ -2531,11 +2613,41 @@ public final class ShareSender {
         return usable;
     }
 
+    private static String withoutHostRootDot(String base) {
+        int schemeEnd = base.indexOf("://");
+        if (schemeEnd < 0) {
+            return base;
+        }
+        int start = schemeEnd + 3;
+        int authorityEnd = base.indexOf('/', start);
+        if (authorityEnd < 0) {
+            authorityEnd = base.length();
+        }
+        int userinfo = base.lastIndexOf('@', authorityEnd - 1);
+        if (userinfo >= start) {
+            start = userinfo + 1;
+        }
+        int port = base.indexOf(':', start);
+        if (port < 0 || port > authorityEnd) {
+            port = authorityEnd;
+        }
+        String host = NodeAddress.withoutRootDot(base.substring(start, port));
+        return host.length() == port - start ? base
+                : base.substring(0, start) + host + base.substring(port);
+    }
+
+    static Keys gameKeys() {
+        return new GameKeys();
+    }
+
     private static final class GameKeys implements Keys {
 
         private CompletableFuture<Optional<ProfileKeyPair>> request;
         private ProfileKeyPair lastPair;
         private Identity built;
+
+        // Tick thread only.
+        private boolean ownKeyOnly;
 
         @Override
         public Identity current() {
@@ -2574,6 +2686,7 @@ public final class ShareSender {
         }
 
         private Identity fromPair(Minecraft client, ProfileKeyPair pair) {
+            ownKeyOnly = false;
             Identity held;
             if (pair == lastPair) {
                 held = built;
@@ -2603,13 +2716,20 @@ public final class ShareSender {
             }
             lastPair = null;
             built = LocalKey.identity(player);
+            ownKeyOnly = true;
             return built;
         }
 
         private Identity forget() {
             lastPair = null;
             built = null;
+            ownKeyOnly = false;
             return null;
+        }
+
+        @Override
+        public boolean withoutProfileKey() {
+            return ownKeyOnly;
         }
     }
 
@@ -2739,6 +2859,12 @@ public final class ShareSender {
                 vanished = marked(text(client.player.getDisplayName()));
             }
             return vanished;
+        }
+
+        @Override
+        public boolean inWorld() {
+            Minecraft client = Minecraft.getInstance();
+            return client != null && client.getConnection() != null && client.player != null;
         }
 
         @Override
@@ -2991,7 +3117,7 @@ public final class ShareSender {
             int samples = scratch.size();
 
             if (samples > 0 && spoolHeld == SPOOL_HELD_UNTAKEN) {
-                spoolHeld = spoolBytes(spoolTally);
+                spoolHeld = backlog.spoolBytesForPass();
             }
             for (int at = 0; at < samples; at++) {
                 if (spoolHeld > SPOOL_CEILING) {
@@ -3033,11 +3159,10 @@ public final class ShareSender {
             out.writeSchedule.failed();
             long waitMillis = out.writeSchedule.intervalMillis();
             out.writeAgainAt = System.nanoTime() + waitMillis * NANOS_PER_MILLI;
-            LOGGER.warn("could not write surveyed ground for {} {} to"
-                    + " spool ({}): {} chunks queued to retry in"
+            LOGGER.warn("spool write failed for {} {}"
+                    + " ({}): {} chunks retry in"
                     + " {} seconds; {} lost, spool full."
-                    + " Map still holds this ground."
-                    + "",
+                    + " Map still holds this ground.",
                     out.server, out.dimension, couldNotWrite.toString(), kept,
                     waitMillis / MILLIS_PER_SECOND, lost);
         }
@@ -3079,8 +3204,8 @@ public final class ShareSender {
                 out.openSaidAbout = out.openFailures;
                 LOGGER.warn("could not open an upload spool under {} ({})."
                         + " Failed {}"
-                        + " times; {} times in all."
-                        + " Next try in {} seconds.", root,
+                        + " times, {} in all;"
+                        + " next try in {} seconds.", root,
                         couldNotOpen.toString(), since, out.openFailures,
                         waitMillis / MILLIS_PER_SECOND);
             }
@@ -3088,124 +3213,13 @@ public final class ShareSender {
         return made;
     }
 
-    // Null when there is no root or no account yet.
+    // Null with no root or no account.
     private Path accountRoot(String account) {
-        Path root = spoolRoot();
-        return root == null || account == null
-                ? null : root.resolve(ACCOUNT_DIR).resolve(account);
+        return backlog.accountRoot(account);
     }
 
-    // Adopts this account's backlog left on disk.
     private void adoptOnce() {
-        String account = accountOf(identity);
-        if (account == null) {
-            return;
-        }
-        sayUnclaimed(account);
-        if (!account.equals(adoptedFor)) {
-            adoptedFor = account;
-            Path root = accountRoot(account);
-            if (root != null) {
-                adoptUnder(account, root);
-            }
-        }
-    }
-
-    private void adoptUnder(String account, Path root) {
-
-        List<ShareSpool.World> found = ShareSpool.worldsUnder(root);
-        Set<World> held = holding(account);
-        List<Outbound> adopted = new ArrayList<>();
-        for (ShareSpool.World world : found) {
-            if (!held.add(new World(world.server(), world.dimension()))) {
-                continue;
-            }
-            adopted.add(new Outbound(parsedEndpoint, account, world.server(), world.dimension(),
-                    false));
-        }
-        if (!adopted.isEmpty()) {
-            synchronized (worldsLock) {
-                Set<World> heldNow = holding(account);
-                adopted.removeIf(out -> heldNow.contains(new World(out.server, out.dimension)));
-                URI endpoint = parsedEndpoint;
-                for (Outbound out : adopted) {
-                    out.endpoint = endpoint;
-                }
-                worlds.addAll(adopted);
-            }
-        }
-    }
-
-    private void sayUnclaimed(String account) {
-        if (unclaimedSaid) {
-            return;
-        }
-        unclaimedSaid = true;
-        Path root = spoolRoot();
-        if (root != null) {
-            List<ShareSpool.World> orphaned = ShareSpool.worldsUnder(root);
-            if (!orphaned.isEmpty()) {
-                sayOrphaned(account, root, orphaned);
-            }
-        }
-    }
-
-    private void sayOrphaned(String account, Path root, List<ShareSpool.World> orphaned) {
-        long held = 0;
-        StringBuilder named = new StringBuilder();
-        for (ShareSpool.World world : orphaned) {
-            Path where = root.resolve(ShareSpool.folderFor(world.server(), world.dimension()));
-            held += bytesUnder(where);
-            named.append(named.isEmpty() ? "" : ", ")
-                    .append(where.getFileName()).append(" (").append(world.server())
-                    .append(' ').append(world.dimension()).append(')');
-        }
-        unclaimedBytes = held;
-        LOGGER.warn("holding {} bytes of ground under {},"
-                + " account unknown: {}. Not contributed."
-                + ""
-                + ""
-                + ""
-                + ""
-                + ""
-                + " Nothing deleted."
-                + " Your map still has it."
-                + ""
-                + " Move it into {} to send under this account."
-                + "", held, root, named, accountRoot(account));
-    }
-
-    private static long bytesUnder(Path directory) {
-        long held = 0;
-        try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
-            for (Path entry : entries) {
-
-                BasicFileAttributes about;
-                try {
-                    about = Files.readAttributes(entry, BasicFileAttributes.class);
-                } catch (IOException gone) {
-                    about = null;
-                }
-                if (about != null && about.isRegularFile()) {
-                    held += about.size();
-                }
-            }
-        } catch (IOException | RuntimeException unreadable) {
-        }
-        return held;
-    }
-
-    private Set<World> holding(String account) {
-        Set<World> held = new HashSet<>();
-        for (Outbound out : worlds) {
-            if (out.mine(account)) {
-                held.add(new World(out.server, out.dimension));
-            }
-        }
-        return held;
-    }
-
-    private record World(String server, String dimension) {
+        backlog.adoptOnce(identity, parsedEndpoint);
     }
 
     private void sealEverything() {
@@ -3213,81 +3227,8 @@ public final class ShareSender {
             ShareSpool spool = out.spool;
             if (spool != null) {
                 spool.close();
-                // endForGood() ends the Deflater; close() may already have.
                 spool.endForGood();
             }
-        }
-    }
-
-    private Path spoolRoot() {
-        Path root = spoolRoot;
-        if (root != null) {
-            return root;
-        }
-        root = defaultSpoolRoot();
-        spoolRoot = root;
-        return root;
-    }
-
-    private static Path defaultSpoolRoot() {
-        Path root;
-        try {
-            root = net.fabricmc.loader.api.FabricLoader.getInstance().getGameDir()
-                    .resolve(LandNav.DATA_DIR).resolve(SPOOL_DIR);
-        } catch (RuntimeException | LinkageError noGame) {
-            root = scratchSpoolRoot();
-        }
-        return root;
-    }
-
-    private static Path scratchSpoolRoot() {
-        Path held;
-        try {
-            Path scratch = Files.createTempDirectory("geosurvey-upload-");
-            LOGGER.warn("geosurvey has no game directory. Ground held in"
-                    + " {} will not survive a restart.",
-                    scratch);
-            Thread cleanup = new Thread(() -> erase(scratch), "geosurvey-upload-cleanup");
-            cleanup.setDaemon(false);
-            Runtime.getRuntime().addShutdownHook(cleanup);
-            held = scratch;
-        } catch (IOException | RuntimeException nowhere) {
-            LOGGER.warn("geosurvey has nowhere to hold ground."
-                    + " None held ({}).", nowhere.toString());
-            held = null;
-        }
-        return held;
-    }
-
-    private static void erase(Path root) {
-        try {
-            Files.walkFileTree(root, new DeletingVisitor());
-        } catch (IOException | RuntimeException stillThere) {
-            LOGGER.warn("geosurvey could not remove {} at exit ({})."
-                    + " Ground stays on disk there.", root,
-                    stillThere.toString());
-        }
-    }
-
-    private static final class DeletingVisitor extends SimpleFileVisitor<Path> {
-
-        @Override
-        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
-                throws IOException {
-            Files.deleteIfExists(file);
-            return FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult visitFileFailed(Path file, IOException exc) {
-            return FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult postVisitDirectory(Path dir, IOException exc)
-                throws IOException {
-            Files.deleteIfExists(dir);
-            return FileVisitResult.CONTINUE;
         }
     }
 
@@ -3308,14 +3249,13 @@ public final class ShareSender {
         long ceilingSince = refusedAtCeiling - ceilingComplainedAbout;
         ceilingComplainedAbout = refusedAtCeiling;
         if (ceilingSince > 0) {
-            LOGGER.warn("geosurvey is refusing ground: backlog at its"
+            LOGGER.warn("geosurvey refuses ground: backlog at its"
                     + " {} MiB ceiling. {}"
-                    + " chunks refused since, {} total. Run"
-                    + ""
+                    + " chunks refused since, {} total; run"
                     + " /geosurvey share.", MAX_SPOOL_BYTES >> ShareSpool.MIB_SHIFT, ceilingSince,
                     refusedAtCeiling);
         } else {
-            LOGGER.warn("geosurvey is refusing ground: disk not keeping up."
+            LOGGER.warn("geosurvey refuses ground: disk too slow."
                     + " {} chunks refused since,"
                     + " {} total.", since, said);
         }
@@ -3350,6 +3290,9 @@ public final class ShareSender {
                             enrolWork.drainCompleted(1);
                             groundWork.drainCompleted(1);
                             uploadWork.drainCompleted(1);
+                            clockWork.drainCompleted(1);
+                            keepClockMeasured();
+                            restartBackoffsOnMove();
                             shareLane.pump(Lane.TICK, PUMP_BUDGET_NANOS);
 
                             healthOfBeats();
@@ -3369,6 +3312,33 @@ public final class ShareSender {
         }
     }
 
+    // Share thread only.
+    private void keepClockMeasured() {
+        if (!measuresClock || !utc.due(System.currentTimeMillis())) {
+            return;
+        }
+        if (clockMeasuring.compareAndSet(false, true)) {
+            boolean accepted = clockWork.submit(CollectorMod.MOD_ID, measureClockJob, measuredClockJob);
+            if (!accepted) {
+                clockMeasuring.set(false);
+            }
+        }
+    }
+
+    // Clock worker only.
+    private UtcClock measureClock() {
+        try {
+            utc.measure();
+        } catch (RuntimeException unexpected) {
+            LOGGER.debug("geosurvey could not measure the time", unexpected);
+        }
+        return utc;
+    }
+
+    private void measuredClock(UtcClock measured) {
+        clockMeasuring.set(false);
+    }
+
     // Test only.
     void proving(Enroller.Session proof) {
         this.session = proof;
@@ -3382,7 +3352,8 @@ public final class ShareSender {
         if (!enrolWorking.compareAndSet(false, true)) {
             return;
         }
-        boolean accepted = enrolWork.submit(LandNav.MOD_ID,
+        enrolAskedUnder = backoffArmedOn.restarts();
+        boolean accepted = enrolWork.submit(CollectorMod.MOD_ID,
                 enrolDecisionJob, applyEnrolJob);
         if (!accepted) {
             enrolWorking.set(false);
@@ -3395,11 +3366,12 @@ public final class ShareSender {
 
     private record EnrolResult(Enroller.Outcome outcome, String at, URI endpoint,
                                 Attestation.Credential credential, String whatGoes,
-                                Throwable failure, long retryAfterSeconds, boolean held) {
+                                Throwable failure, long retryAfterSeconds, boolean held,
+                                boolean deniedBySession) {
     }
 
     private static final EnrolResult ENROL_RESULT_HELD =
-            new EnrolResult(null, null, null, null, null, null, 0L, true);
+            new EnrolResult(null, null, null, null, null, null, 0L, true, false);
 
     private EnrolResult enrolDecision() {
 
@@ -3427,13 +3399,19 @@ public final class ShareSender {
             }
         } catch (Throwable anything) {
             result = new EnrolResult(null, null, endpoint, who.credential(), null, anything, 0L,
-                    false);
+                    false, false);
         }
         return result;
     }
 
     private EnrolResult enrolAt(String at, URI endpoint, Identity who) {
-        CollectorWire wire = new CollectorWire(endpoint);
+        CollectorWire wire = collectorWire;
+        if (wire == null) {
+            wire = new CollectorWire(endpoint);
+            collectorWire = wire;
+        } else {
+            wire.pointAt(endpoint);
+        }
         Enroller.Outcome outcome;
         Throwable down;
         try {
@@ -3447,10 +3425,10 @@ public final class ShareSender {
         EnrolResult result;
         if (down == null) {
             result = new EnrolResult(outcome, at, endpoint, who.credential(), whatGoes(), null,
-                    wire.retryAfterSeconds(), false);
+                    wire.retryAfterSeconds(), false, Enroller.deniedBySession(wire.offerReply()));
         } else {
             result = new EnrolResult(null, at, endpoint, who.credential(), null, down, 0L,
-                    false);
+                    false, false);
         }
         return result;
     }
@@ -3471,9 +3449,12 @@ public final class ShareSender {
             enrolReason = ENROL_HELD;
             return;
         }
+        boolean current = enrolAskedUnder == backoffArmedOn.restarts();
         if (result.failure() != null) {
-            enrolSchedule.failed();
-            enrolAgainIn(enrolSchedule.intervalMillis());
+            if (current) {
+                enrolFailed(result.endpoint());
+                enrolAgainIn(enrolSchedule.intervalMillis());
+            }
             enrolReason = "the collector could not be reached ("
                     + result.failure().getClass().getSimpleName() + ")";
             LOGGER.debug("geosurvey could not prove its account to {}",
@@ -3484,41 +3465,67 @@ public final class ShareSender {
         switch (outcome) {
             case ENROLLED -> {
                 enrolledAt = result.at();
+                offerRefused();
                 enrolSchedule.succeeded();
                 enrolAgainIn(1);
                 enrolReason = "";
+                walk.keyEnrolled();
                 LOGGER.info("geosurvey proved this account to {} through"
-                        + " Mojang. Key {} now accepted."
+                        + " Mojang; it accepts key {}."
                         + " {}", result.endpoint(),
                         Attestation.fingerprint(result.credential()), result.whatGoes());
             }
             case UNROUTED -> {
                 enrolmentShut = result.at();
-                enrolReason = "that collector does not offer the road";
+                enrolReason = ENROL_UNROUTED;
                 LOGGER.info("geosurvey asked {} to record its key: no such route."
-                        + " Nothing else will be asked."
-                        + ""
-                        + "",
+                        + " Nothing else will be asked.",
                         result.endpoint());
             }
             case REFUSED -> {
                 enrolmentShut = result.at();
-                enrolReason = "that collector refused the proof";
+                enrolReason = ENROL_REFUSED;
+                if (current && result.deniedBySession()) {
+                    enrolDeniedAt.set(parsedEndpoint);
+                }
 
                 LOGGER.warn("geosurvey could not prove this account to {}: refused."
-                        + " Nothing is sent there until the"
-                        + " operator trusts {}"
-                        + " by hand.", result.endpoint(),
+                        + " No ground is sent there until the operator"
+                        + " trusts {}"
+                        + ".", result.endpoint(),
                         Attestation.fingerprint(result.credential()));
             }
             case RETRY -> {
-                enrolSchedule.failed();
-                long retryAfterSeconds = result.retryAfterSeconds();
-                enrolAgainIn(retryAfterSeconds > 0
-                        ? Math.clamp(retryAfterSeconds, 1, MAX_QUIET_SECONDS) * MILLIS_PER_SECOND
-                        : enrolSchedule.intervalMillis());
-                enrolReason = "waiting to ask that collector again";
+                if (current) {
+                    enrolFailed(result.endpoint());
+                    long retryAfterSeconds = result.retryAfterSeconds();
+                    enrolAgainIn(retryAfterSeconds > 0
+                            ? Math.clamp(retryAfterSeconds, 1, MAX_QUIET_SECONDS) * MILLIS_PER_SECOND
+                            : enrolSchedule.intervalMillis());
+                }
+                enrolReason = "waiting to ask again";
             }
+        }
+    }
+
+    private void enrolFailed(URI endpoint) {
+        enrolSchedule.failed();
+        if (enrolSchedule.consecutiveFailures() == ENROL_FAILURES_LOGGED) {
+            LOGGER.info("geosurvey could not prove this account to {};"
+                    + " it keeps asking.", endpoint);
+        }
+    }
+
+    // Share thread only.
+    private void restartBackoffsOnMove() {
+        Identity who = identity;
+        if (backoffArmedOn.moved(parsedEndpoint, groundServer, worldRolls,
+                who == null ? null : who.credential())) {
+            enrolSchedule.succeeded();
+            enrolAgainIn(1);
+            groundSchedule.succeeded();
+            groundAskAt = 0L;
+            groundReaskAt = 0L;
         }
     }
 
@@ -3526,9 +3533,13 @@ public final class ShareSender {
         if (endpoint != enrolKeyFrom || credential != enrolKeyFor) {
             enrolKeyFrom = endpoint;
             enrolKeyFor = credential;
-            enrolKey = endpoint + " " + Attestation.fingerprint(credential);
+            enrolKey = enrolKeyOf(endpoint, credential);
         }
         return enrolKey;
+    }
+
+    private static String enrolKeyOf(URI endpoint, Attestation.Credential credential) {
+        return endpoint + " " + Attestation.fingerprint(credential);
     }
 
     private void enrolAgainIn(long millis) {
@@ -3543,12 +3554,12 @@ public final class ShareSender {
             goes = "Ground, position and the player list go"
                     + " to whoever runs it.";
         } else if (withheldByBuild) {
-            goes = "Ground goes to whoever runs it. The position and the"
-                    + " player list do not; this build publishes ground"
-                    + " only.";
+            goes = "Ground goes to whoever runs it; this build"
+                    + " sends no position"
+                    + " or player list.";
         } else {
-            goes = "Ground goes to whoever runs it. The position and the player"
-                    + " list do not. The switch that publishes them"
+            goes = "Ground goes to whoever runs it; the position and the player"
+                    + " list do not while the switch"
                     + " is off.";
         }
         return goes;
@@ -3572,11 +3583,17 @@ public final class ShareSender {
 
     private final class CollectorWire implements Enroller.Wire {
 
-        private final URI endpoint;
+        private URI endpoint;
+
+        private final ByteArrayOutputStream replyText = new ByteArrayOutputStream();
 
         private long retryAfterSeconds;
 
         private CollectorWire(URI endpoint) {
+            this.endpoint = endpoint;
+        }
+
+        private void pointAt(URI endpoint) {
             this.endpoint = endpoint;
         }
 
@@ -3587,9 +3604,15 @@ public final class ShareSender {
 
         @Override
         public int offer(byte[] enrolment) throws IOException {
-            Reply reply = transport.post(endpoint, enrolment);
+            replyText.reset();
+            Reply reply = transport.postReading(endpoint, enrolment, replyText);
             retryAfterSeconds = reply.retryAfterSeconds();
             return reply.status();
+        }
+
+        @Override
+        public String offerReply() {
+            return replyText.toString(java.nio.charset.StandardCharsets.UTF_8).trim();
         }
 
         long retryAfterSeconds() {
@@ -3602,11 +3625,11 @@ public final class ShareSender {
         private static final int MAX_SESSION_CALLS = 2;
 
         private static final String CLIENT_THREAD_FAILURE = "geosurvey could not read the"
-                + " player's session; the read threw on the client thread."
-                + " Account not proved this time";
+                + " player's session on the client thread."
+                + " Account not proved";
 
         private static final String SESSION_SERVICE_FAILURE = "geosurvey's call to Mojang's"
-                + " session service threw. Account not proved this time";
+                + " session service failed. Account not proved";
 
         private static final AtomicInteger outstanding = new AtomicInteger();
 
@@ -3673,8 +3696,7 @@ public final class ShareSender {
             int already = outstanding.getAndIncrement();
             if (already >= MAX_SESSION_CALLS) {
                 outstanding.decrementAndGet();
-                LOGGER.debug("geosurvey will not ask Mojang's session service again while"
-                        + " {} such calls are still running", already);
+                LOGGER.debug("geosurvey will not ask Mojang while {} calls run", already);
                 return orElse;
             }
             AtomicReference<Thread> worker = new AtomicReference<>();
@@ -3687,6 +3709,7 @@ public final class ShareSender {
             }, work -> {
                 Thread made = Background.thread(work, "geosurvey-session");
                 worker.set(made);
+                StoppableWorkers.thread("geosurvey-session", made);
                 made.start();
             });
             T got;
@@ -3760,6 +3783,11 @@ public final class ShareSender {
             if (now >= groundReaskAt && now >= groundAskAt) {
                 askGround(collector, server);
             }
+        } else if (walk.standingDue()) {
+            long now = System.nanoTime();
+            if (now >= groundAskAt) {
+                askGround(collector, server);
+            }
         }
         if (!groundAsking.get()) {
 
@@ -3784,7 +3812,6 @@ public final class ShareSender {
         GroundAskResult result;
         try {
 
-            // identity is volatile; only sync() and shutDown() write it, on the client thread.
             result = groundAskResult(
                     walk.ask(transport, collector, server, currentEndpoint, identity));
         } catch (Throwable down) {
@@ -3800,7 +3827,8 @@ public final class ShareSender {
         GroundAsk ask = heldGroundAsk();
         ask.collector = collector;
         ask.server = server;
-        boolean accepted = groundWork.submit(LandNav.MOD_ID, ask.compute, ask.apply);
+        groundAskedUnder = backoffArmedOn.restarts();
+        boolean accepted = groundWork.submit(CollectorMod.MOD_ID, ask.compute, ask.apply);
         if (!accepted) {
             spareGroundAsk.set(ask);
             groundAsking.set(false);
@@ -3840,10 +3868,10 @@ public final class ShareSender {
             if (result.failure() != null) {
                 LOGGER.warn("geosurvey's ground handshake ask crashed."
                         + " It will be asked again", result.failure());
-                groundSchedule.failed();
-                groundAskAt = System.nanoTime()
-                        + groundSchedule.intervalMillis() * NANOS_PER_MILLI;
-            } else if (result.asked()) {
+            }
+            if (groundAskedUnder != backoffArmedOn.restarts()) {
+                groundAskAt = 0L;
+            } else if (result.asked() && result.failure() == null && !walk.standingDue()) {
                 groundSchedule.succeeded();
                 groundAskAt = 0L;
                 groundReaskAt = System.nanoTime() + GROUND_REASK_MILLIS * NANOS_PER_MILLI;
@@ -3881,9 +3909,19 @@ public final class ShareSender {
         return walk.readMore(level, tick);
     }
 
-    // Tick thread only; null when there is nothing to say.
+    // Tick thread only; null with nothing to say.
     public String groundNotice() {
-        return walk.notice();
+        String line = enrolDeniedLine();
+        return line != null ? line : walk.notice();
+    }
+
+    // Tick thread only; null unless a refusal of this computer's own key waits for the current collector.
+    private String enrolDeniedLine() {
+        if (enrolDeniedAt.get() == null) {
+            return null;
+        }
+        URI denied = enrolDeniedAt.getAndSet(null);
+        return denied != null && denied.equals(parsedEndpoint) ? GroundWalk.SAID + ENROL_DENIED : null;
     }
 
     public boolean groundWorthSaying() {
@@ -3898,8 +3936,37 @@ public final class ShareSender {
         return walk.proven();
     }
 
+    ServerConfirmation.Ground groundFor(String nodeHost, String server) {
+        URI endpoint = parsedEndpoint;
+        String walking = groundServer;
+        if (endpoint == null || nodeHost == null
+                || !NodeAddress.withoutRootDot(nodeHost)
+                        .equalsIgnoreCase(NodeAddress.withoutRootDot(endpoint.getHost()))
+                || walking == null || !walking.equals(server)) {
+            return ServerConfirmation.Ground.NOT_WALKING;
+        }
+        return walk.groundFor(nodeHost, server);
+    }
+
+    boolean groundAsked() {
+        return walk.asked();
+    }
+
+    boolean groundAskedNothing() {
+        return walk.askedNothing();
+    }
+
+    boolean groundAskOpen() {
+        return groundAsking.get();
+    }
+
+    // In the operator's order.
+    List<WorldPrint.Region> groundOwed() {
+        return walk.owed();
+    }
+
     private static final String GROUND_FIRST =
-            "the ground handshake is not finished. Position goes up once it is.";
+            "the ground handshake is not finished";
 
     private void beat() {
 
@@ -3924,17 +3991,18 @@ public final class ShareSender {
 
     private void beatTo(URI endpoint, long now) {
         if (endpoint == null) {
-            stalled("there is no collector address to post it to");
+            stalled("no collector address");
             return;
         }
         Identity who = identity;
         if (who == null) {
-            stalled(unidentified());
+            unidentifiedPresence();
             return;
         }
+        keyMissing = false;
         if (!Attestation.current(who.credential(), now)) {
             stalled(LocalKey.isMine(who.credential())
-                    ? "this client's own signing key lapsed without being re-minted"
+                    ? "this client's own signing key has expired"
                     : "the Mojang profile key has expired");
             return;
         }
@@ -3943,7 +4011,7 @@ public final class ShareSender {
             return;
         }
         if (seen == null) {
-            stalled("the game has not reported a position yet");
+            stalled("the game has not reported a position");
             return;
         }
 
@@ -4119,11 +4187,11 @@ public final class ShareSender {
             return;
         }
         if (endpoint == null) {
-            rosterStalled("there is no collector address to post it to");
+            rosterStalled("no collector address");
             return;
         }
         if (me == null || !Attestation.current(me.credential(), now)) {
-            rosterStalled("there is nothing to sign it with");
+            rosterStalled("nothing to sign with");
             return;
         }
         if (seen == null || who == null) {
@@ -4133,7 +4201,7 @@ public final class ShareSender {
                 rosterChose(withheldByBuild ? ROSTER_WITHHELD_BY_BUILD : ROSTER_WITHHELD);
                 return;
             }
-            rosterStalled("the game has not reported a player list yet");
+            rosterStalled("the game has not reported a player list");
             return;
         }
         Here where = seen.where;
@@ -4196,9 +4264,9 @@ public final class ShareSender {
                 rosterRefused++;
 
                 rosterStalled(status == HTTP_NOT_FOUND
-                        ? "this collector has no /roster route."
-                                + " Your position is still"
-                                + " being reported"
+                        ? "this collector has no /roster route;"
+                                + " your position is still"
+                                + " reported"
                         : "the collector answered " + status);
             }
         } catch (IOException | RuntimeException notSendable) {
@@ -4330,8 +4398,8 @@ public final class ShareSender {
         rosterReason = reason;
         if (!reason.equals(rosterAnnounced)) {
             rosterAnnounced = reason;
-            String said = "geosurvey is not reporting who else is online: {}. Run"
-                    + " /geosurvey share for the rest of the state.";
+            String said = "geosurvey does not report the player list: {}. Run"
+                    + " /geosurvey share to see the state.";
             if (fault) {
                 LOGGER.warn(said, reason);
             } else {
@@ -4344,7 +4412,7 @@ public final class ShareSender {
         rosterReason = "";
         if (rosterAnnounced != null) {
             rosterAnnounced = null;
-            LOGGER.info("geosurvey is reporting who else is online again.");
+            LOGGER.info("geosurvey reports the player list again.");
         }
     }
 
@@ -4353,8 +4421,8 @@ public final class ShareSender {
         if (!noLocalKey.isEmpty()) {
             return noLocalKey;
         }
-        return "there is nothing to sign with yet: this client is not signed in to a"
-                + " multiplayer server, or its own key is still being made";
+        return "nothing to sign with: no server joined,"
+                + " or its key is not made";
     }
 
     private void stalled(String reason) {
@@ -4369,16 +4437,26 @@ public final class ShareSender {
         stalled(reason, null, false);
     }
 
-    private void stalled(String reason, Throwable cause, boolean fault) {
-        beatAgainIn(1);
+    private void unidentifiedPresence() {
+        String reason = unidentified();
+        long now = System.nanoTime();
+        if (!keyMissing) {
+            keyMissing = true;
+            keyMissingSince = now;
+        }
+        if (LocalKey.unusable().isEmpty() && now - keyMissingSince < KEY_SETTLE_NANOS) {
+            holdPresence(reason);
+        } else {
+            stalled(reason);
+        }
+    }
 
-        lastPosted = null;
-        lastPostedFor = null;
-        presenceReason = reason;
+    private void stalled(String reason, Throwable cause, boolean fault) {
+        holdPresence(reason);
         if (!reason.equals(presenceAnnounced)) {
             presenceAnnounced = reason;
-            String said = "geosurvey is not reporting your position, the server clock"
-                    + " or the weather: {}. Run /geosurvey share for the rest of the"
+            String said = "geosurvey does not report"
+                    + " your position: {}. Run /geosurvey share to see the"
                     + " state.";
             if (cause != null) {
                 LOGGER.warn(said, reason, cause);
@@ -4390,11 +4468,19 @@ public final class ShareSender {
         }
     }
 
+    private void holdPresence(String reason) {
+        beatAgainIn(1);
+
+        lastPosted = null;
+        lastPostedFor = null;
+        presenceReason = reason;
+    }
+
     private void flowing() {
         presenceReason = "";
         if (presenceAnnounced != null) {
             presenceAnnounced = null;
-            LOGGER.info("geosurvey is reporting your position again.");
+            LOGGER.info("geosurvey reports your position again.");
         }
     }
 
@@ -4422,10 +4508,10 @@ public final class ShareSender {
         if (out == null) {
             return;
         }
-        if (!Attestation.current(who.credential(), Instant.now())) {
+        if (!Attestation.current(who.credential(), utc.nowMillis())) {
             return;
         }
-        if (walk.asked() && mayOweGround(out.server)) {
+        if (walk.asked() && mayOweGround(out.label)) {
             return;
         }
 
@@ -4447,7 +4533,7 @@ public final class ShareSender {
             read = true;
         } catch (IOException unreadable) {
 
-            LOGGER.warn("geosurvey could not read a batch back out of the upload"
+            LOGGER.warn("geosurvey could not read a batch from the upload"
                     + " spool for {} {} ({}). It is still there.", out.server,
                     out.dimension, unreadable.toString());
             loaded = null;
@@ -4471,7 +4557,7 @@ public final class ShareSender {
         }
         boolean built;
         try {
-            Batch.encodeTo(batchRoom, out.server, out.dimension, out.account(),
+            Batch.encodeTo(batchRoom, out.label, out.dimension, out.account(),
                     stampFor(loaded), loaded.samples());
             built = true;
         } catch (IOException | RuntimeException notSendable) {
@@ -4490,10 +4576,10 @@ public final class ShareSender {
                 signedIt = false;
                 failed++;
                 signerFailures++;
-                noteGroundTrouble("could not sign a batch (see the log): "
+                noteGroundTrouble("signing failed (see the log): "
                         + signerFailures
-                        + " in a row. Nothing sent until it can sign."
-                        + " Ground stays queued, not set"
+                        + " in a row; nothing"
+                        + " set"
                         + " aside", notSigned);
                 backOff();
                 settleUpload(spool, out, loaded, Posted.RETRY);
@@ -4532,7 +4618,7 @@ public final class ShareSender {
         job.spool = spool;
         job.out = out;
         job.loaded = loaded;
-        boolean accepted = uploadWork.submit(LandNav.MOD_ID,
+        boolean accepted = uploadWork.submit(CollectorMod.MOD_ID,
                 job.post, job.apply, null,
                 job.drop, job.discard);
         if (!accepted) {
@@ -4636,6 +4722,7 @@ public final class ShareSender {
             if (failure != null) {
 
                 failed++;
+                uploadUnreached = true;
                 noteGroundTrouble("the collector could not be reached (see the log)", failure);
                 backOff();
                 settleUpload(spool, out, loaded, Posted.RETRY);
@@ -4651,7 +4738,11 @@ public final class ShareSender {
                               ShareSpool.Loaded loaded) {
         int status = reply.status();
         lastStatus = status;
-        if (status == Enroller.HTTP_TOO_MANY_REQUESTS) {
+        uploadUnreached = false;
+        if (status == HTTP_REQUEST_TIMEOUT) {
+            backOff();
+            settleUpload(spool, out, loaded, Posted.RETRY);
+        } else if (status == Enroller.HTTP_TOO_MANY_REQUESTS) {
             refused++;
             uploadAgainIn(Math.clamp(reply.retryAfterSeconds(), 1, MAX_QUIET_SECONDS)
                     * MILLIS_PER_SECOND);
@@ -4659,9 +4750,16 @@ public final class ShareSender {
         } else if (status / HTTP_STATUS_CLASS == HTTP_SUCCESS_CLASS) {
             sent++;
             groundReason = "";
+            lastRefusal = "";
             schedule.succeeded();
             uploadAgainIn(1);
             settleUpload(spool, out, loaded, Posted.TAKEN);
+        } else if (status == HTTP_UNAUTHORIZED && awaitingEnrolment()) {
+            String line = refusedLine(status);
+            lastRefusal = line;
+            walk.sayAt(out.endpoint, line);
+            backOff();
+            settleUpload(spool, out, loaded, Posted.RETRY);
         } else {
             refused++;
             backOff();
@@ -4673,30 +4771,65 @@ public final class ShareSender {
                                ShareSpool.Loaded loaded) {
         if (status / HTTP_STATUS_CLASS == HTTP_REDIRECT_CLASS) {
             noteGroundTrouble("the collector answered " + status
-                    + ": redirected. This client does not follow"
-                    + " redirects. Point the setting at the"
-                    + " address the collector serves");
+                    + ", a redirect; set"
+                    + " the address"
+                    + " it serves");
             settleUpload(spool, out, loaded, Posted.RETRY);
-        } else if (status == HTTP_FORBIDDEN && refusalMayOweGround(out.server)) {
-            noteGroundTrouble("the collector answered 403 for " + out.server
-                    + ": has not proven the ground yet."
-                    + " Nothing set aside. Run /geosurvey share"
-                    + " to see where to walk");
+        } else if (status == HTTP_FORBIDDEN && refusalMayOweGround(out.label)) {
+            noteGroundTrouble("the collector answered 403 for " + out.label
+                    + ": ground not proven;"
+                    + " see"
+                    + " /geosurvey share");
             settleUpload(spool, out, loaded, Posted.RETRY);
-        } else if (status == HTTP_FORBIDDEN && out.server != null
-                && out.server.equals(groundServer)
+        } else if (status == HTTP_FORBIDDEN && out.label != null
+                && out.label.equals(groundServer)
                 && walk.askedNothing() && walk.mayReask()) {
             walk.reask();
-            noteGroundTrouble("the collector answered 403 for " + out.server
-                    + ": asked for no ground."
-                    + " Asking again; the"
-                    + " ground it wants will be read then. Nothing is"
-                    + " set aside. Run /geosurvey share to see where to walk");
+            noteGroundTrouble("the collector answered 403 for " + out.label
+                    + ": it asked for"
+                    + " no ground;"
+                    + " asking"
+                    + " again");
             settleUpload(spool, out, loaded, Posted.RETRY);
+        } else if (status / HTTP_STATUS_CLASS == HTTP_CLIENT_ERROR_CLASS) {
+            String line = refusedLine(status);
+            lastRefusal = line;
+            walk.sayAt(out.endpoint, line);
+            settleUpload(spool, out, loaded, Posted.REFUSED);
         } else {
-            settleUpload(spool, out, loaded,
-                    status / HTTP_STATUS_CLASS == HTTP_CLIENT_ERROR_CLASS
-                            ? Posted.REFUSED : Posted.RETRY);
+            settleUpload(spool, out, loaded, Posted.RETRY);
+        }
+    }
+
+    // Share thread only.
+    private String refusedLine(int status) {
+        Identity who = identity;
+        String line;
+        if (status != HTTP_UNAUTHORIZED) {
+            line = REFUSED;
+        } else if (who != null && LocalKey.isMine(who.credential())
+                && !enrolledAt.equals(enrolKeyOf(enrolEndpoint, who.credential()))) {
+            line = REFUSED_KEY;
+        } else if (!utc.grounded()) {
+            line = REFUSED_CLOCK;
+        } else {
+            line = REFUSED;
+        }
+        return line;
+    }
+
+    private boolean awaitingEnrolment() {
+        Identity who = identity;
+        return who != null && LocalKey.isMine(who.credential())
+                && !enrolledAt.equals(enrolKeyOf(enrolEndpoint, who.credential()));
+    }
+
+    private void offerRefused() {
+        for (Outbound out : worlds) {
+            ShareSpool spool = out.spool;
+            if (spool != null) {
+                spool.offerRefused();
+            }
         }
     }
 
@@ -4722,7 +4855,7 @@ public final class ShareSender {
     }
 
     long stampFor(ShareSpool.Loaded loaded) {
-        long now = System.currentTimeMillis();
+        long now = utc.nowMillis();
         Stamp held = retryStamps.get(loaded.file());
         long age = held == null ? -1L : now - held.sent();
         if (held != null && held.era() == loaded.era()
@@ -4843,7 +4976,6 @@ public final class ShareSender {
             if (!heldElsewhere(out)) {
                 spool.removeIfEmpty();
             }
-            // endForGood() ends the Deflater; close() may already have.
             spool.endForGood();
             out.spool = null;
         }
@@ -4941,8 +5073,8 @@ public final class ShareSender {
         long lastComplaint = groundComplainedAt;
         if (lastComplaint == 0 || now - lastComplaint >= COMPLAIN_EVERY_MS * NANOS_PER_MILLI) {
             groundComplainedAt = now;
-            String said = "geosurvey could not reach the collector to contribute ground:"
-                    + " {}. It keeps trying, and nothing surveyed is lost. Run"
+            String said = "geosurvey does not contribute ground:"
+                    + " {}. It keeps trying and loses nothing; run"
                     + " /geosurvey share for the backlog.";
             if (cause == null) {
                 LOGGER.warn(said, why);
@@ -4982,7 +5114,6 @@ public final class ShareSender {
         return offered;
     }
 
-    // Surveyed ground that could not be spooled.
     long dropped() {
         return dropped.get();
     }
@@ -4992,49 +5123,15 @@ public final class ShareSender {
     }
 
     long spooled() {
-        long held = 0;
-        for (Outbound out : worlds) {
-            held += out.queued() + out.onDisk();
-        }
-        return held;
+        return backlog.spooled();
     }
 
     long spoolBytes() {
-        return spoolBytes(new SpoolTally());
-    }
-
-    private long spoolBytes(SpoolTally tally) {
-        tally.held = 0L;
-        worlds.forEach(tally);
-        return tally.held;
-    }
-
-    private static final class SpoolTally implements Consumer<Outbound> {
-
-        private long held = 0L;
-
-        @Override
-        public void accept(Outbound out) {
-            ShareSpool spool = out.spool;
-            if (spool != null) {
-                held += spool.bytes();
-            }
-        }
-    }
-
-    long unclaimedBytes() {
-        return unclaimedBytes;
+        return backlog.spoolBytes();
     }
 
     long spoolRefused() {
-        long held = 0;
-        for (Outbound out : worlds) {
-            ShareSpool spool = out.spool;
-            if (spool != null) {
-                held += spool.refusedRecords();
-            }
-        }
-        return held;
+        return backlog.spoolRefused();
     }
 
     long sent() {
@@ -5053,9 +5150,16 @@ public final class ShareSender {
         return live;
     }
 
+    static void sayGroundNotice(String line) {
+        ShareSender sender = live;
+        if (sender != null) {
+            sender.walk.say(line);
+        }
+    }
+
     boolean signing() {
         Identity who = identity;
-        return who != null && Attestation.current(who.credential(), Instant.now());
+        return who != null && Attestation.current(who.credential(), utc.nowMillis());
     }
 
     boolean addressed() {
@@ -5068,6 +5172,15 @@ public final class ShareSender {
 
     int lastStatus() {
         return lastStatus;
+    }
+
+    // "" unless a refusal followed the last accepted upload.
+    String lastRefusal() {
+        return lastRefusal;
+    }
+
+    boolean uploadUnreached() {
+        return uploadUnreached;
     }
 
     long presenceSent() {
@@ -5119,6 +5232,13 @@ public final class ShareSender {
         return who != null && LocalKey.isMine(who.credential());
     }
 
+    // Allocates.
+    boolean enrolledHere() {
+        Identity who = identity;
+        URI at = enrolEndpoint;
+        return who != null && at != null && enrolledAt.equals(enrolKeyOf(at, who.credential()));
+    }
+
     String identityFingerprint() {
         Identity who = identity;
         return who == null ? ""
@@ -5129,15 +5249,38 @@ public final class ShareSender {
         return probe;
     }
 
-    // Test only; sync() overwrites this on its next call.
+    // Test only; sync() overwrites it.
     void probing(VanishProbe armed) {
         this.probe = armed;
     }
 
-    boolean spoolRootWasGiven() {
-        return spoolRootGiven;
+    static Transport httpTransport() {
+        return new HttpTransport();
     }
 
+    // The outbox's poster, over a transport of its own; closing it closes the transport.
+    static ShareOutbox.Poster outboxPoster() {
+        return new OutboxPoster(new HttpTransport());
+    }
+
+    private static final class OutboxPoster implements ShareOutbox.Poster, AutoCloseable {
+
+        private final HttpTransport transport;
+
+        private OutboxPoster(HttpTransport transport) {
+            this.transport = transport;
+        }
+
+        @Override
+        public Reply post(URI endpoint, byte[] body, String server) throws IOException {
+            return transport.postNamed(endpoint, body, server);
+        }
+
+        @Override
+        public void close() {
+            transport.close();
+        }
+    }
 
     private static final class HttpTransport implements Transport, AutoCloseable {
 
@@ -5147,7 +5290,7 @@ public final class ShareSender {
 
         private static final int HELD_REQUESTS = 8;
 
-        private static final long DECIMAL_RADIX = 10L;
+        private static final String DATE = "Date";
 
         private static final AtomicReferenceArray<Reply> REPLIES =
                 new AtomicReferenceArray<>(STATUS_CODES);
@@ -5177,6 +5320,16 @@ public final class ShareSender {
 
         private final AtomicReferenceArray<HeldRange> heldRanges =
                 new AtomicReferenceArray<>(HELD_REQUESTS);
+
+        private final UtcClock utc;
+
+        HttpTransport() {
+            this(UtcClock.collector());
+        }
+
+        HttpTransport(UtcClock utc) {
+            this.utc = utc;
+        }
 
         @Override
         public void close() {
@@ -5223,12 +5376,38 @@ public final class ShareSender {
             return replyTo(response);
         }
 
+        // server is null, or the name of the server whose world the record is from.
+        Reply postNamed(URI endpoint, byte[] body, String server) throws IOException {
+            if (server == null) {
+                return post(endpoint, body);
+            }
+            HttpRequest request = HttpRequest.newBuilder(endpoint)
+                    .timeout(TIMEOUT)
+                    .header("User-Agent", "GeoSurvey/" + LandNav.MOD_ID)
+                    .header("Content-Type", "application/octet-stream")
+                    .header(SharedRecord.serverHeader(), SharedRecord.serverHeaderValue(server))
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                    .build();
+            HttpResponse<Void> response = exchange(request, MAX_REPLY_BYTES, null,
+                    "interrupted while posting");
+            return replyTo(response);
+        }
+
         @Override
         public Reply answer(URI endpoint, byte[] body, ByteArrayOutputStream into)
                 throws IOException {
             HttpRequest request = posting(endpoint, body, body.length);
             HttpResponse<Void> response = exchange(request, WorldAsk.MAX_BODY, into,
                     "interrupted while answering");
+            return replyTo(response);
+        }
+
+        @Override
+        public Reply postReading(URI endpoint, byte[] body, ByteArrayOutputStream into)
+                throws IOException {
+            HttpRequest request = posting(endpoint, body, body.length);
+            HttpResponse<Void> response = exchange(request, MAX_REPLY_BYTES, into,
+                    "interrupted while posting");
             return replyTo(response);
         }
 
@@ -5361,10 +5540,12 @@ public final class ShareSender {
             Reading reading = heldReading();
             int cap = Math.max(1, maxBytes);
             reading.expect(into, cap, keeps);
+            long startedAt = System.currentTimeMillis();
             CompletableFuture<HttpResponse<Void>> pending = client().sendAsync(request, reading);
             HttpResponse<Void> response;
             try {
                 response = pending.get(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+                noteDate(response, startedAt);
                 if (reading.ended()) {
                     spareReading(reading);
                 }
@@ -5385,6 +5566,13 @@ public final class ShareSender {
                 pending.cancel(true);
             }
             return response;
+        }
+
+        private void noteDate(HttpResponse<Void> response, long startedAt) {
+            List<String> dates = response.headers().allValues(DATE);
+            if (!dates.isEmpty()) {
+                utc.noteHttpDate(dates.get(0), startedAt, System.currentTimeMillis());
+            }
         }
 
         // Null chunk means the body ended.
@@ -5739,20 +5927,8 @@ public final class ShareSender {
         }
 
         private static long delaySeconds(String text) {
-            long seconds = text.isEmpty() ? -1L : 0L;
-            int at = 0;
-            while (seconds >= 0L && at < text.length()) {
-                char glyph = text.charAt(at);
-                long digit = glyph - '0';
-                if (glyph < '0' || glyph > '9'
-                        || seconds > (Long.MAX_VALUE - digit) / DECIMAL_RADIX) {
-                    seconds = -1L;
-                } else {
-                    seconds = seconds * DECIMAL_RADIX + digit;
-                }
-                at++;
-            }
-            return seconds;
+            Long seconds = NumberGrammar.decimalLong(text);
+            return seconds == null ? -1L : seconds.longValue();
         }
 
         private static Reply replyTo(HttpResponse<?> response) {

@@ -31,7 +31,7 @@ public final class CaveProjection {
 
     public static int depthBand(int height, int entranceHeight, int bandSize) {
         if (bandSize <= 0) {
-            throw new IllegalArgumentException("bandSize must be positive, was " + bandSize);
+            throw new IllegalArgumentException("bandSize must be positive: " + bandSize);
         }
         int below = entranceHeight - height;
         if (below < bandSize) {
@@ -56,7 +56,7 @@ public final class CaveProjection {
 
         public static DepthBandDescriptor of(int entranceHeight, int bandSize) {
             if (bandSize <= 0) {
-                throw new IllegalArgumentException("bandSize must be positive, was " + bandSize);
+                throw new IllegalArgumentException("bandSize must be positive: " + bandSize);
             }
             int shift = (bandSize & (bandSize - 1)) == 0 ? Integer.numberOfTrailingZeros(bandSize) : -1;
             return new DepthBandDescriptor(entranceHeight, bandSize, shift);

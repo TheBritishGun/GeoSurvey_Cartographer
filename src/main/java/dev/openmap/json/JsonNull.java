@@ -1,6 +1,6 @@
 package dev.openmap.json;
 
-// The JSON literal null, distinct from a Java null.
+// The JSON literal null, not a Java null.
 public final class JsonNull implements JsonElement {
 
     public static final JsonNull INSTANCE = new JsonNull();

@@ -12,8 +12,8 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-// Gives ChunkCapture.shareServer the redirect target of a server transfer;
-// ServerData.ip does not carry it. Cleared on an ordinary disconnect.
+// Gives ChunkCapture.shareServer the target of a server transfer.
+// A normal disconnect clears it.
 @Mixin(ClientCommonPacketListenerImpl.class)
 public abstract class ClientCommonPacketListenerImplTransferMixin {
 

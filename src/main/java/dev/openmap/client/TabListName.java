@@ -18,13 +18,12 @@ import net.minecraft.world.scores.TeamColor;
 
 public final class TabListName {
 
-    // Leading space separates the badge from the name.
     private static final String BADGE = " BOT";
 
     private static final Component BADGE_COMPONENT =
             Component.literal(BADGE).withStyle(ChatFormatting.DARK_BLUE);
 
-    // Single-entry memo, keyed by identity of shown, profile, spectator and team.
+    // Single-entry memo, keyed by identity.
     private static Component damagedMemoShown;
     private static GameProfile damagedMemoProfile;
     private static boolean damagedMemoSpectator;
@@ -160,7 +159,7 @@ public final class TabListName {
         return result;
     }
 
-    // Same rule as tidied, for a bare string; profile may be null.
+    // Like tidied, for a string; profile can be null.
     public static String readable(String shown, GameProfile profile) {
         if (profile != null && TabName.damaged(shown, profile.id())) {
             return TabName.bounded(profile.name());

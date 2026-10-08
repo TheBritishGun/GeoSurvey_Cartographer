@@ -1,5 +1,6 @@
 package dev.openmap.map;
 
+import dev.openmap.json.AtomicFileReplace;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -45,6 +46,18 @@ public final class MapCodec {
     private static final int RECORD_COVER =
             RECORD_HEIGHTS + ChunkSample.COLUMNS * Short.BYTES;
 
+    private static final int HEIGHT_BYTES = ChunkSample.COLUMNS * Short.BYTES;
+
+    private static final int COLOUR_BYTES = ChunkSample.COLUMNS * Integer.BYTES;
+
+    private static final int COLUMNS_CEILING_BYTES = HEIGHT_BYTES + COLOUR_BYTES;
+
+    private static final int OVERWORLD_FLOOR = -64;
+
+    private static final int NETHER_END_FLOOR = 0;
+
+    private static final byte UNKNOWN_COVER = (byte) LandCover.UNKNOWN.code();
+
     private MapCodec() {
     }
 
@@ -53,17 +66,11 @@ public final class MapCodec {
 
         Path temp = path.resolveSibling(
                 path.getFileName() + "." + Thread.currentThread().threadId() + ".tmp");
-        try (OutputStream out = openTemp(temp, parent)) {
-            write(store, out);
-        } catch (IOException | RuntimeException failed) {
-            try {
-                Files.deleteIfExists(temp);
-            } catch (IOException | RuntimeException undeletable) {
-                failed.addSuppressed(undeletable);
+        AtomicFileReplace.write(temp, path, written -> {
+            try (OutputStream out = openTemp(written, parent)) {
+                write(store, out);
             }
-            throw failed;
-        }
-        MapStorage.FileReplace.replace(temp, path, true, MapStorage.FileReplace.ALWAYS);
+        });
     }
 
     private static OutputStream openTemp(Path temp, Path parent) throws IOException {
@@ -229,7 +236,7 @@ public final class MapCodec {
         try {
             writeChunk(out, new ChunkSample(0, 0), new ChunkWriter());
         } catch (IOException impossible) {
-            throw new IllegalStateException("writing to nowhere failed", impossible);
+            throw new IllegalStateException("measuring write failed", impossible);
         }
         return out.size();
     }
@@ -238,13 +245,12 @@ public final class MapCodec {
         int measured = measureChunk();
         if (measured != CHUNK_BYTES) {
             throw new IllegalStateException("CHUNK_BYTES is " + CHUNK_BYTES
-                    + " but measured " + measured + ":"
+                    + ", measured " + measured + ":"
                     + " ChunkWriter.writeInto and ChunkWriter.write"
                     + " disagree");
         }
     }
 
-    // One record. For a run of records, reuse a ChunkReader instead.
     public static ChunkSample decodeChunk(byte[] data) throws IOException {
         if (data.length < CHUNK_BYTES) {
             throw new EOFException();
@@ -285,14 +291,14 @@ public final class MapCodec {
         return (short) ((from[at] << Byte.SIZE) | (from[at + 1] & BYTE_MASK));
     }
 
-    // Not thread-safe; one instance per decoding loop.
+    // Not thread-safe; one per decoding loop.
     public static final class ChunkReader {
 
         private final DecodeScratch scratch = new DecodeScratch();
         private final ArraySource from = new ArraySource();
         private final DataInputStream in = new DataInputStream(from);
 
-        // Exactly one CHUNK_BYTES record; throws EOFException if short.
+        // One CHUNK_BYTES record; throws EOFException if short.
         public ChunkSample read(byte[] record) throws IOException {
             from.on(record);
             return readChunk(in, VERSION, null, scratch);
@@ -304,6 +310,9 @@ public final class MapCodec {
         private final short[] heights = new short[ChunkSample.COLUMNS];
         private final byte[] cover = new byte[ChunkSample.COLUMNS];
         private final byte[] rawHeights = new byte[ChunkSample.COLUMNS * Short.BYTES];
+        private final byte[] columns = new byte[COLUMNS_CEILING_BYTES];
+        private final ArraySource from = new ArraySource();
+        private final DataInputStream body = new DataInputStream(from);
         private int cx;
         private int cz;
         private long captured;
@@ -334,7 +343,6 @@ public final class MapCodec {
         }
     }
 
-    // Reuses the caller's scratch across records.
     private static ChunkSample readChunk(DataInputStream in, int version,
                                          IntFunction<LandCover> legacyColourToCover,
                                          DecodeScratch scratch)
@@ -367,6 +375,49 @@ public final class MapCodec {
         sample.setCapturedAt(scratch.captured);
         sample.setCaptureVersion(scratch.captureVersion);
         return sample;
+    }
+
+    static boolean columnsHoldGround(byte[] columns, int version,
+                                     IntFunction<LandCover> legacyColourToCover) {
+        boolean holdsGround = false;
+        for (int column = 0; column < ChunkSample.COLUMNS && !holdsGround; column++) {
+            if (holdsGroundHeight(bigEndianShort(columns, column * Short.BYTES))) {
+                holdsGround = true;
+            }
+        }
+        if (!holdsGround) {
+            holdsGround = holdsGroundCover(columns, version, legacyColourToCover);
+        }
+        return holdsGround;
+    }
+
+    private static boolean holdsGroundCover(byte[] columns, int version,
+                                            IntFunction<LandCover> legacyColourToCover) {
+        int at = HEIGHT_BYTES;
+        boolean holdsGround = false;
+        if (version >= VERSION_COVER) {
+            for (int column = 0; column < ChunkSample.COLUMNS && !holdsGround; column++) {
+                if (storedCover(columns[at + column]) != UNKNOWN_COVER) {
+                    holdsGround = true;
+                }
+            }
+        } else {
+            for (int column = 0; column < ChunkSample.COLUMNS && !holdsGround; column++) {
+                if (convertLegacy(getInt(columns, at + column * Integer.BYTES),
+                        legacyColourToCover).isKnown()) {
+                    holdsGround = true;
+                }
+            }
+        }
+        return holdsGround;
+    }
+
+    private static boolean holdsGroundHeight(short height) {
+        return height > OVERWORLD_FLOOR && height != NETHER_END_FLOOR;
+    }
+
+    private static byte storedCover(byte ordinal) {
+        return ordinal < 0 || ordinal >= LandCover.count() ? UNKNOWN_COVER : ordinal;
     }
 
     public static final class ChunkWriter {
@@ -423,12 +474,21 @@ public final class MapCodec {
         }
     }
 
+    interface ColumnGate extends ChunkGate {
+
+        boolean keepsColumns(byte[] columns, int version,
+                             IntFunction<LandCover> legacyColourToCover);
+    }
+
     public static int stream(Path path, IntFunction<LandCover> legacyColourToCover,
                              ChunkGate gate, java.util.function.Consumer<ChunkSample> sink,
                              int maxChunks,
                              java.util.function.Consumer<String> damaged)
             throws IOException {
-        if (path == null || !Files.isRegularFile(path)) {
+        if (path == null) {
+            return 0;
+        }
+        if (!present(path)) {
             return 0;
         }
         int read = 0;
@@ -455,7 +515,6 @@ public final class MapCodec {
             boolean wanted = true;
             for (int i = 0; wanted && i < count; i++) {
                 if (read == maxChunks) {
-                    // Not oversized when the count is unknown and nothing follows.
                     if (promised == COUNT_UNKNOWN && noMoreBytes(in)) {
                         break;
                     }
@@ -495,7 +554,14 @@ public final class MapCodec {
         return read;
     }
 
-    // True when nothing is left; does not consume from the stream.
+    static boolean present(Path path) throws IOException {
+        boolean found = Files.isRegularFile(path);
+        if (!found) {
+            found = AtomicFileReplace.recoverStaleAside(path) && Files.isRegularFile(path);
+        }
+        return found;
+    }
+
     private static boolean noMoreBytes(DataInputStream in) throws IOException {
         in.mark(1);
         boolean noMore = in.read() == -1;
@@ -507,7 +573,7 @@ public final class MapCodec {
 
     private static long readHeader(DataInputStream in) throws IOException {
         if (in.readInt() != MAGIC) {
-            throw new IOException("not a .landnav map file");
+            throw new IOException("not a .landnav file");
         }
         int version = in.readInt();
         if (version < VERSION_COLOUR || version > VERSION) {
@@ -529,12 +595,28 @@ public final class MapCodec {
         if (wanted) {
             if (gate == null || gate.keeps(scratch.cx, scratch.cz, scratch.captured,
                     scratch.captureVersion)) {
-                sink.accept(readRecord(in, version, legacyColourToCover, scratch));
+                decodeColumns(in, version, legacyColourToCover, gate, sink, scratch);
             } else {
                 skipRecord(in, skipBytes);
             }
         }
         return wanted;
+    }
+
+    private static void decodeColumns(DataInputStream in, int version,
+                                      IntFunction<LandCover> legacyColourToCover, ChunkGate gate,
+                                      java.util.function.Consumer<ChunkSample> sink,
+                                      DecodeScratch scratch) throws IOException {
+        if (!(gate instanceof ColumnGate ranker)) {
+            sink.accept(readRecord(in, version, legacyColourToCover, scratch));
+            return;
+        }
+        int length = bodyBytes(version);
+        in.readFully(scratch.columns, 0, length);
+        if (ranker.keepsColumns(scratch.columns, version, legacyColourToCover)) {
+            scratch.from.on(scratch.columns, length);
+            sink.accept(readRecord(scratch.body, version, legacyColourToCover, scratch));
+        }
     }
 
     private static void checkLongRead(DataInputStream in,
@@ -546,38 +628,38 @@ public final class MapCodec {
     }
 
     private static String tornMidRecord(String what, int read) {
-        return what + " never promised a count and ended partway through a record, after "
-                + read + " complete. It is truncated and the ground past that point is"
-                + " not in it";
+        return what + " has no count and ended inside a record, after "
+                + read + " complete records. The ground past that point is"
+                + " missing";
     }
 
     private static String shortRead(String what, int promised, int read) {
         return what + " says it holds " + promised + " chunks and only " + read + " of"
-                + " them could be read. It is truncated and the ground past that point"
-                + " is not in it";
+                + " them could be read. The ground past that point"
+                + " is missing";
     }
 
     private static String longRead(String what, int promised) {
-        return what + " says it holds " + promised + " chunks and there are more bytes"
-                + " after them. It is longer than its own header and whatever follows"
-                + " that count was never read";
+        return what + " says it holds " + promised + " chunks and has more bytes"
+                + " after them. Those bytes were"
+                + " not read";
     }
 
     private static String noHead(String what) {
-        return what + " ended before its own header. Nothing in it could be read at"
-                + " all and it is not the empty map it looks like";
+        return what + " ended before its header. Nothing was"
+                + " read";
     }
 
     private static String tornTrailer(String what, int promised) {
-        return what + " gave all " + promised + " chunks its header counted and then broke"
-                + " in the bytes that close the file. Nothing read checked those chunks"
-                + " against what was written";
+        return what + " gave all " + promised + " chunks, then ended"
+                + " inside its closing bytes. The chunks were"
+                + " not checked";
     }
 
     private static String tornTailWithoutCount(String what, int read) {
-        return what + " never promised a count, gave the " + read + " records it held and"
-                + " then broke in the bytes that close the file. Nothing read checked"
-                + " that ground against what was written";
+        return what + " has no count and gave " + read + " records, then ended"
+                + " inside its closing bytes. The records were"
+                + " not checked";
     }
 
     public static MapStore read(Path path, int capacity) {
@@ -641,20 +723,20 @@ public final class MapCodec {
                 betweenRecords = true;
             }
             if (damaged != null && promised != COUNT_UNKNOWN && in.read() != -1) {
-                damaged.accept(longRead("the map being read", promised));
+                damaged.accept(longRead("the map", promised));
             }
         } catch (EOFException truncated) {
             if (damaged != null) {
                 if (!headed) {
-                    damaged.accept(noHead("the map being read"));
+                    damaged.accept(noHead("the map"));
                 } else if (promised != COUNT_UNKNOWN && read < promised) {
-                    damaged.accept(shortRead("the map being read", promised, read));
+                    damaged.accept(shortRead("the map", promised, read));
                 } else if (promised == COUNT_UNKNOWN && betweenRecords) {
-                    damaged.accept(tornTailWithoutCount("the map being read", read));
+                    damaged.accept(tornTailWithoutCount("the map", read));
                 } else if (promised == COUNT_UNKNOWN) {
-                    damaged.accept(tornMidRecord("the map being read", read));
+                    damaged.accept(tornMidRecord("the map", read));
                 } else {
-                    damaged.accept(tornTrailer("the map being read", promised));
+                    damaged.accept(tornTrailer("the map", promised));
                 }
             }
         }
@@ -845,22 +927,27 @@ public final class MapCodec {
         }
     }
 
-    // Reusable across records: retargeted, not reallocated.
     private static final class ArraySource extends InputStream {
 
         private static final byte[] NOTHING = new byte[0];
 
         private byte[] from = NOTHING;
         private int at;
+        private int end;
 
         void on(byte[] data) {
+            on(data, data.length);
+        }
+
+        void on(byte[] data, int length) {
             from = data;
             at = 0;
+            end = length;
         }
 
         @Override
         public int read() {
-            return at < from.length ? from[at++] & BYTE_MASK : -1;
+            return at < end ? from[at++] & BYTE_MASK : -1;
         }
 
         @Override
@@ -868,7 +955,7 @@ public final class MapCodec {
             if (len == 0) {
                 return 0;
             }
-            int left = from.length - at;
+            int left = end - at;
             if (left <= 0) {
                 return -1;
             }
@@ -880,12 +967,10 @@ public final class MapCodec {
 
         @Override
         public int available() {
-            return from.length - at;
+            return end - at;
         }
     }
 
-    // Discards everything written; used only to measure a chunk's encoded
-    // size.
     private static final class Nowhere extends OutputStream {
 
         @Override

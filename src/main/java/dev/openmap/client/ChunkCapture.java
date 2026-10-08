@@ -14,6 +14,8 @@ import dev.openmap.map.ChunkSample;
 import dev.openmap.map.MapStore;
 import dev.openmap.map.MapRegion;
 import dev.openmap.map.MapStorage;
+import dev.openmap.share.Batch;
+import dev.openmap.share.UtcClock;
 import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.nio.file.Path;
@@ -27,6 +29,7 @@ import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -59,7 +62,7 @@ public final class ChunkCapture {
                 MIN_SCAN_RADIUS, MAX_SCAN_RADIUS);
     }
 
-    // Matches ClientChunkCache's own retention range of view + 3.
+    // Matches ClientChunkCache's retention beyond view.
     private static final int CACHE_SLACK = 3;
 
     private static final int DEADLINE_CHECK_MASK = 63;
@@ -73,19 +76,58 @@ public final class ChunkCapture {
 
     private static final long SAVE_INTERVAL_MILLIS = 30_000;
 
+    private static final long NEVER_RESURVEY = Long.MIN_VALUE;
+
+    private static final long NOTHING_TO_RESURVEY = Long.MAX_VALUE;
+
+    private static final long MILLIS_PER_SECOND = 1_000L;
+
+    private volatile long resurveyBefore = NEVER_RESURVEY;
+
+    private long lapOldestStamp = NOTHING_TO_RESURVEY;
+
+    private long scanCompleteOldestStamp = NOTHING_TO_RESURVEY;
+
     private final MapStorage storage;
 
     private final ShareSender share;
 
+    private final CollectorCartographerWorld world;
+
+    private final CollectorCartographerGround ground;
+
     private final ShareSender.Here standingAt =
             new ShareSender.Here(null, null, null, 0, 0, 0, false, false);
 
-    private final LongArrayFIFOQueue pending = new LongArrayFIFOQueue();
-    private final LongOpenHashSet queued = new LongOpenHashSet();
+    private final LongArrayFIFOQueue pending = new StableLongArrayFIFOQueue(MAX_RING_CELLS);
+    private final LongOpenHashSet queued = new LongOpenHashSet(MAX_RING_CELLS);
 
     private static final int MAX_UNLOADED = (2 * MAX_SCAN_RADIUS + 1) * (2 * MAX_SCAN_RADIUS + 1);
 
+    private static final int MAX_VOID_CHUNKS = (2 * MAX_SCAN_RADIUS + 1) * (2 * MAX_SCAN_RADIUS + 1);
+
+    private static final class StableLongArrayFIFOQueue extends LongArrayFIFOQueue {
+
+        StableLongArrayFIFOQueue(int capacity) {
+            super(capacity);
+        }
+
+        @Override
+        public long dequeueLong() {
+            if (start == end) {
+                throw new java.util.NoSuchElementException();
+            }
+            long value = array[start++];
+            if (start == length) {
+                start = 0;
+            }
+            return value;
+        }
+    }
+
     private final LongOpenHashSet unloaded = new LongOpenHashSet();
+
+    private final LongOpenHashSet voidChunks = new LongOpenHashSet();
 
     private int unloadedCentreX;
     private int unloadedCentreZ;
@@ -127,7 +169,7 @@ public final class ChunkCapture {
 
     private long capturedChunks;
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
     private long savesStarted;
     private long savesFinished;
@@ -176,6 +218,39 @@ public final class ChunkCapture {
     private final java.util.Set<String> saidUnapproved =
             new java.util.LinkedHashSet<>();
 
+    // Tick thread only; label and labelCollector are for this address.
+    private String labelFor;
+
+    private String label;
+
+    private String labelCollector = "";
+
+    // The share name of the server whose world the store's root holds; null with no server. Any thread reads it.
+    private volatile String rootServer = null;
+
+    // Tick thread only; the label rootServer was last made from, and the usable name made from it.
+    private String namedLabel = null;
+
+    private String namedAs = null;
+
+    // Tick thread only; null once said.
+    private String chosenNotice;
+
+    // Tick thread only; null once said.
+    private String emptyListNotice;
+
+    // Tick thread only.
+    private boolean setupOwed = true;
+
+    private boolean setupAsked = false;
+
+    private final CollectorSettings.Setup setup = new CollectorSettings.Setup();
+
+    // Tick thread only; null when no line waits.
+    private java.util.List<String> setupLines = null;
+
+    private int setupLineAt = 0;
+
     ChunkCapture(MapStorage storage) {
         this(storage, new ShareSender());
     }
@@ -183,8 +258,9 @@ public final class ChunkCapture {
     ChunkCapture(MapStorage storage, ShareSender share) {
         this.storage = storage;
         this.share = share;
+        this.world = new CollectorCartographerWorld(storage);
+        this.ground = new CollectorCartographerGround(storage, world);
 
-        // Set last, so no other thread sees a half-built instance.
         live = this;
     }
 
@@ -192,8 +268,7 @@ public final class ChunkCapture {
         storage.setLegacyColourConverter(LandCoverClassifier::fromLegacyColour);
 
         net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.JOIN.register(
-                (handler, sender, client) ->
-                        storage.setRoot(worldRoot(client, LandNav.config())));
+                (handler, sender, client) -> joined(client));
 
         net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents.CHUNK_LOAD
                 .register((loaded, chunk) ->
@@ -201,21 +276,21 @@ public final class ChunkCapture {
 
         Sandpaper.scheduler().register(
                 JobSpec.everyMillis(Lane.TICK, SCAN_INTERVAL_MILLIS)
-                        .withOwner(LandNav.MOD_ID)
+                        .withOwner(CollectorMod.MOD_ID)
                         .withPriority(Priority.LOW)
                         .neverDrop()
                         .withLabel("geosurvey-scan"),
                 tick -> scan(tick));
 
         captureHandle = Sandpaper.scheduler().registerSliced(
-                JobSpec.everyPump(Lane.TICK).withOwner(LandNav.MOD_ID)
+                JobSpec.everyPump(Lane.TICK).withOwner(CollectorMod.MOD_ID)
                         .neverDrop()
                         .withLabel("geosurvey-capture"),
                 this::captureOne);
         captureHandle.setPaused(true);
 
         handshakeHandle = Sandpaper.scheduler().registerSliced(
-                JobSpec.everyPump(Lane.TICK).withOwner(LandNav.MOD_ID)
+                JobSpec.everyPump(Lane.TICK).withOwner(CollectorMod.MOD_ID)
                         .neverDrop()
                         .withLabel("geosurvey-handshake"),
                 this::handshakeStep);
@@ -223,11 +298,45 @@ public final class ChunkCapture {
 
         Sandpaper.scheduler().register(
                 JobSpec.everyMillis(Lane.TICK, SAVE_INTERVAL_MILLIS)
-                        .withOwner(LandNav.MOD_ID)
+                        .withOwner(CollectorMod.MOD_ID)
                         .withPriority(Priority.LOW)
                         .neverDrop()
                         .withLabel("geosurvey-save"),
                 tick -> saveDirtyInBackground(tick));
+
+        Handle imports = Sandpaper.scheduler().registerSliced(
+                JobSpec.everyPump(Lane.TICK).withOwner(CollectorMod.MOD_ID)
+                        .neverDrop()
+                        .withLabel("openmap-import"),
+                ground::importStep);
+        imports.setPaused(true);
+        ground.drainWith(imports);
+    }
+
+    // Client thread; the player joined a server or a single-player world.
+    void joined(Minecraft client) {
+        rootAt(worldRoot(client, LandNav.config()), uploadLabel(shareServer(client)));
+        world.followRoot(storage.root());
+    }
+
+    // Moves the store's root, then the share name of its server; the tick thread. label may be null: no server.
+    void rootAt(Path root, String label) {
+        storage.setRoot(root);
+        rootServer = shareName(label);
+    }
+
+    // The share name of the server whose world the store's root holds, or null; any thread.
+    String rootServer() {
+        return rootServer;
+    }
+
+    // Tick thread only; the usable name of a label, made again only when the label changes.
+    private String shareName(String label) {
+        if (label != null && !label.equals(namedLabel)) {
+            namedAs = Batch.usableServerName(label);
+            namedLabel = label;
+        }
+        return label == null ? null : namedAs;
     }
 
     Step handshakeStep(Tick tick) {
@@ -242,12 +351,13 @@ public final class ChunkCapture {
     }
 
     void unregister() {
-        Sandpaper.scheduler().cancelAllFor(LandNav.MOD_ID);
+        Sandpaper.scheduler().cancelAllFor(CollectorMod.MOD_ID);
+        ground.stopImports();
 
         share.sync(LandNav.config(), null, null);
         share.standing(null);
 
-        Sandpaper.workPool().cancelAllFor(LandNav.MOD_ID);
+        Sandpaper.workPool().cancelAllFor(CollectorMod.MOD_ID);
         takeBackDroppedSaves();
         storage.flushQuietly();
         share.close();
@@ -262,25 +372,44 @@ public final class ChunkCapture {
         return currentDimension.isEmpty() ? null : storage.store(currentDimension);
     }
 
+    CollectorCartographerWorld world() {
+        return world;
+    }
+
+    CollectorCartographerGround ground() {
+        return ground;
+    }
+
 
     private static final int MAX_NOTICES_PER_SCAN = 3;
+
+    private static final String EMPTY_LIST_LINE = CollectorSettings.Setup.CHAT_PREFIX
+            + "Contribute ground is off: the"
+            + " approved-server list is empty. Add a server with /geosurvey server add"
+            + " <host>, or turn contribute ground on for"
+            + " every server.";
 
     private void scan(Tick tick) {
         long deadline = System.nanoTime() + tick.remainingNanos();
         Minecraft client = Minecraft.getInstance();
         LandNavConfig config = LandNav.config();
+        resurveyBefore = resurveyCutoff(config);
         ClientLevel level = client.level;
         if (level == null || client.player == null) {
             CollectorFinder.worldLeft();
+            world.left();
             share.sync(config, null, null);
             share.closeGroundReading();
             share.standing(null);
             pending.clear();
             queued.clear();
             unloaded.clear();
+            voidChunks.clear();
             backlogRotationCurrent = false;
             currentDimension = "";
             scannedLevel = null;
+            setupOwed = true;
+            setupLines = null;
             scanRestart();
             if (handshakeHandle != null) {
                 handshakeHandle.setPaused(true);
@@ -288,17 +417,18 @@ public final class ChunkCapture {
             return;
         }
         sayApprovedPorts(client, config);
+        noteEmptyServerList(config);
         String server = shareServer(client);
-        String uploadServer = rawServerIp(client);
+        String uploadServer = uploadLabel(server);
         boolean contributing = sharing(config, server);
         if (!contributing) {
             share.sync(config, null, null);
             share.standing(null);
             tell(client, server);
         }
-        // Notices are written on the share thread; read here on the tick thread.
         sayNotices(client);
-        storage.setRoot(worldRoot(client, config));
+        rootAt(worldRoot(client, config), uploadServer);
+        world.followRoot(storage.root());
         followLevel(level);
         MapStore store = storage.store(currentDimension);
 
@@ -309,6 +439,7 @@ public final class ChunkCapture {
                 scannedDimensionKey = dimensionKey;
             }
             String dimensionId = scannedDimensionText;
+            chooseCollector(config, server);
             share.sync(config, uploadServer,
                     dimensionId);
             if (uploadServer != null) {
@@ -328,6 +459,7 @@ public final class ChunkCapture {
                         client.player.blockPosition().getZ());
             }
         }
+        noteSetup(config, contributing);
 
         int centreX = client.player.blockPosition().getX() >> CHUNK_BLOCK_SHIFT;
         int centreZ = client.player.blockPosition().getZ() >> CHUNK_BLOCK_SHIFT;
@@ -366,6 +498,9 @@ public final class ChunkCapture {
         } else {
             at = scanResume(centreX, centreZ, radius, store, revisions);
             lapRevisions = at == 0 ? revisions : scanCursorRevisions;
+            if (at == 0) {
+                lapOldestStamp = NOTHING_TO_RESURVEY;
+            }
             store.allowRegionLoads(1);
             try {
                 int walked = 0;
@@ -377,13 +512,16 @@ public final class ChunkCapture {
                     int cx = centreX + dev.openmap.map.Spiral.x(offset);
                     int cz = centreZ + dev.openmap.map.Spiral.z(offset);
                     long key = MapStore.key(cx, cz);
-                    if (!queued.contains(key) && (unloaded.isEmpty() || !unloaded.contains(key))) {
+                    if (!queued.contains(key) && (unloaded.isEmpty() || !unloaded.contains(key))
+                            && (voidChunks.isEmpty() || !voidChunks.contains(key))) {
                         ChunkSample existing = store.peek(cx, cz);
                         boolean missing = existing == null;
                         if (missing) {
                             requestMissingRegion(store, cx, cz);
+                        } else {
+                            noteLapStamp(existing);
                         }
-                        if (missing || !existing.isCurrent()) {
+                        if (missing || !existing.isCurrent() || dueForResurvey(existing)) {
                             queued.add(key);
                             pending.enqueue(key);
                         }
@@ -411,6 +549,7 @@ public final class ChunkCapture {
             pending.clear();
             queued.clear();
             unloaded.clear();
+            voidChunks.clear();
             backlogRotationCurrent = false;
             scanRestart();
         }
@@ -421,11 +560,12 @@ public final class ChunkCapture {
             pending.clear();
             queued.clear();
             unloaded.clear();
+            voidChunks.clear();
             backlogRotationCurrent = false;
             scanRestart();
         }
         if (Sandpaper.isReady()) {
-            storage.loadLandmarksInBackground(Sandpaper.workPool(), LandNav.MOD_ID,
+            storage.loadLandmarksInBackground(Sandpaper.workPool(), CollectorMod.MOD_ID,
                     currentDimension);
         }
     }
@@ -454,6 +594,7 @@ public final class ChunkCapture {
         scanCursorStore = null;
         scanComplete = false;
         scanCompleteStore = null;
+        scanCompleteOldestStamp = NOTHING_TO_RESURVEY;
     }
 
     void rememberUnloaded(long key) {
@@ -463,13 +604,24 @@ public final class ChunkCapture {
     }
 
     void chunkLoaded(int chunkX, int chunkZ) {
-        if (!unloaded.isEmpty() && unloaded.remove(MapStore.key(chunkX, chunkZ))) {
+        long key = MapStore.key(chunkX, chunkZ);
+        boolean changed = unloaded.remove(key);
+        if (voidChunks.remove(key)) {
+            changed = true;
+        }
+        if (changed) {
             scanComplete = false;
         }
     }
 
     int rememberedUnloaded() {
         return unloaded.size();
+    }
+
+    private void rememberVoid(long key) {
+        if (voidChunks.size() < MAX_VOID_CHUNKS) {
+            voidChunks.add(key);
+        }
     }
 
     boolean scanIsComplete(int centreX, int centreZ, int radius, MapStore store,
@@ -480,7 +632,18 @@ public final class ChunkCapture {
                 && scanCompleteCentreZ == centreZ
                 && scanCompleteRadius == radius
                 && scanCompleteStore == store
-                && scanCompleteRevisions == revisions;
+                && scanCompleteRevisions == revisions
+                && !heldGroundIsDue();
+    }
+
+    private boolean heldGroundIsDue() {
+        return resurveyBefore >= scanCompleteOldestStamp;
+    }
+
+    private void noteLapStamp(ChunkSample held) {
+        if (held.hasWallClockCapture() && held.capturedAt() < lapOldestStamp) {
+            lapOldestStamp = held.capturedAt();
+        }
     }
 
     void markScanComplete(int centreX, int centreZ, int radius, MapStore store,
@@ -493,6 +656,7 @@ public final class ChunkCapture {
         scanCompleteRadius = radius;
         scanCompleteStore = store;
         scanCompleteRevisions = revisions;
+        scanCompleteOldestStamp = lapOldestStamp;
     }
 
     void dropBacklogOutOfReach(int centreX, int centreZ, int reach) {
@@ -522,7 +686,7 @@ public final class ChunkCapture {
             return;
         }
         regionLoadCalls++;
-        storage.loadRegionInBackground(Sandpaper.workPool(), LandNav.MOD_ID,
+        storage.loadRegionInBackground(Sandpaper.workPool(), CollectorMod.MOD_ID,
                 currentDimension, store, MapRegion.of(cx), MapRegion.of(cz));
     }
 
@@ -560,6 +724,17 @@ public final class ChunkCapture {
 
     static String shareServer(Minecraft client) {
         return WorldDirectories.shareServer(client);
+    }
+
+    // Null off a server.
+    static String joinedServer() {
+        Minecraft client = Minecraft.getInstance();
+        return client == null ? null : shareServer(client);
+    }
+
+    // Empty unless the address is in a known group.
+    static String knownCollector(String serverAddress) {
+        return ApprovedServers.knownCollector(serverAddress);
     }
 
 
@@ -619,27 +794,30 @@ public final class ChunkCapture {
         SystemToast.addOrUpdate(client.gui.toastManager(), APPROVED_PORTS_TOAST,
                 Component.translatableWithFallback(
                         "openmap-collect.toast.approved_ports.title",
-                        "Approved servers now match the port you typed"),
+                        "Approved servers match the port you typed"),
                 Component.translatableWithFallback(
                         "openmap-collect.toast.approved_ports.body",
                         "An entry with a port approves only that host and port."
                                 + " An entry with no port,"
-                                + " or one"
-                                + " naming " + DEFAULT_PORT + ", approves that"
+                                + " or port " + DEFAULT_PORT + ", approves that"
                                 + " host on any"
                                 + " port."));
         LOGGER.info("[openmap-collect] an approved-server entry with a port"
-                + " matches that host and port only. An entry with no port,"
-                + " or naming 25565, matches any port on that host."
-                + " Ground already on disk is untouched."
-                + "");
+                + " approves only that host and port. An entry with no port,"
+                + " or naming 25565, approves that host"
+                + " on any port.");
     }
 
     private void sayNotices(Minecraft client) {
         if (client.gui == null) {
             return;
         }
-        for (int said = 0; said < MAX_NOTICES_PER_SCAN; said++) {
+        int first = sayOnce(client, emptyListNotice);
+        emptyListNotice = null;
+        first += sayOnce(client, chosenNotice);
+        chosenNotice = null;
+        first += saySetup(client, MAX_NOTICES_PER_SCAN - first);
+        for (int said = first; said < MAX_NOTICES_PER_SCAN; said++) {
             String line = share.groundNotice();
             if (line == null) {
                 break;
@@ -669,8 +847,7 @@ public final class ChunkCapture {
                             + " server."
                     : "GeoSurvey is mapping " + key + " but not contributing."
                             + " Add it with"
-                            + " /geosurvey server add " + key + "."
-                            + "";
+                            + " /geosurvey server add " + key + ".";
             client.gui.hud.getChat().addClientSystemMessage(
                     Component.literal(said).withStyle(ChatFormatting.GRAY));
         }
@@ -678,6 +855,98 @@ public final class ChunkCapture {
 
     boolean sayOnce(String server) {
         return saidUnapproved.size() < MAX_NAMED_SERVERS && saidUnapproved.add(server);
+    }
+
+    // Tick thread only.
+    private void learn(String joined) {
+        if (joined != labelFor) {
+            labelFor = joined;
+            String key = joined == null ? null : serverWorldKey(joined);
+            String name = LandNavConfig.KnownServers.nameOf(key);
+            label = name.isEmpty() ? joined : name;
+            labelCollector = LandNavConfig.KnownServers.collectorOf(key);
+        }
+    }
+
+    // Tick thread only; a known group's name, else the address.
+    String uploadLabel(String joined) {
+        learn(joined);
+        return label;
+    }
+
+    // Tick thread only.
+    void chooseCollector(LandNavConfig config, String joined) {
+        learn(joined);
+        if (config.shareEnabled && !labelCollector.isEmpty() && blank(config.shareCollector)) {
+            config.shareCollector = labelCollector;
+            CollectorOptions.persistLive();
+            String host = serverKey(joined);
+            chosenNotice = "GeoSurvey set its collector address to " + labelCollector
+                    + " for " + host + ". Ground is uploaded there with your"
+                    + " Minecraft UUID; a shared claim or marker sends your player name.";
+            LOGGER.info("[openmap-collect] collector address set to {} for {}",
+                    labelCollector, host);
+        }
+    }
+
+    private static boolean blank(String text) {
+        return text == null || text.isBlank();
+    }
+
+    // Tick thread only.
+    private void noteEmptyServerList(LandNavConfig config) {
+        if (config.takeEmptyServerListTurnedOff()) {
+            emptyListNotice = EMPTY_LIST_LINE;
+        }
+    }
+
+    // line may be null.
+    private static int sayOnce(Minecraft client, String line) {
+        if (line == null) {
+            return 0;
+        }
+        client.gui.hud.getChat().addClientSystemMessage(Component.literal(
+                ShareCommand.drawable(line)).withStyle(ChatFormatting.GRAY));
+        return 1;
+    }
+
+    // Shows the setup at the next scan; tick thread only.
+    void showSetup() {
+        setupAsked = true;
+    }
+
+    // Tick thread only.
+    private void noteSetup(LandNavConfig config, boolean listed) {
+        if (!setupAsked && !(setupOwed && listed && config.shareEnabled && labelFor != null)) {
+            return;
+        }
+        boolean due = setupAsked;
+        if (!due) {
+            setup.read(config, share, labelFor, listed, false);
+            due = setup.missing();
+        }
+        if (due) {
+            setup.read(config, share, labelFor, listed, true);
+            setupLines = setup.said();
+            setupLineAt = 0;
+            setupAsked = false;
+            setupOwed = false;
+        }
+    }
+
+    private int saySetup(Minecraft client, int room) {
+        java.util.List<String> lines = setupLines;
+        int said = 0;
+        while (lines != null && said < room && setupLineAt < lines.size()) {
+            client.gui.hud.getChat().addClientSystemMessage(Component.literal(
+                    ShareCommand.drawable(lines.get(setupLineAt))).withStyle(ChatFormatting.GRAY));
+            setupLineAt++;
+            said++;
+        }
+        if (lines != null && setupLineAt >= lines.size()) {
+            setupLines = null;
+        }
+        return said;
     }
 
 
@@ -717,6 +986,7 @@ public final class ChunkCapture {
             pending.clear();
             queued.clear();
             unloaded.clear();
+            voidChunks.clear();
             backlogRotationCurrent = false;
             scanRestart();
             return Step.YIELD;
@@ -732,37 +1002,83 @@ public final class ChunkCapture {
     private Step captureQueued(ClientLevel level, long key, boolean resuming, long deadline) {
         int cx = MapStore.chunkX(key);
         int cz = MapStore.chunkZ(key);
-        if (resuming || !groundAlreadyCurrent(cx, cz)) {
+        ChunkSample held = resuming ? null : heldGround(cx, cz);
+        if (resuming || held == null || !held.isCurrent() || dueForResurvey(held)) {
             LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false);
             if (chunk == null) {
                 partial = null;
                 rememberUnloaded(key);
             } else {
-                ChunkSample done = sample(level, chunk, cx, cz, deadline);
-                if (done == null) {
-                    partialKey = key;
+                boolean floored = bedrockFloored(level.dimension());
+                if (floored && chunk.getSections() != null && chunk.getHighestFilledSectionIndex()
+                        == ChunkAccess.NO_FILLED_SECTION) {
+                    partial = null;
+                    rememberVoid(key);
                 } else {
-                    captured(currentDimension, done);
+                    ChunkSample done = sample(level, chunk, cx, cz, deadline, held);
+                    if (done == null) {
+                        if (!sampledUnchanged) {
+                            partialKey = key;
+                        }
+                    } else if (!floored || done.holdsGround()) {
+                        captured(currentDimension, done);
+                    } else {
+                        rememberVoid(key);
+                    }
                 }
             }
         }
         return Step.MORE;
     }
 
-    private boolean groundAlreadyCurrent(int cx, int cz) {
+    private ChunkSample heldGround(int cx, int cz) {
         MapStore store = storage.loadedStore(currentDimension);
         storage.countAsUse(currentDimension, store);
-        ChunkSample existing = store == null ? null : store.peek(cx, cz);
-        return existing != null && existing.isCurrent();
+        return store == null ? null : store.peek(cx, cz);
     }
 
     void captured(String dimension, ChunkSample sample) {
-        storage.store(dimension).put(sample);
+        MapStore store = storage.store(dimension);
+        ChunkSample held = store.peek(sample.chunkX, sample.chunkZ);
+        if (held != null && held.isCurrent() && sameGround(held, sample)) {
+            held.setCapturedAt(sample.capturedAt());
+            return;
+        }
+        store.put(sample);
         storage.markDirty(dimension);
+        ground.stored(dimension, sample);
         if (sharing()) {
             share.offer(sample);
         }
         capturedChunks++;
+    }
+
+    private static long resurveyCutoff(LandNavConfig config) {
+        if (!config.resurveyEnabled) {
+            return NEVER_RESURVEY;
+        }
+        return UtcClock.collector().nowMillis() - config.resurveySeconds * MILLIS_PER_SECOND;
+    }
+
+    private boolean dueForResurvey(ChunkSample held) {
+        return resurveyBefore != NEVER_RESURVEY && held.hasWallClockCapture()
+                && held.capturedAt() <= resurveyBefore;
+    }
+
+    private static boolean sameGround(ChunkSample first, ChunkSample second) {
+        for (int z = 0; z < ChunkSample.SIZE; z++) {
+            for (int x = 0; x < ChunkSample.SIZE; x++) {
+                if (first.height(x, z) != second.height(x, z)
+                        || first.coverOrdinal(x, z) != second.coverOrdinal(x, z)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean bedrockFloored(ResourceKey<Level> dimension) {
+        return Level.OVERWORLD.equals(dimension) || Level.NETHER.equals(dimension);
     }
 
     private static final class MutableSurface implements ChunkSampler.Surface {
@@ -780,10 +1096,25 @@ public final class ChunkCapture {
 
     private final ChunkSampler.Scratch scratch = ChunkSampler.newScratch();
 
-    // Null when a budget stops before the chunk finishes.
+    private final ChunkSample resurveyScratch = ChunkSample.forFullWriter(0, 0);
+
+    private boolean sampledUnchanged;
+
+    // Null if the budget ends first or held ground is unchanged.
     private ChunkSample sample(ClientLevel level, LevelChunk chunk, int cx, int cz,
-                               long deadline) {
-        ChunkSample out = partial != null ? partial : ChunkSample.forFullWriter(cx, cz);
+                               long deadline, ChunkSample held) {
+        sampledUnchanged = false;
+        boolean reusing = partial == null && held != null && held.isCurrent()
+                && dueForResurvey(held);
+        ChunkSample out;
+        if (partial != null) {
+            out = partial;
+        } else if (reusing) {
+            resurveyScratch.resetForFullWriter(cx, cz);
+            out = resurveyScratch;
+        } else {
+            out = ChunkSample.forFullWriter(cx, cz);
+        }
         int at = partial != null ? partialColumn : 0;
         surface.chunk = chunk;
         try {
@@ -797,16 +1128,19 @@ public final class ChunkCapture {
         }
         ChunkSample result;
         if (at < ChunkSample.COLUMNS) {
-            partial = out;
+            partial = reusing ? out.copyForFullWriter() : out;
             partialColumn = at;
             result = null;
         } else {
             partial = null;
-            result = out;
-        }
-        // Epoch milliseconds, not the world's game time.
-        if (result != null) {
-            out.setCapturedAt(System.currentTimeMillis());
+            out.setCapturedAt(UtcClock.collector().nowMillis());
+            if (reusing && sameGround(held, out)) {
+                held.setCapturedAt(out.capturedAt());
+                sampledUnchanged = true;
+                result = null;
+            } else {
+                result = reusing ? out.copyForFullWriter() : out;
+            }
         }
         return result;
     }
@@ -824,6 +1158,7 @@ public final class ChunkCapture {
         takeBackDroppedSaves();
         storage.endSaveCycles();
         boolean[] stopAfterThisEntry = {false};
+        Path savingRoot = storage.root();
         storage.forEachLoadedStore((dimension, live) -> {
             if (stopAfterThisEntry[0] || System.nanoTime() >= deadline) {
                 stopAfterThisEntry[0] = true;
@@ -862,15 +1197,15 @@ public final class ChunkCapture {
                 ChunkSample[] held = prepared.all().toArray(new ChunkSample[0]);
 
                 java.util.function.Consumer<Boolean> onFinished = ok -> {
-                    // Runs on the tick thread.
+                    // Tick thread only.
                     inFlightSaves.remove(queued.receipt);
                     savesFinished++;
                     if (!Boolean.TRUE.equals(ok)) {
                         savesFailed++;
                         storage.countAsUse(dimension, live);
                         if (!storage.holds(dimension, live)) {
-                            LOGGER.warn("region save failed for {} {},{}."
-                                + " The world is"
+                            LOGGER.warn("region save failed for {} {},{};"
+                                + " the world is"
                                 + " gone."
                                 + " Filed"
                                 + " against {} for the"
@@ -880,11 +1215,13 @@ public final class ChunkCapture {
                             live.markRegionDirty(rx, rz);
                             storage.markDirty(dimension);
                         }
+                    } else {
+                        ground.saved(savingRoot, dimension, rx, rz);
                     }
                 };
 
                 boolean queuedOk = Sandpaper.workPool().submit(
-                        LandNav.MOD_ID,
+                        CollectorMod.MOD_ID,
                         () -> {
                             Boolean saved;
                             try {
@@ -962,7 +1299,7 @@ public final class ChunkCapture {
                         storage.fileDroppedRegionWrite(queued.dimension, queued.store,
                                 queued.regionX, queued.regionZ, queued.file, carried);
                     }
-                    LOGGER.warn("geosurvey queued {} {},{} and"
+                    LOGGER.warn("geosurvey queued {} {},{};"
                             + " the work pool" + how + "."
                             + " Handed"
                             + " to storage,"
@@ -970,7 +1307,7 @@ public final class ChunkCapture {
                             + " the next flush.", queued.dimension,
                             queued.regionX, queued.regionZ, queued.file);
                 } else {
-                    LOGGER.warn("geosurvey queued {} {},{} and"
+                    LOGGER.warn("geosurvey queued {} {},{};"
                             + " the work pool" + how + "."
                             + " Nothing was carried back:"
                             + " lost, aimed"
@@ -989,7 +1326,7 @@ public final class ChunkCapture {
                     }
                     queued.store.markRegionDirty(queued.regionX, queued.regionZ);
                     storage.markDirty(queued.dimension);
-                    LOGGER.warn("geosurvey queued {} {},{} and"
+                    LOGGER.warn("geosurvey queued {} {},{};"
                     + " the work pool" + how + "."
                     + " Put back, will write to {}.",
                     queued.dimension, queued.regionX, queued.regionZ,
@@ -1076,11 +1413,18 @@ public final class ChunkCapture {
         }
 
         static boolean gatesOn(LandNavConfig config, String serverAddress) {
+            return listedAs(config, serverAddress, false);
+        }
+
+        // asOneServer: also match entries for group members.
+        private static boolean listedAs(LandNavConfig config, String serverAddress,
+                boolean asOneServer) {
             String host = serverKey(serverAddress);
             if (host.isEmpty()) {
                 return false;
             }
             String joined = serverWorldKey(serverAddress, host);
+            String group = asOneServer ? LandNavConfig.KnownServers.nameOf(joined) : "";
             boolean approved = false;
             for (String entry : approvedServers(config)) {
                 if (entry != null) {
@@ -1091,6 +1435,10 @@ public final class ChunkCapture {
                         break;
                     }
                     if (named.equals(host) && entryKey.key().equals(host)) {
+                        approved = true;
+                        break;
+                    }
+                    if (!group.isEmpty() && group.equals(LandNavConfig.KnownServers.nameOf(named))) {
                         approved = true;
                         break;
                     }
@@ -1114,17 +1462,21 @@ public final class ChunkCapture {
         }
 
         static boolean gating(LandNavConfig config) {
-            return config != null
-                    && (config.approvedServersConfigured
-                            || !approvedServers(config).isEmpty());
+            return config != null && !approvedServers(config).isEmpty();
         }
 
         static boolean approved(LandNavConfig config, String serverAddress) {
-            // Null means singleplayer; always surveyed.
+            // Null means singleplayer.
             if (serverAddress == null) {
                 return true;
             }
-            return !gating(config) || gatesOn(config, serverAddress);
+            return !gating(config) || listedAs(config, serverAddress, true);
+        }
+
+        // Any thread.
+        static String knownCollector(String address) {
+            return address == null ? "" : LandNavConfig.KnownServers.collectorOf(
+                    serverWorldKey(address, CollectorGuess.hostOf(address)));
         }
 
         boolean sharing(LandNavConfig config, String server) {
@@ -1178,6 +1530,10 @@ public final class ChunkCapture {
             } else {
                 String typed = address.trim().toLowerCase(java.util.Locale.ROOT);
                 int port = key.length() + 1;
+                boolean rootDotted = typed.length() > port && typed.charAt(port - 1) == '.';
+                if (rootDotted) {
+                    port++;
+                }
                 if (typed.length() <= port || !typed.startsWith(key)
                         || typed.charAt(port - 1) != ':') {
                     worldKey = key;
@@ -1191,7 +1547,8 @@ public final class ChunkCapture {
                             && typed.startsWith(DEFAULT_PORT, digits)) {
                         worldKey = key;
                     } else {
-                        worldKey = digits == port ? typed : key + ":" + typed.substring(digits);
+                        worldKey = rootDotted || digits != port
+                                ? key + ":" + typed.substring(digits) : typed;
                     }
                 }
             }
@@ -1267,7 +1624,7 @@ public final class ChunkCapture {
             return levelId;
         }
 
-        // Returns null if the path has no file name.
+        // Null if the path has no file name.
         static String saveFolderName(Path worldPath) {
             if (worldPath == null) {
                 return null;
@@ -1281,7 +1638,7 @@ public final class ChunkCapture {
         }
 
         static String singleplayerPrior(String saveFolder, String displayName) {
-            return saveFolder == null ? "singleplayer-" + displayName : null;
+            return saveFolder == null ? MapStorage.saveKeyPrefix() + displayName : null;
         }
 
         public static void noteTransferTarget(String host, int port, ServerData from) {
@@ -1335,7 +1692,7 @@ public final class ChunkCapture {
             if (address != null) {
                 key = ApprovedServers.serverWorldKey(address, host);
             } else {
-                key = local == null ? "unknown" : "singleplayer-" + levelId(local);
+                key = local == null ? "unknown" : MapStorage.saveKeyPrefix() + levelId(local);
             }
             Path root;
             if (rootPath != null && key.equals(rootKey)) {

@@ -8,7 +8,7 @@ public enum MinimapView {
 
     CAVE_FRONT("Cave elevation, north", dev.openmap.map.CaveProjection.View.FRONT),
 
-    // The compass word is the direction the observer faces.
+    // The compass word is the facing direction.
     CAVE_SIDE("Cave elevation, west", dev.openmap.map.CaveProjection.View.SIDE);
 
     private final String label;

@@ -1,8 +1,8 @@
 package dev.openmap.client;
 
 import dev.openmap.LandNav;
+import dev.openmap.json.AtomicFileReplace;
 import dev.openmap.config.LandNavConfig;
-import dev.openmap.map.MapStorage;
 import dev.sandpaper.Sandpaper;
 import dev.sandpaper.api.settings.OptionSpec;
 import dev.sandpaper.api.settings.SettingsContributor;
@@ -22,13 +22,11 @@ import net.minecraft.client.gui.components.toasts.SystemToast;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
-// How this artifact's settings reach the screen sandpaper hosts.
-// Constructed by the SettingsContributor entrypoint in fabric.mod.json; no code here
-// calls it.
+// Constructed by the sandpaper-settings entrypoint.
 public final class CollectorOptions implements SettingsContributor {
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
     private static final Identifier PAGE =
             Identifier.fromNamespaceAndPath(CollectorMod.MOD_ID, "contributing");
@@ -55,22 +53,6 @@ public final class CollectorOptions implements SettingsContributor {
 
     private static final Component ENABLED_DESCRIPTION =
             Component.translatable("openmap-collect.option.enabled.desc");
-
-    private static final Component SESSION_PROOF_LABEL =
-            Component.translatable("openmap-collect.option.session_proof");
-
-    private static final Component SESSION_PROOF_DESCRIPTION =
-            Component.translatable("openmap-collect.option.session_proof.desc");
-
-    private static final Component GATE_LABEL =
-            Component.translatable("openmap-collect.option.gate");
-
-    private static final Component GATE_DESCRIPTION =
-            Component.translatable("openmap-collect.option.gate.desc");
-
-    private static final List<Component> GATE_LABELS =
-            List.of(Component.translatable("openmap-collect.option.gate.all"),
-                    Component.translatable("openmap-collect.option.gate.listed"));
 
     private static final Component SERVERS_LABEL =
             Component.translatable("openmap-collect.option.servers");
@@ -139,37 +121,57 @@ public final class CollectorOptions implements SettingsContributor {
     // Null until the first pages() call.
     private Staged staged;
 
-    // The five settings while the reader is editing them.
+    private CollectorAddressCheck addressCheck;
+
     private static final class Staged {
+        private final LandNavConfig live;
+        private final CollectorAddressCheck check;
         private String collector;
         private boolean enabled;
-        private boolean sessionProof;
-        private boolean gating;
+        private boolean claimGreetings;
         private String servers;
         private String cleartextOf;
         private boolean cleartext;
+
+        // The address isCleartext() last read, trimmed.
+        private String trimmed = "";
+
+        private Staged(LandNavConfig live, CollectorAddressCheck check) {
+            this.live = live;
+            this.check = check;
+        }
 
         private boolean isCleartext() {
             String address = collector;
             if (!address.equals(cleartextOf)) {
                 cleartextOf = address;
-                cleartext = ShareCommand.cleartextAwayFromHome(address.trim());
+                trimmed = address.trim();
+                cleartext = ShareCommand.cleartextAwayFromHome(trimmed);
             }
             return cleartext;
         }
 
         private CollectorSettings.Draft draft() {
-            return new CollectorSettings.Draft(
-                    collector, enabled, sessionProof, gating, servers);
+            return new CollectorSettings.Draft(collector, enabled, servers, claimGreetings);
+        }
+
+        private void turned(boolean on) {
+            enabled = on;
+            if (on && collector.isBlank()) {
+                String known = ChunkCapture.knownCollector(ChunkCapture.joinedServer());
+                if (!known.isEmpty()) {
+                    collector = known;
+                    check.trusted(known);
+                }
+            }
         }
     }
 
-    // Reads nothing; everything is read when the screen opens.
     public CollectorOptions() {
-        this(LandNav::config, LandNav::stageWrite, Sandpaper::workPool);
+        this(LandNav::config, () -> new InlineWrite(LandNav::saveOrThrow), Sandpaper::workPool);
     }
 
-    // For tests: a config supplier and a write a test can hand it directly.
+    // For tests.
     CollectorOptions(Supplier<LandNavConfig> live, Saver saver) {
         this(live, inline(saver), null);
     }
@@ -190,49 +192,35 @@ public final class CollectorOptions implements SettingsContributor {
         LandNavConfig defaults = DEFAULTS;
 
         staged = null;
-        Staged editing = new Staged();
+        CollectorAddressCheck check = newAddressCheck(now);
+        Staged editing = new Staged(now, check);
         editing.collector = now.shareCollector == null ? "" : now.shareCollector;
         editing.enabled = now.shareEnabled;
-        editing.sessionProof = now.shareSessionProof;
-        editing.gating = ChunkCapture.gating(now);
+        editing.claimGreetings = now.claimGreetings;
         editing.servers = String.join(", ", ChunkCapture.approvedServers(now));
+        check.opensOn(editing.collector);
+        addressCheck = check;
         staged = editing;
+
+        OptionSpec status = new OptionSpec.Button(
+                CollectorSettings.Setup.now(now, ShareSender.live()).statusLine(),
+                CollectorSettings.STATUS_DESCRIPTION,
+                CollectorSettings.STATUS_BUTTON,
+                CollectorOptions::showSteps);
 
         OptionSpec collector = new OptionSpec.Text(
                 COLLECTOR_LABEL,
                 COLLECTOR_DESCRIPTION,
                 defaults.shareCollector == null ? "" : defaults.shareCollector,
                 editing.collector,
-                typed -> editing.collector = typed,
-                null,
                 typed -> {
-                    // Typing an address turns contributing on; going back to blank does
-                    // not turn it off.
-                    boolean wasBlank = editing.collector.isBlank();
                     editing.collector = typed;
-                    if (wasBlank && !typed.isBlank() && !editing.enabled) {
-                        if (ShareCommand.looksUsable(typed.trim())
-                                && !editing.isCleartext()) {
-                            editing.enabled = true;
-                        }
-                    } else if (editing.enabled && editing.isCleartext()) {
-                        editing.enabled = false;
-                    } else {
-                    }
+                    check.typed(typed);
                 },
+                null,
+                typed -> editing.collector = typed,
                 () -> editing.collector,
-                typed -> {
-                    String address = typed.trim();
-                    if (address.isEmpty()) {
-                        return null;
-                    }
-                    if (!ShareCommand.looksUsable(address)) {
-                        return Component.translatable("openmap-collect.status.not_an_address");
-                    }
-                    return ShareCommand.cleartextAwayFromHome(address)
-                            ? Component.translatable("openmap-collect.status.cleartext")
-                            : null;
-                });
+                check::review);
 
         OptionSpec enabled = new OptionSpec.Toggle(
                 ENABLED_LABEL,
@@ -240,38 +228,11 @@ public final class CollectorOptions implements SettingsContributor {
                 defaults.shareEnabled,
                 editing.enabled,
                 on -> editing.enabled = on,
-                // Greyed only where it would arm, never where it would withdraw.
-                () -> editing.enabled || !editing.isCleartext(),
-                on -> editing.enabled = on,
+                // Greyed only where it would arm.
+                () -> editing.enabled || (!editing.isCleartext()
+                        && !editing.check.awaitsAnswer(editing.live.shareCollector, editing.trimmed)),
+                on -> editing.turned(on),
                 () -> editing.enabled);
-
-        OptionSpec sessionProof = new OptionSpec.Toggle(
-                SESSION_PROOF_LABEL,
-                SESSION_PROOF_DESCRIPTION,
-                defaults.shareSessionProof,
-                editing.sessionProof,
-                on -> editing.sessionProof = on,
-                null,
-                on -> editing.sessionProof = on,
-                () -> editing.sessionProof);
-
-        OptionSpec gate = new OptionSpec.Choice(
-                GATE_LABEL,
-                GATE_DESCRIPTION,
-                GATE_LABELS,
-                // Index 0 is every server; index 1 is only the servers listed.
-                defaults.approvedServersConfigured ? 1 : 0,
-                editing.gating ? 1 : 0,
-                index -> editing.gating = index == 1,
-                null,
-                index -> {
-                    editing.gating = index == 1;
-                    if (index == 0) {
-                        // Clears the list too, so a leftover entry cannot keep the gate armed.
-                        editing.servers = "";
-                    }
-                },
-                () -> editing.gating ? 1 : 0);
 
         OptionSpec servers = new OptionSpec.Text(
                 SERVERS_LABEL,
@@ -279,9 +240,19 @@ public final class CollectorOptions implements SettingsContributor {
                 "",
                 editing.servers,
                 typed -> editing.servers = typed,
-                () -> editing.gating,
+                null,
                 typed -> editing.servers = typed,
                 () -> editing.servers);
+
+        OptionSpec claimGreetings = new OptionSpec.Toggle(
+                CollectorSettings.CLAIM_GREETINGS_LABEL,
+                CollectorSettings.CLAIM_GREETINGS_DESCRIPTION,
+                defaults.claimGreetings,
+                editing.claimGreetings,
+                on -> editing.claimGreetings = on,
+                () -> true,
+                on -> editing.claimGreetings = on,
+                () -> editing.claimGreetings);
 
         return List.of(new SettingsPage(
                 PAGE,
@@ -289,40 +260,78 @@ public final class CollectorOptions implements SettingsContributor {
                 List.of(
                         new SettingsGroup(
                                 CONTRIBUTING_GROUP_TITLE,
-                                List.of(collector, enabled, sessionProof)),
+                                List.of(status, collector, enabled)),
                         new SettingsGroup(
                                 SERVERS_GROUP_TITLE,
-                                List.of(gate, servers)))));
+                                List.of(servers)),
+                        new SettingsGroup(
+                                CollectorSettings.CLAIM_GREETINGS_GROUP_TITLE,
+                                List.of(claimGreetings)))));
     }
 
-    // Apply: hand the staged values to the one rule that writes them, then save.
     @Override
     public boolean save() {
         Staged taken = staged;
         if (taken == null) {
-            // True: nothing was shown, so nothing needed saving.
             return true;
         }
         staleRetries.set(0);
         staleWriteSaid = false;
-        CollectorSettings.write(live.get(), taken.draft());
+        CollectorAddressCheck check = addressCheck;
+        if (check == null) {
+            return false;
+        }
+        CollectorSettings.write(live.get(), taken.draft(), check);
         sayDroppedServers(taken.draft());
         LandNav.Write write = stage();
         return write != null && lands(write);
     }
 
-    private static void sayDroppedServers(CollectorSettings.Draft draft) {
-        if (!draft.gating()) {
-            return;
+    @Override
+    public void screenOpened(SettingsContributor.Rules rules) {
+        CollectorAddressCheck check = addressCheck;
+        if (check != null) {
+            check.opened(rules);
         }
+    }
+
+    CollectorAddressCheck addressCheck() {
+        return addressCheck;
+    }
+
+    // Shows in chat at the next scan; client thread only.
+    private static void showSteps() {
+        ChunkCapture capture = ChunkCapture.live();
+        if (capture != null) {
+            capture.showSetup();
+        }
+    }
+
+    static CollectorAddressCheck newAddressCheck(LandNavConfig config) {
+        return new CollectorAddressCheck(config,
+                Component.translatable("openmap-collect.status.checking"),
+                Component.translatable("openmap-collect.status.no_answer"),
+                Component.translatable("openmap-collect.status.cleartext"),
+                Component.translatable("openmap-collect.status.not_an_address"));
+    }
+
+    // Writes like Done; client thread only.
+    static boolean persistLive() {
+        CollectorOptions writer =
+                new CollectorOptions(LandNav::config,
+                        () -> new InlineWrite(LandNav::saveOrThrow), Sandpaper::workPool);
+        LandNav.Write write = writer.stage();
+        return write != null && writer.lands(write);
+    }
+
+    private static void sayDroppedServers(CollectorSettings.Draft draft) {
         List<String> dropped = CollectorSettings.droppedKeys(draft.servers());
         if (dropped.isEmpty()) {
             return;
         }
         String names = String.join(", ", dropped);
         LOGGER.warn("[openmap-collect] dropped " + names
-                + " from the approved-server list: not a server address."
-                + " The rest was saved.");
+                + " from the approved-server list: not a server address.");
         Minecraft client = Minecraft.getInstance();
         if (client != null && client.gui != null) {
             SystemToast.addOrUpdate(client.gui.toastManager(), DROPPED_SERVERS_TOAST,
@@ -331,8 +340,7 @@ public final class CollectorOptions implements SettingsContributor {
                             "Some approved servers were not added"),
                     Component.translatableWithFallback(
                             "openmap-collect.toast.dropped_servers.body",
-                            "%s is not a server address this mod can read. Not approved."
-                                    + " The rest of the list was saved.",
+                            "%s is not a server address.",
                             names));
         }
     }
@@ -384,17 +392,17 @@ public final class CollectorOptions implements SettingsContributor {
         if (write == null) {
             return;
         }
-        MapStorage.FileReplace.beginNoWait();
+        AtomicFileReplace.beginNoWait();
         try {
             write.write();
         } catch (IOException | RuntimeException broken) {
-            if (broken instanceof MapStorage.FileReplace.Refused) {
+            if (broken instanceof AtomicFileReplace.Refused) {
                 PENDING_SHUTDOWN.compareAndSet(null, write);
             }
-            LOGGER.warn("[openmap-collect] could not write the settings the client"
-                    + " stopped before saving", broken);
+            LOGGER.warn("[openmap-collect] could not write the settings"
+                    + " at shutdown", broken);
         } finally {
-            MapStorage.FileReplace.endNoWait();
+            AtomicFileReplace.endNoWait();
         }
     }
 
@@ -427,7 +435,7 @@ public final class CollectorOptions implements SettingsContributor {
     private void neverRan() {
         writesAflight.decrementAndGet();
         saidWith(new IOException(
-                "the work pool let the settings write go before it ran"));
+                "the work pool dropped the settings write unrun"));
     }
 
     private void returned(LandNav.Write write, Throwable failure) {
@@ -486,22 +494,21 @@ public final class CollectorOptions implements SettingsContributor {
                         "GeoSurvey Cartographer settings not saved"),
                 Component.translatableWithFallback(
                         "openmap-collect.toast.save_failed.body",
-                        "Not saved. Check the log."));
+                        "Check the log."));
         return true;
     }
 
     private boolean writeHere(LandNav.Write write) {
         boolean landed;
-        MapStorage.FileReplace.beginNoWait();
+        AtomicFileReplace.beginNoWait();
         try {
             write.write();
             landed = true;
         } catch (IOException | RuntimeException broken) {
-            // Also reported to the player, separately.
             LOGGER.warn("[openmap-collect] could not save config", broken);
             landed = false;
         } finally {
-            MapStorage.FileReplace.endNoWait();
+            AtomicFileReplace.endNoWait();
         }
         if (landed) {
             PENDING_SHUTDOWN.compareAndSet(write, null);

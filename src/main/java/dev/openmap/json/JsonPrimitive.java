@@ -23,7 +23,6 @@ public final class JsonPrimitive implements JsonElement {
 
     private static final JsonPrimitive FALSE = new JsonPrimitive("false", Kind.BOOLEAN);
 
-    // Sentinel for nothing carried. Coincides with Long.MIN_VALUE, which still reads correctly.
     static final long NOT_CARRIED = Long.MIN_VALUE;
 
     enum Kind {
@@ -34,7 +33,7 @@ public final class JsonPrimitive implements JsonElement {
 
     private final Kind kind;
 
-    // The plain-integer value already accumulated, or NOT_CARRIED.
+    // The plain-integer value, or NOT_CARRIED.
     private final long carried;
 
     private JsonPrimitive(String text, Kind kind) {
@@ -51,12 +50,11 @@ public final class JsonPrimitive implements JsonElement {
         return new JsonPrimitive(value, Kind.STRING);
     }
 
-    // Keeps the token verbatim.
     static JsonPrimitive ofNumberToken(String token) {
         return new JsonPrimitive(token, Kind.NUMBER);
     }
 
-    // Caller guarantees token is plain digits matching value; not checked here.
+    // Token must be plain digits matching value; not checked.
     static JsonPrimitive ofNumberToken(String token, long value) {
         return new JsonPrimitive(token, Kind.NUMBER, value);
     }
@@ -84,6 +82,10 @@ public final class JsonPrimitive implements JsonElement {
 
     public boolean isBoolean() {
         return kind == Kind.BOOLEAN;
+    }
+
+    public boolean isString() {
+        return kind == Kind.STRING;
     }
 
     Kind kind() {
@@ -115,12 +117,11 @@ public final class JsonPrimitive implements JsonElement {
             return;
         }
         if (written == Kind.NUMBER && JsonText.nonFinite(token) && !out.lenient()) {
-            throw new IllegalArgumentException("not a legal JSON number: " + token);
+            throw new IllegalArgumentException("not a JSON number: " + token);
         }
         out.bare(token);
     }
 
-    // Double.parseDouble of the text, string tokens included.
     @Override
     public double getAsDouble() {
         if (kind == Kind.NUMBER) {
@@ -132,8 +133,7 @@ public final class JsonPrimitive implements JsonElement {
         return Double.parseDouble(text);
     }
 
-    // Truncates a number toward zero; a string must parse as a whole number or this throws.
-    // 1e19 wraps negative; 1e400 reads as 0.
+    // Truncates toward zero; 1e19 wraps negative; 1e400 reads as 0.
     @Override
     public long getAsLong() {
         long result;
@@ -147,7 +147,7 @@ public final class JsonPrimitive implements JsonElement {
         return result;
     }
 
-    // Narrows to the low 32 bits rather than throwing when a value fits a long but not an int.
+    // Keeps the low 32 bits.
     @Override
     public int getAsInt() {
         int result;
@@ -161,7 +161,6 @@ public final class JsonPrimitive implements JsonElement {
         return result;
     }
 
-    // The stored value for a boolean; Boolean.parseBoolean of the text otherwise.
     @Override
     public boolean getAsBoolean() {
         if (kind == Kind.BOOLEAN) {
@@ -395,30 +394,27 @@ public final class JsonPrimitive implements JsonElement {
     }
 
     private static long longViaBigDecimal(String token) {
-        if (!isPlainLongShape(token)) {
-            return parseBigDecimal(token).longValue();
-        }
-        int length = token.length();
-        boolean negative = token.charAt(0) == '-';
-        int at = negative || token.charAt(0) == '+' ? 1 : 0;
-        long limit = negative ? Long.MIN_VALUE : -Long.MAX_VALUE;
-        long result = 0;
-        boolean fits = true;
-        while (at < length && fits) {
-            int digit = token.charAt(at) - '0';
-            if (result < limit / DECIMAL_RADIX) {
-                fits = false;
-            } else {
-                result *= DECIMAL_RADIX;
-                if (result < limit + digit) {
-                    fits = false;
-                } else {
-                    result -= digit;
-                }
+        if (isPlainLongShape(token)) {
+            long viaGrammar = NumberGrammar.decimalLongOr(token, Long.MIN_VALUE);
+            if (viaGrammar != Long.MIN_VALUE) {
+                return viaGrammar;
             }
-            at++;
         }
-        return fits ? (negative ? result : -result) : parseBigDecimal(token).longValue();
+        return parseBigDecimal(token).longValue();
+    }
+
+    static boolean isPlainLongShape(String token) {
+        int length = token.length();
+        boolean plain = length != 0 && length <= LONGEST_PLAIN_LONG_TEXT;
+        if (plain) {
+            int at = token.charAt(0) == '-' || token.charAt(0) == '+' ? 1 : 0;
+            plain = at != length;
+            while (at < length && plain) {
+                plain = isDigit(token.charAt(at));
+                at++;
+            }
+        }
+        return plain;
     }
 
     private static BigDecimal parseBigDecimal(String token) {
@@ -436,20 +432,6 @@ public final class JsonPrimitive implements JsonElement {
         if (Math.abs(scale) >= SMALLEST_REFUSED_SCALE) {
             throw unsupportedScale(scale);
         }
-    }
-
-    static boolean isPlainLongShape(String token) {
-        int length = token.length();
-        boolean plain = length != 0 && length <= LONGEST_PLAIN_LONG_TEXT;
-        if (plain) {
-            int at = token.charAt(0) == '-' || token.charAt(0) == '+' ? 1 : 0;
-            plain = at != length;
-            while (at < length && plain) {
-                plain = isDigit(token.charAt(at));
-                at++;
-            }
-        }
-        return plain;
     }
 
     static double fastIntegerDouble(String token) {
@@ -486,7 +468,7 @@ public final class JsonPrimitive implements JsonElement {
 
     private static NumberFormatException unsupportedScale(long scale) {
         return new NumberFormatException("number scale of " + scale + " is "
-                + SMALLEST_REFUSED_SCALE + " or more either side of zero");
+                + SMALLEST_REFUSED_SCALE + " or more from zero");
     }
 
     private static int digitsEnd(String token, int from) {

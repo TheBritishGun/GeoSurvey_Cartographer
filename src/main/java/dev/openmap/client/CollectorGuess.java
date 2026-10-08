@@ -1,11 +1,13 @@
 package dev.openmap.client;
 
+import dev.openmap.claim.NodeAddress;
 import dev.openmap.map.LabelText;
 import java.net.IDN;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.Locale;
-import net.minecraft.client.Minecraft;
 
-// A guess only; the player must see it before anything uses it.
+// A guess only; the player must see it before use.
 public final class CollectorGuess {
 
     static final int HOME_PORT = 8123;
@@ -28,16 +30,21 @@ public final class CollectorGuess {
     private static final int DECIMAL_RADIX = 10;
     private static final int MAX_OCTET_VALUE = 255;
     private static final int PORT_MAX_DIGITS = 5;
+    private static final int IPV4_ADDRESS_BYTES = 4;
+    private static final int IPV6_ADDRESS_BYTES = 16;
+    private static final int UNIQUE_LOCAL_IPV6_LOW = 0xFC00;
+    private static final int UNIQUE_LOCAL_IPV6_HIGH = 0xFDFF;
+    private static final int LINK_LOCAL_IPV6_LOW = 0xFE80;
+    private static final int LINK_LOCAL_IPV6_HIGH = 0xFEBF;
 
     private CollectorGuess() {
     }
 
-    public static String forCurrentServer() {
-        Minecraft client = Minecraft.getInstance();
-        return client == null ? "" : forServer(ChunkCapture.shareServer(client));
-    }
-
     public static String forServer(String serverAddress) {
+        String known = ChunkCapture.knownCollector(serverAddress);
+        if (!known.isEmpty()) {
+            return known;
+        }
         String host = hostOf(serverAddress);
         if (host.isEmpty()) {
             return "";
@@ -59,7 +66,8 @@ public final class CollectorGuess {
         if (!charsAllowed(address)) {
             return "";
         }
-        return address.charAt(0) == '[' ? bracketHost(address) : hostWithoutPort(address);
+        String host = address.charAt(0) == '[' ? bracketHost(address) : hostWithoutPort(address);
+        return NodeAddress.withoutRootDot(host);
     }
 
     private static boolean charsAllowed(String address) {
@@ -153,22 +161,33 @@ public final class CollectorGuess {
     }
 
     static boolean atHome(String host) {
+        host = NodeAddress.withoutRootDot(host);
         if (host.isEmpty()) {
             return false;
         }
         if (host.charAt(0) == '[') {
             return homeV6(host);
         }
-        if (host.length() > 1 && host.charAt(host.length() - 1) == '.') {
-            host = host.substring(0, host.length() - 1);
-        }
         return localName(host) || privateV4(host);
     }
 
     private static boolean homeV6(String host) {
-        return loopbackV6(host) || host.startsWith("[fc") || host.startsWith("[fd")
-                || host.startsWith("[fe8") || host.startsWith("[fe9")
-                || host.startsWith("[fea") || host.startsWith("[feb");
+        byte[] address;
+        try {
+            address = InetAddress.getByName(host.substring(1, host.length() - 1)).getAddress();
+        } catch (UnknownHostException refused) {
+            return false;
+        }
+        if (address.length == IPV4_ADDRESS_BYTES) {
+            return privateV4(address);
+        }
+        if (address.length != IPV6_ADDRESS_BYTES) {
+            return false;
+        }
+        int firstGroup = (Byte.toUnsignedInt(address[0]) << 8) | Byte.toUnsignedInt(address[1]);
+        return loopbackV6(address) || (firstGroup >= UNIQUE_LOCAL_IPV6_LOW
+                && firstGroup <= UNIQUE_LOCAL_IPV6_HIGH) || (firstGroup >= LINK_LOCAL_IPV6_LOW
+                && firstGroup <= LINK_LOCAL_IPV6_HIGH);
     }
 
     private static boolean localName(String host) {
@@ -189,18 +208,21 @@ public final class CollectorGuess {
                 || secondOctetBetween(host, "100.", SHARED_100_LOW, SHARED_100_HIGH);
     }
 
-    private static boolean loopbackV6(String host) {
-        if (host.indexOf(':') < 0 || !host.endsWith("]")) {
-            return false;
+    private static boolean privateV4(byte[] address) {
+        int first = Byte.toUnsignedInt(address[0]);
+        int second = Byte.toUnsignedInt(address[1]);
+        return first == 127 || first == 10 || (first == 192 && second == 168)
+                || (first == 169 && second == 254) || (first == 172 && second >= PRIVATE_172_LOW
+                && second <= PRIVATE_172_HIGH) || (first == 100 && second >= SHARED_100_LOW
+                && second <= SHARED_100_HIGH);
+    }
+
+    private static boolean loopbackV6(byte[] address) {
+        boolean zeroes = true;
+        for (int index = 0; index < address.length - 1; index++) {
+            zeroes = zeroes && address[index] == 0;
         }
-        boolean loopback;
-        try {
-            loopback = java.net.InetAddress.getByName(host.substring(1, host.length() - 1))
-                    .isLoopbackAddress();
-        } catch (java.net.UnknownHostException refused) {
-            loopback = false;
-        }
-        return loopback;
+        return zeroes && address[address.length - 1] == 1;
     }
 
     private static boolean allAsciiDigits(String host) {
@@ -217,7 +239,7 @@ public final class CollectorGuess {
         return valid;
     }
 
-    // Four dot-separated decimal octets, 0-255 each, no leading zeros.
+    // Four dot-separated octets, 0-255, no leading zeros.
     private static boolean ipv4Literal(String host) {
         int length = host.length();
         int octets = 0;

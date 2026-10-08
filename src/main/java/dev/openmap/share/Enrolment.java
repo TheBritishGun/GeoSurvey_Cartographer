@@ -4,12 +4,11 @@ import dev.openmap.map.LabelText;
 import java.io.IOException;
 import java.util.Objects;
 
-// What a contributor posts to have its own key recorded.
+// A contributor's request to record its key.
 public record Enrolment(String challenge, String name) {
 
     public static final int MAGIC = 0x43524531;
 
-    // The longest name this will carry.
     public static final int MAX_NAME = RosterReport.MAX_PLAYER_NAME;
 
     public static final int MAX_BYTES = 512;
@@ -21,7 +20,7 @@ public record Enrolment(String challenge, String name) {
         Objects.requireNonNull(name, "name");
         if (!SessionProof.readable(challenge)) {
             throw new IllegalArgumentException("the challenge is not "
-                    + SessionProof.CHALLENGE_CHARACTERS + " characters of hex");
+                    + SessionProof.CHALLENGE_CHARACTERS + " hex characters");
         }
         name = LabelText.clean(name, LabelText.UNBOUNDED_READ,
                 LabelText.UNBOUNDED_READ, false);
@@ -38,7 +37,7 @@ public record Enrolment(String challenge, String name) {
         return encode(challenge, name);
     }
 
-    // The same bytes, for a caller that has already checked both fields.
+    // The same bytes; the caller already checked both fields.
     static byte[] encode(String challenge, String name) throws IOException {
         int challengeLength = WireWrite.modifiedUtfLength(challenge);
         int nameLength = WireWrite.modifiedUtfLength(name);
@@ -65,8 +64,8 @@ public record Enrolment(String challenge, String name) {
                     Presence.MAX_UTF8_BYTES_PER_CHAR * MAX_NAME);
             int left = body.remaining();
             if (left != 0) {
-                throw new IOException(left + " bytes after the enrolment."
-                        + " Refusing it.");
+                throw new IOException(left + " extra bytes"
+                        + " after the enrolment.");
             }
             enrolment = new Enrolment(challenge, name);
         } catch (IllegalArgumentException refused) {

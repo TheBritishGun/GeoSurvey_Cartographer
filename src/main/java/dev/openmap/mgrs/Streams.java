@@ -8,7 +8,7 @@ public final class Streams {
     private Streams() {
     }
 
-    // Reads fully up to length; returns short only at end of stream.
+    // Reads length bytes unless the stream ends first.
     public static int readNBytes(InputStream in, byte[] into, int offset, int length)
             throws IOException {
         if ((offset | length) < 0 || length > into.length - offset) {

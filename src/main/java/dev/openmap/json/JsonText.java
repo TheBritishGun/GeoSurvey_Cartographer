@@ -3,7 +3,7 @@ package dev.openmap.json;
 import java.io.IOException;
 import java.io.Writer;
 
-// Non-ASCII and lone surrogates are written unescaped.
+// Non-ASCII and lone surrogates stay unescaped.
 public final class JsonText {
 
     private static final char[] HEX = "0123456789abcdef".toCharArray();
@@ -52,7 +52,6 @@ public final class JsonText {
 
     public static final char PARAGRAPH_SEPARATOR = 0x2029;
 
-    // Escapes for U+0000 to U+001F plus the two JSON always requires.
     private static final String[] ESCAPES = new String[CONTROL_ESCAPE_LIMIT];
 
     private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
@@ -69,7 +68,6 @@ public final class JsonText {
         ESCAPES['\f'] = "\\f";
     }
 
-    // PLAIN escapes control characters, the quote and the backslash; HTML also escapes < > & = and the apostrophe.
     private static final boolean[] NEEDS_ESCAPE_PLAIN = new boolean[ASCII_LIMIT];
 
     private static final boolean[] NEEDS_ESCAPE_HTML = new boolean[ASCII_LIMIT];
@@ -103,7 +101,7 @@ public final class JsonText {
         write(value, out, pretty, htmlSafe, false);
     }
 
-    // Compact text: no spaces, no HTML escaping.
+    // Compact text without HTML escaping.
     static String shown(JsonElement value) {
         StringBuilder out = new StringBuilder(SHOWN_CAPACITY);
         write(value, out, false, false, true);
@@ -117,7 +115,6 @@ public final class JsonText {
         try {
             write(value, emitter);
         } catch (IOException impossible) {
-            // Never reached: this emitter has no sink to drain.
             throw new AssertionError(impossible);
         } finally {
             emitter.release();
@@ -170,7 +167,6 @@ public final class JsonText {
                 || "-Infinity".equals(token);
     }
 
-    // Two spaces per level, a bare \n, never \r\n.
     private static void newline(StringBuilder out, boolean pretty, int depth) {
         if (!pretty) {
             return;
@@ -299,7 +295,6 @@ public final class JsonText {
             named = false;
         }
 
-        // Drains mid-string too, never splitting a surrogate pair.
         private void string(String value, StringBuilder out, boolean htmlSafe)
                 throws IOException {
             boolean[] table = htmlSafe ? NEEDS_ESCAPE_HTML : NEEDS_ESCAPE_PLAIN;
@@ -367,7 +362,7 @@ public final class JsonText {
 
         @Override
         public void value(Number number) {
-            // A boxed Float is not widened to double before formatting.
+            // A Float is not widened to double.
             if (number instanceof Integer boxed) {
                 separate();
                 out.append(boxed.intValue());
@@ -384,7 +379,7 @@ public final class JsonText {
             } else {
                 String text = number.toString();
                 if (nonFinite(text)) {
-                    throw new IllegalArgumentException("not a legal JSON number: " + text);
+                    throw new IllegalArgumentException("not a JSON number: " + text);
                 }
                 bare(text);
             }
@@ -421,11 +416,11 @@ public final class JsonText {
         }
 
         private static IllegalArgumentException nonFiniteFloat(float number) {
-            return new IllegalArgumentException("not a legal JSON number: " + number);
+            return new IllegalArgumentException("not a JSON number: " + number);
         }
 
         private static IllegalArgumentException nonFiniteDouble(double number) {
-            return new IllegalArgumentException("not a legal JSON number: " + number);
+            return new IllegalArgumentException("not a JSON number: " + number);
         }
 
         @Override

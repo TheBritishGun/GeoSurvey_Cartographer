@@ -18,7 +18,7 @@ public final class ClaimPen {
 
     private MarkerColour colour = MarkerColour.BLACK;
 
-    // True once begin() has been called and clear() has not.
+    // True from begin() until clear().
     public boolean drawing() {
         return !dimension.isEmpty();
     }
@@ -66,18 +66,16 @@ public final class ClaimPen {
         name = other == null ? "" : other.trim();
     }
 
-    // corner()'s refusal reason, or NONE.
     public enum Refusal {
 
         NONE,
 
-        // A corner in a dimension the boundary did not start in.
+        // A corner in another dimension.
         ELSEWHERE,
 
-        // The same block as the corner before it.
+        // The same block as the last corner.
         REPEATED,
 
-        // Claim.MAX_CORNERS already.
         FULL,
 
         OUTSIDE_BORDER
@@ -111,7 +109,7 @@ public final class ClaimPen {
         return Refusal.NONE;
     }
 
-    // Drop the last corner. False when there was none to drop.
+    // Drop the last corner. False when there is none.
     public boolean undo() {
         int n = count;
         if (n == 0) {
@@ -133,7 +131,7 @@ public final class ClaimPen {
 
     public Claim finish(String id, String owner, String ownerId, long now) {
         if (!enough()) {
-            throw new IllegalStateException(count + " corners is not a shape");
+            throw new IllegalStateException(count + " corners are too few");
         }
         return Claim.fromPen(new Claim.Identity(id, owner, ownerId, dimension), name,
                 Arrays.copyOf(xs, count), Arrays.copyOf(zs, count), colour, now);
@@ -141,7 +139,7 @@ public final class ClaimPen {
 
     public Claim finish(Supplier<String> id, String owner, String ownerId, long now) {
         if (!enough()) {
-            throw new IllegalStateException(count + " corners is not a shape");
+            throw new IllegalStateException(count + " corners are too few");
         }
         String minted = closeable() ? id.get() : PENDING_ID;
         return Claim.fromPen(new Claim.Identity(minted, owner, ownerId, dimension),
@@ -150,7 +148,7 @@ public final class ClaimPen {
 
     private static final String PENDING_ID = "pending";
 
-    // Box corners for 2 opposite points, clockwise from north-west. Returns {xs, zs}.
+    // Returns {xs, zs}, clockwise from north-west.
     public static double[][] rectangle(double x1, double z1, double x2, double z2) {
         double westX;
         double eastX;

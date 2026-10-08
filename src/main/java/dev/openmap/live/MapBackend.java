@@ -36,7 +36,7 @@ public enum MapBackend {
 
     public static final String STATUS_PATH = "status";
 
-    // Identifies the backend; live.json carries the map data.
+    // Identifies the backend.
     public String configurationPath() {
         return switch (this) {
             case DYNMAP -> "up/configuration";
@@ -288,7 +288,7 @@ public enum MapBackend {
         return c < ASCII_LIMIT && (((c < LOW_KEPT_RANGE_LIMIT ? KEPT_LO : KEPT_HI) >>> c) & 1L) != 0;
     }
 
-    // Whether the endpoint cannot narrow players to one world.
+    // Whether the endpoint lists players of all worlds.
     public boolean playersAreGlobal() {
         return this == PL3XMAP || this == SQUAREMAP || this == OPENMAP;
     }
@@ -300,12 +300,11 @@ public enum MapBackend {
 
     private static final WorldMapping OPENMAP_DEFAULT_WORLDS = WorldMapping.openMapDefaults();
 
-    // Which remote world serves which dimension, when the config names none.
+    // Which remote world serves which dimension.
     public WorldMapping defaultWorlds() {
         return this == OPENMAP ? OPENMAP_DEFAULT_WORLDS : DynmapDefaultsHolder.VALUE;
     }
 
-    // True only for Open-Map: players and markers are the same document.
     public boolean playersAndMarkersShareADocument() {
         return this == OPENMAP;
     }
@@ -378,13 +377,13 @@ public enum MapBackend {
         return longest;
     }
 
-    // The backend of that name, or Dynmap.
+    // The named backend, or Dynmap.
     public static MapBackend fromName(String name) {
         MapBackend found = match(name);
         return found == null ? DYNMAP : found;
     }
 
-    // The backend of that name, or null if nothing is called that.
+    // The named backend, or null.
     public static MapBackend match(String name) {
         if (name == null) {
             return null;

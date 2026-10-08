@@ -39,25 +39,6 @@ public final class JsonBind {
 
     private static final Class<?>[] NO_PARAMS = new Class<?>[0];
 
-    private static final int DECIMAL_RADIX = 10;
-
-    private static final int HEXADECIMAL_RADIX = 16;
-
-    private static final int HEX_PREFIX_LENGTH = 2;
-
-    private static final int HEX_EXPONENT_BITS = 4;
-
-    private static final int ASCII_LOWER_CASE_BIT = 0x20;
-
-    private static final int LONG_SHIFT_LIMIT = 63;
-
-    private static final long[] POWERS_OF_TEN = {
-        1L, 10L, 100L, 1_000L, 10_000L, 100_000L, 1_000_000L, 10_000_000L, 100_000_000L,
-        1_000_000_000L, 10_000_000_000L, 100_000_000_000L, 1_000_000_000_000L,
-        10_000_000_000_000L, 100_000_000_000_000L, 1_000_000_000_000_000L,
-        10_000_000_000_000_000L, 100_000_000_000_000_000L, 1_000_000_000_000_000_000L,
-    };
-
     private static final AtomicLong KIND_RESOLUTIONS = new AtomicLong();
 
     private static final AtomicLong TO_DOUBLE_CALLS = new AtomicLong();
@@ -85,17 +66,16 @@ public final class JsonBind {
         this.writeNulls = writeNulls;
     }
 
-    // Indented output that omits null fields.
+    // Omits null fields.
     public static JsonBind pretty() {
         return PRETTY;
     }
 
-    // Indented output that writes null fields as null.
     public static JsonBind prettyWithNulls() {
         return PRETTY_WITH_NULLS;
     }
 
-    // No indentation, omitting null fields.
+    // Omits null fields.
     public static JsonBind compact() {
         return COMPACT;
     }
@@ -115,14 +95,12 @@ public final class JsonBind {
         return cast(type, read(document, type));
     }
 
-    // Casts through the wrapper type when type is primitive.
     private static <T> T cast(Class<T> type, Object read) {
         @SuppressWarnings("unchecked")
         Class<T> boxed = (Class<T>) boxOf(type);
         return boxed.cast(read);
     }
 
-    // The wrapper type for a primitive class, or the class itself.
     private static Class<?> boxOf(Class<?> type) {
         if (!type.isPrimitive()) {
             return type;
@@ -167,7 +145,7 @@ public final class JsonBind {
         return out;
     }
 
-    // Returns -1 for an empty document or a literal null.
+    // -1 for an empty document or a literal null.
     public <T> int fromJsonStream(Reader reader, Class<T> element, Consumer<T> each) {
         @SuppressWarnings("unchecked")
         Class<T> boxed = (Class<T>) boxOf(element);
@@ -210,7 +188,6 @@ public final class JsonBind {
         return tree.root;
     }
 
-    // ---------------------------------------------------------------- reading
 
     private static Object read(JsonElement value, Type type) {
         if (value == null || value.isJsonNull()) {
@@ -220,7 +197,6 @@ public final class JsonBind {
         return bind(value, KINDS.computeIfAbsent(type, JsonBind::specOf));
     }
 
-    // Never called with a null value.
     private static Object readAs(JsonElement value, Spec shape) {
         TYPE_CHAIN_READS.incrementAndGet();
         return bind(value, shape);
@@ -505,7 +481,7 @@ public final class JsonBind {
             instance = constructor.newInstance(NO_ARGS);
         } catch (ReflectiveOperationException | RuntimeException cannotBuild) {
             throw new JsonParseException(type.getName()
-                    + " needs a no-argument constructor to be read from JSON",
+                    + " needs a no-argument constructor",
                     cannotBuild);
         }
         return instance;
@@ -519,15 +495,14 @@ public final class JsonBind {
             constructor.setAccessible(true);
         } catch (ReflectiveOperationException | RuntimeException cannotBuild) {
             throw new JsonParseException(type.getName()
-                    + " needs a no-argument constructor to be read from JSON",
+                    + " needs a no-argument constructor",
                     cannotBuild);
         }
         return constructor;
     }
 
-    // ---------------------------------------------------------------- numbers
 
-    // 3.0 reads as 3, the string "7" reads as 7; 3.5 or anything outside int range is refused.
+    // 3.0 reads as 3 and "7" as 7; 3.5 and values outside int range are refused.
     private static int toInt(JsonElement value) {
         long asLong = toLong(value);
         if (asLong < Integer.MIN_VALUE || asLong > Integer.MAX_VALUE) {
@@ -536,194 +511,22 @@ public final class JsonBind {
         return (int) asLong;
     }
 
-    private static final String LONG_MAX_VALUE_DIGITS = "9223372036854775807";
-
-    private static final String LONG_MIN_VALUE_DIGITS = "9223372036854775808";
-
     private static long toLong(JsonElement value) {
         String text = value.getAsString();
-        if (isPlainLong(text) && fitsInLong(text)) {
-            return Long.parseLong(text);
+        long result = NumberGrammar.decimalLongOr(text, Long.MIN_VALUE);
+        if (result != Long.MIN_VALUE) {
+            return result;
         }
-        return wholeLong(text);
-    }
-
-    private static long wholeLong(String text) {
-        long whole;
-        try {
-            whole = exactLong(text);
-        } catch (ArithmeticException | NumberFormatException notWhole) {
-            throw new JsonParseException("not a whole number: " + text, notWhole);
+        boolean finiteJavaDouble = NumberGrammar.isJavaDouble(text)
+                && !NumberGrammar.isNonFiniteJavaDouble(text);
+        Long exact = NumberGrammar.exactLong(text);
+        if (exact != null) {
+            return exact;
         }
-        return whole;
-    }
-
-    private static boolean isPlainLong(String text) {
-        int at = text.startsWith("-") ? 1 : 0;
-        boolean plain = at != text.length();
-        while (plain && at < text.length()) {
-            char digit = text.charAt(at);
-            if (digit < '0' || digit > '9') {
-                plain = false;
-            }
-            at++;
-        }
-        return plain;
-    }
-
-    private static boolean fitsInLong(String text) {
-        boolean negative = text.charAt(0) == '-';
-        int start = negative ? 1 : 0;
-        int end = text.length();
-        while (start < end - 1 && text.charAt(start) == '0') {
-            start++;
-        }
-        int significantDigits = end - start;
-        boolean fits;
-        if (significantDigits < JsonPrimitive.LONG_MAX_DIGITS) {
-            fits = true;
-        } else if (significantDigits > JsonPrimitive.LONG_MAX_DIGITS) {
-            fits = false;
-        } else {
-            String boundary = negative ? LONG_MIN_VALUE_DIGITS : LONG_MAX_VALUE_DIGITS;
-            fits = text.substring(start).compareTo(boundary) <= 0;
-        }
-        return fits;
-    }
-
-    private static long exactLong(String text) {
-        String number = text.trim();
-        if (number.isEmpty()) {
-            throw new NumberFormatException("not a whole number: " + text);
-        }
-        char first = number.charAt(0);
-        boolean negative = first == '-';
-        int start = negative || first == '+' ? 1 : 0;
-        int len = number.length();
-        boolean hex = isHexToken(number, start, len);
-        int radix = hex ? HEXADECIMAL_RADIX : DECIMAL_RADIX;
-        int end = tokenEnd(number, start, len, hex);
-        int point = -1;
-        int firstNonZero = -1;
-        int lastNonZero = -1;
-        boolean sawDigit = false;
-        int digitsEnd = hex ? start + HEX_PREFIX_LENGTH : start;
-        while (digitsEnd < end) {
-            char c = number.charAt(digitsEnd);
-            if (c == '.') {
-                if (point >= 0) {
-                    throw new NumberFormatException("not a whole number: " + text);
-                }
-                point = digitsEnd;
-            } else if (Character.digit(c, radix) < 0) {
-                break;
-            } else {
-                sawDigit = true;
-                if (c != '0') {
-                    if (firstNonZero < 0) {
-                        firstNonZero = digitsEnd;
-                    }
-                    lastNonZero = digitsEnd;
-                }
-            }
-            digitsEnd++;
-        }
-        requireScannedDigits(text, number, digitsEnd, end, hex, sawDigit);
-        long result = 0;
-        if (firstNonZero >= 0) {
-            long power = powerOf(number, digitsEnd, end, point, lastNonZero, hex);
-            requireNoFraction(number, radix, lastNonZero, power, hex);
-            long whole = wholeOf(number, radix, firstNonZero, lastNonZero, point, negative,
-                    power);
-            result = scaled(whole, power, hex);
-        }
-        return result;
-    }
-
-    private static boolean isHexToken(String number, int start, int len) {
-        return start + 1 < len && number.charAt(start) == '0'
-                && (number.charAt(start + 1) | ASCII_LOWER_CASE_BIT) == 'x';
-    }
-
-    private static int tokenEnd(String number, int start, int len, boolean hex) {
-        boolean plainHex = hex && number.indexOf('p', start) < 0
-                && number.indexOf('P', start) < 0;
-        return plainHex || "fFdD".indexOf(number.charAt(len - 1)) < 0 ? len : len - 1;
-    }
-
-    private static void requireScannedDigits(String text, String number, int digitsEnd, int end,
-            boolean hex, boolean sawDigit) {
-        if (digitsEnd < end
-                && Character.toLowerCase(number.charAt(digitsEnd)) != (hex ? 'p' : 'e')) {
-            throw new NumberFormatException("not a whole number: " + text);
-        }
-        if (!sawDigit) {
-            throw new NumberFormatException("not a whole number: " + text);
-        }
-    }
-
-    private static long powerOf(String number, int digitsEnd, int end, int point,
-            int lastNonZero, boolean hex) {
-        int radixPoint = point < 0 ? digitsEnd : point;
-        long lastPlace = radixPoint > lastNonZero
-                ? radixPoint - lastNonZero - 1 : radixPoint - lastNonZero;
-        long exponent = digitsEnd < end
-                ? Long.parseLong(number, digitsEnd + 1, end, DECIMAL_RADIX) : 0;
-        return Math.addExact(hex ? HEX_EXPONENT_BITS * lastPlace : lastPlace, exponent);
-    }
-
-    private static void requireNoFraction(String number, int radix, int lastNonZero, long power,
-            boolean hex) {
-        if (power >= 0) {
-            return;
-        }
-        if (!hex) {
-            throw new ArithmeticException("a fraction is left over");
-        }
-        int lastDigit = Character.digit(number.charAt(lastNonZero), radix);
-        if (power < -Integer.numberOfTrailingZeros(lastDigit)) {
-            throw new ArithmeticException("a fraction is left over");
-        }
-    }
-
-    private static long wholeOf(String number, int radix, int firstNonZero, int lastNonZero,
-            int point, boolean negative, long power) {
-        int droppedBits = (int) Math.max(-power, 0);
-        long whole = 0;
-        for (int i = firstNonZero; i <= lastNonZero; i++) {
-            if (i == point) {
-                continue;
-            }
-            int drop = i == lastNonZero ? droppedBits : 0;
-            long scale = radix >> drop;
-            char symbol = number.charAt(i);
-            long digit = (radix == DECIMAL_RADIX && symbol <= '9' ? symbol - '0'
-                    : Character.digit(symbol, radix)) >> drop;
-            whole = Math.multiplyExact(whole, scale);
-            whole = negative ? Math.subtractExact(whole, digit) : Math.addExact(whole, digit);
-        }
-        return whole;
-    }
-
-    private static long scaled(long whole, long power, boolean hex) {
-        if (power > 0) {
-            if (hex) {
-                if (power > LONG_SHIFT_LIMIT) {
-                    throw new ArithmeticException("long overflow");
-                }
-                int shift = (int) power;
-                long shifted = whole << shift;
-                if (shifted >> shift != whole) {
-                    throw new ArithmeticException("long overflow");
-                }
-                whole = shifted;
-            } else if (power > POWERS_OF_TEN.length - 1) {
-                throw new ArithmeticException("long overflow");
-            } else {
-                whole = Math.multiplyExact(whole, POWERS_OF_TEN[(int) power]);
-            }
-        }
-        return whole;
+        RuntimeException refusal = finiteJavaDouble
+                ? new ArithmeticException("long overflow")
+                : new NumberFormatException("not a whole number: " + text);
+        throw new JsonParseException("not a whole number: " + text, refusal);
     }
 
     private static double toDouble(JsonElement value) {
@@ -738,7 +541,6 @@ public final class JsonBind {
         return number;
     }
 
-    // ---------------------------------------------------------------- writing
 
     private <E extends Exception> void write(Object value, JsonText.Tokens<E> out) throws E {
         out.spill();
@@ -762,7 +564,7 @@ public final class JsonBind {
             }
         }
         case NUMBER -> {
-            // A boxed Float is not widened to double before formatting.
+            // A Float is not widened to double.
             if (value instanceof Number asNumber) {
                 out.value(asNumber);
             } else {
@@ -1229,7 +1031,7 @@ public final class JsonBind {
         }
     }
 
-    // Binder(Spec) binds one value.
+    // Binder(Spec) binds one value;
     // Binder(Spec, null) collects a JSON array into a list.
     // Binder(Spec, each) hands each array element to each.
     private static final class Binder implements JsonParser.Sink {
@@ -1377,7 +1179,6 @@ public final class JsonBind {
             }
         }
 
-        // Fixed-size chunks, not a doubling buffer.
         private void openArray(Spec shape, FrameKind kind, Class<?> component, Spec child) {
             Frame frame = push(kind, shape);
             frame.component = component;
@@ -1388,7 +1189,6 @@ public final class JsonBind {
             }
         }
 
-        // The current chunk, with room for one more element.
         private static Object room(Frame top) {
             if (top.slot == Array.getLength(top.chunk)) {
                 if (top.spilled == null) {
@@ -1430,7 +1230,6 @@ public final class JsonBind {
             Integer at = top.descriptor.byName.get(name);
             if (at == null) {
 
-                // Unknown member names are skipped.
                 skipValue = true;
                 return;
             }

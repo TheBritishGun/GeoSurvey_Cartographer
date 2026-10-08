@@ -2,7 +2,6 @@ package dev.openmap.config;
 
 import java.nio.charset.StandardCharsets;
 
-// A colour: a named preset, or a value written out in full.
 public record ColourSwatch(Preset preset, int custom) {
 
     private static final int AMBER_ARGB = 0xDDE0A33A;
@@ -31,7 +30,6 @@ public record ColourSwatch(Preset preset, int custom) {
     private static final int ALPHA_BYTE_MASK = 0xFF;
     private static final int OPAQUE_ALPHA = 0xFF;
 
-    // A named colour, or a stand-in name (DEFAULT, CUSTOM).
     public enum Preset {
 
         AMBER(AMBER_ARGB, "Amber"),
@@ -40,7 +38,6 @@ public record ColourSwatch(Preset preset, int custom) {
 
         TEAL(TEAL_ARGB, "Teal"),
 
-        // Draws nothing.
         CLEAR(CLEAR_ARGB, "Clear"),
 
         BLACK(BLACK_ARGB, "Black"),
@@ -49,10 +46,10 @@ public record ColourSwatch(Preset preset, int custom) {
 
         GREY(GREY_ARGB, "Grey"),
 
-        // Its colour comes from the caller's own shipped value, via resolve().
+        // Takes the caller's shipped colour.
         DEFAULT(0, "Default"),
 
-        // The colour is on the record's custom field, not here.
+        // The colour is in the record's custom field.
         CUSTOM(0, "Custom");
 
         private final int argb;
@@ -65,13 +62,12 @@ public record ColourSwatch(Preset preset, int custom) {
             this.nameLength = name().length();
         }
 
-        // What the config file stores and parse() reads.
+        // The text the config file stores.
         public String label() {
             return label;
         }
     }
 
-    // What an untouched setting holds.
     public static final ColourSwatch DEFAULT = new ColourSwatch(Preset.DEFAULT, 0);
 
     public ColourSwatch {
@@ -87,7 +83,7 @@ public record ColourSwatch(Preset preset, int custom) {
         return new ColourSwatch(Preset.CUSTOM, argb);
     }
 
-    // The packed ARGB to draw; shipped is what DEFAULT means for this field.
+    // The packed ARGB to draw.
     public int resolve(int shipped) {
         if (preset == Preset.DEFAULT) {
             return shipped;
@@ -112,14 +108,13 @@ public record ColourSwatch(Preset preset, int custom) {
         return new String(out, StandardCharsets.ISO_8859_1);
     }
 
-    // #RRGGBBAA for a packed ARGB, with no swatch to hold it.
+    // #RRGGBBAA for a packed ARGB.
     public static String formatCustom(int argb) {
         byte[] out = new byte[SWATCH_TEXT_LENGTH];
         writeCustom(out, argb);
         return new String(out, StandardCharsets.ISO_8859_1);
     }
 
-    // Writes the nine bytes of #RRGGBBAA.
     private static void writeCustom(byte[] out, int argb) {
         out[0] = '#';
         hex(out, RED_COMPONENT_OFFSET, argb >> RED_COMPONENT_SHIFT);
@@ -211,7 +206,6 @@ public record ColourSwatch(Preset preset, int custom) {
                     if (n == FULL_HEX_DIGITS) {
                         settled = custom(Integer.rotateRight(all, ARGB_ROTATE_BITS));
                     } else {
-                        // No alpha in the text: the replaced swatch's alpha, or opaque when that is zero.
                         int kept = alphaWhenAbsent & ALPHA_BYTE_MASK;
                         int alpha = kept == 0 ? OPAQUE_ALPHA : kept;
                         settled = custom((alpha << ALPHA_SHIFT) | all);

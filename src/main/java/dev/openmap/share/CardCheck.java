@@ -5,27 +5,26 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
-// Whether one MapCard describes the ground this client has surveyed.
+// Whether a MapCard describes the ground this client surveyed.
 public final class CardCheck {
 
-    // What one card came to.
     public enum Verdict {
 
         MATCHED("This map card describes the ground here.", true),
 
-        NEAR("The ground here is close to this map card. It has changed too much."
+        NEAR("This map card nearly matches, but the ground changed too much."
                 + " Ask the operator to publish a new card.", false),
 
-        MISMATCHED("This map card describes other ground. It is for another server,"
-                + " or somebody replaced this world.", false),
+        MISMATCHED("This map card is for another server,"
+                + " or a replaced world.", false),
 
-        NOT_SURVEYED("Walk to the spawn point this map card names. The map holds no"
-                + " record of that ground.", false),
+        NOT_SURVEYED("Walk to this map card's spawn point. The map has no"
+                + " record of it.", false),
 
-        TOO_OLD("Walk to the spawn point this map card names. That record is too old"
-                + " to compare.", false),
+        TOO_OLD("Walk to this map card's spawn point. The record"
+                + " there is too old.", false),
 
-        NO_MAP("Join a server. A map card needs ground you have walked.", false);
+        NO_MAP("Join a server. A map card needs ground you walked.", false);
 
         private final String reason;
 
@@ -41,7 +40,7 @@ public final class CardCheck {
             return reason;
         }
 
-        // Whether the address in the card may be asked. Only MATCHED.
+        // Whether the card's address may be asked.
         public boolean usable() {
             return usable;
         }
@@ -58,7 +57,7 @@ public final class CardCheck {
     private CardCheck() {
     }
 
-    // Checks one card against stored ground; ground is null when there is none.
+    // ground is null when there is none.
     public static Result of(MapCard card, ChunkSource ground) {
         if (card == null) {
             return null;
@@ -75,7 +74,7 @@ public final class CardCheck {
                 result = new Result(card, verdict, SpawnPrint.Agreement.NONE);
             } else {
 
-        // In the card's frame, never in one derived here.
+        // In the card's frame, not our own.
                 SpawnPrint print = card.print();
                 SpawnPrint mine = SpawnPrint.of(measured, print.base());
                 SpawnPrint.Agreement agreement = print.agreementWith(mine);
@@ -106,7 +105,7 @@ public final class CardCheck {
         return agreeing;
     }
 
-    // The addresses a caller may ask, in card order, without repeats.
+    // The usable addresses, in card order, without repeats.
     public static List<String> usableOrigins(List<Result> results) {
         if (results == null || results.isEmpty()) {
             return List.of();

@@ -6,7 +6,8 @@
   "client": [
     "PlayerTabOverlayMixin",
     "ClientPacketListenerTagsMixin",
-    "ClientCommonPacketListenerImplTransferMixin"
+    "ClientCommonPacketListenerImplTransferMixin",
+    "ClientPacketListenerTitleMixin"
   ],
   "injectors": {
     "defaultRequire": 1

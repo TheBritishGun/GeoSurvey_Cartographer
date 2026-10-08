@@ -73,7 +73,7 @@ public final class ChunkSampler {
         int topBlockY(int localX, int localZ);
     }
 
-    // At most limit columns starting at column from; returns the column to resume from.
+    // At most limit columns from column from; returns the next column.
     static int sample(ChunkSample out, BlockGetter blocks, int minY,
                       Surface surface, Scratch scratch, int from, int limit) {
         BlockPos.MutableBlockPos cursor = scratch.cursor;

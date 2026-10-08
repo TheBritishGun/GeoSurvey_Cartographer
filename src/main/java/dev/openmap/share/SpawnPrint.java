@@ -8,19 +8,19 @@ import java.util.Objects;
 
 public final class SpawnPrint {
 
-    // Chunks a side.
+    // Chunks per side.
     public static final int SPAN = 3;
 
-    // Columns a side.
+    // Columns per side.
     public static final int COLUMNS = SPAN * 16;
 
-    // Cells a side.
+    // Cells per side.
     public static final int CELLS = 8;
 
-    // Columns a side in one cell.
+    // Columns per cell side.
     public static final int CELL_COLUMNS = COLUMNS / CELLS;
 
-    // Cells in one panel.
+    // Cells per panel.
     public static final int PANEL = CELLS * CELLS;
 
     // Blocks per height step.
@@ -37,7 +37,7 @@ public final class SpawnPrint {
     // Five bits per cell.
     public static final int MAX_COVER = 31;
 
-    // Bytes written: 2 of base, 32 of heights, 40 of covers.
+    // Bytes written: 2 base, 32 heights, 40 covers.
     public static final int BYTES = 2 + PANEL / 2 + PANEL * 5 / 8;
 
     private static final int HASH_MULTIPLIER = 31;
@@ -88,14 +88,14 @@ public final class SpawnPrint {
 
         NONE(""),
 
-        NOT_SURVEYED("Walk to the spawn point of this server. The map has no record"
-                + " of the ground there."),
+        NOT_SURVEYED("Walk to this server's spawn point"
+                + " to record the ground."),
 
-        TOO_OLD("Walk to the spawn point of this server again. The record of the"
-                + " ground there is too old to compare."),
+        TOO_OLD("Walk to this server's spawn point again"
+                + " to update the record."),
 
-        TOO_FLAT("The ground around this spawn point is flat. Flat ground identifies"
-                + " no server.");
+        TOO_FLAT("Flat ground at this spawn point"
+                + " identifies no server.");
 
         private final String reason;
 
@@ -103,13 +103,12 @@ public final class SpawnPrint {
             this.reason = reason;
         }
 
-        // Empty for NONE.
         public String reason() {
             return reason;
         }
     }
 
-    // median and cover are row major, one entry per cell.
+    // Row major, one entry per cell.
     public record Ground(int[] median, byte[] cover, Fault fault) {
 
 
@@ -178,7 +177,6 @@ public final class SpawnPrint {
                 + Arrays.hashCode(cover);
     }
 
-    // Cell heights are offsets from this.
     public int base() {
         return base;
     }
@@ -219,7 +217,7 @@ public final class SpawnPrint {
         return offPlateau() >= MIN_OFF_PLATEAU;
     }
 
-    // other must be built in this print's frame.
+    // other must share this print's base.
     public Agreement agreementWith(SpawnPrint other) {
         if (other == null) {
             return Agreement.NONE;
@@ -375,7 +373,7 @@ public final class SpawnPrint {
         column[b] = held;
     }
 
-    // Null when the ground could not be read or has no relief.
+    // Null when the ground is unreadable or flat.
     public static SpawnPrint of(Ground ground) {
         if (ground == null || !ground.isReadable()
                 || ground.median().length != PANEL || ground.cover().length != PANEL) {
@@ -387,7 +385,7 @@ public final class SpawnPrint {
         return print != null && print.identifies() ? print : null;
     }
 
-    // Null when the ground could not be read.
+    // Null when the ground is unreadable.
     public static SpawnPrint of(Ground ground, int base) {
         if (ground == null || !ground.isReadable()
                 || ground.median().length != PANEL || ground.cover().length != PANEL) {
@@ -409,14 +407,14 @@ public final class SpawnPrint {
         return Math.max(Short.MIN_VALUE + 1, Math.min(Short.MAX_VALUE, base));
     }
 
-    // Big endian: 2 base bytes, then 64 height nibbles (even cell high), then 64 five-bit covers, MSB first.
+    // Big endian: 2 base bytes, 64 height nibbles (even cell high), 64 five-bit covers, MSB first.
     public byte[] toBytes() {
         byte[] out = new byte[BYTES];
         writeTo(out, 0);
         return out;
     }
 
-    // dest needs BYTES of room from at; not checked.
+    // dest needs BYTES of room from at; unchecked.
     public void writeTo(byte[] dest, int at) {
         dest[at] = (byte) (base >> BITS_PER_BYTE);
         dest[at + 1] = (byte) base;
@@ -444,7 +442,7 @@ public final class SpawnPrint {
         return data == null ? null : fromBytes(data, 0, data.length);
     }
 
-    // Null when data, at or length do not describe a print.
+    // Null when the arguments describe no print.
     public static SpawnPrint fromBytes(byte[] data, int at, int length) {
         if (data == null || length != BYTES || at < 0 || at > data.length - length) {
             return null;
@@ -477,7 +475,7 @@ public final class SpawnPrint {
         return new SpawnPrint(base, level, cover);
     }
 
-    // Unknown covers read as UNKNOWN, never throw.
+    // An unknown cover reads as UNKNOWN.
     public LandCover coverOf(int cell) {
         return LandCover.byCode(cover[cell]);
     }

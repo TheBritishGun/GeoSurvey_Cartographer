@@ -22,37 +22,34 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-// A per-world upload backlog, held on disk; never deletes ground to make room.
-// A segment is deleted only after the collector accepts it, so a crash costs at most one re-post.
+// A per-world upload backlog on disk.
 final class ShareSpool implements AutoCloseable {
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
-    // A count only; SEGMENT_PAYLOAD_BYTES is the byte half of the same seal.
     static final int SEGMENT_SAMPLES = Batch.MAX_SAMPLES;
 
     static final int MIB_SHIFT = 20;
 
-    // Mirrors Envelopes.MAX_ENTRY on the collector; kept in sync here by hand, not by import.
+    // Mirrors Envelopes.MAX_ENTRY on the collector.
     static final int MAX_ENTRY_BYTES = 1 << MIB_SHIFT;
 
-    // The largest non-payload overhead one entry can add, worst case, not measured.
+    // Largest non-payload overhead of one entry.
     static final int WRAPPING_BYTES =
             13 + 3 * (2 + 3 * Batch.MAX_NAME) + 44 + 4096 + 1024 + 1024;
 
-    // The batch header's worst-case size, reserved uncompressed.
+    // Worst-case size.
     private static final int BATCH_HEADER_BYTES = 4 + 3 * (2 + 3 * Batch.MAX_NAME) + 8 + 4;
 
-    // Slack for the deflater's own lag: bytes fed in are not yet bytes counted out.
+    // Room for bytes pending in the deflater.
     private static final int PENDING_BYTES = 1 << 16;
 
-    // The byte ceiling for sealing, on top of the record count; measured by compressing.
+    // Compressed bytes at which a segment seals.
     static final int SEGMENT_PAYLOAD_BYTES =
             MAX_ENTRY_BYTES - WRAPPING_BYTES - BATCH_HEADER_BYTES - PENDING_BYTES;
 
-    // From MapCodec's chunk record, not a local number.
-    // Stamped into the segment's file name; there is no in-file header to carry it.
+    // From MapCodec's chunk record; stamped into segment file names.
     static final int RECORD_BYTES = MapCodec.CHUNK_BYTES;
 
     private static final String SEALED_SUFFIX = ".seg";
@@ -60,10 +57,6 @@ final class ShareSpool implements AutoCloseable {
     private static final String WRITING_SUFFIX = ".part";
 
     private static final String REFUSED_SUFFIX = ".refused";
-
-    private static final String WORLD_FILE = "world";
-
-    private static final long WORLD_LEFTOVER_MILLIS = 60L * 60L * 1000L;
 
     private static final int HASH_MULTIPLIER = 31;
 
@@ -79,7 +72,6 @@ final class ShareSpool implements AutoCloseable {
 
     private static final long NANOS_PER_MILLI = 1_000_000L;
 
-    // Counts only a refusal the collector will repeat; a 5xx, timeout or unreachable host retries forever.
     private static final int MAX_ATTEMPTS = 3;
 
     private static final int RESTOCK_ATTEMPTS = 13;
@@ -88,7 +80,7 @@ final class ShareSpool implements AutoCloseable {
 
     private static final long CHANGES_PER_FILE_WORK = 2L;
 
-    // What set-aside ground may take on disk, per world.
+    // Per world.
     static final long MAX_REFUSED_BYTES = 64L << MIB_SHIFT;
 
     private static final int WRITE_BUFFER_BYTES = 1 << 16;
@@ -114,8 +106,8 @@ final class ShareSpool implements AutoCloseable {
     private static final StandardCopyOption[] MOVE_FALLBACK_OPTIONS =
             {StandardCopyOption.REPLACE_EXISTING};
 
-    // file plus era is the identity a path alone cannot give; era never repeats.
-    // tornBytes: bytes of a record that was never finished being written.
+    // era: the backlog version at the read; never repeats.
+    // tornBytes: bytes of an unfinished record.
     static final class Loaded {
 
         private Path file;
@@ -193,19 +185,17 @@ final class ShareSpool implements AutoCloseable {
 
     private final Map<Path, Integer> attempts = new HashMap<>();
 
-    // Segments given up on, and how many times tried; under this object's monitor.
+    // Segments given up on, with their try counts; guarded by this.
     private final Map<Path, Integer> spent = new HashMap<>();
 
-    // Segments a take() is currently reading, so a second take skips them.
-    // Under this object's monitor; released in a finally even if the read throws.
+    // Segments a take() is reading; guarded by this.
     private final java.util.Set<Path> reading = new java.util.HashSet<>();
 
     private java.util.TreeMap<String, SpoolFile> sealedFiles = new java.util.TreeMap<>();
 
     private final List<GoneSegment> goneMidDiscard = new ArrayList<>();
 
-    // A version stamp for which backlog this spool holds; never repeats. Under this object's monitor.
-    // Drawn from a process-wide counter that is not itself guarded; read once per spool and once per discard.
+    // Source of unique epoch values; epoch is guarded by this.
     private static final java.util.concurrent.atomic.AtomicLong EPOCHS =
             new java.util.concurrent.atomic.AtomicLong();
 
@@ -240,13 +230,16 @@ final class ShareSpool implements AutoCloseable {
 
     private final MapCodec.ChunkWriter writer = new MapCodec.ChunkWriter();
 
-    // Read without the monitor, by the tick thread and the poster.
     private volatile DataOutputStream writing;
     private volatile int sealedSegments;
     private volatile long records;
     private volatile long bytes;
 
     private final RefusedBacklog refusedBacklog = new RefusedBacklog(this);
+
+    private final SetAsideSchedule setAside = new SetAsideSchedule(REFUSED_SUFFIX);
+
+    private final WorldMarker marker;
 
     void refusedCap(long bytes) {
         refusedBacklog.cap = bytes;
@@ -261,6 +254,7 @@ final class ShareSpool implements AutoCloseable {
         this.directory = directory;
         this.server = server;
         this.dimension = dimension;
+        marker = new WorldMarker(directory, server, dimension);
     }
 
     static ShareSpool open(Path root, String server, String dimension)
@@ -277,66 +271,87 @@ final class ShareSpool implements AutoCloseable {
         DIRECTORY_CREATES.incrementAndGet();
         ShareSpool spool = new ShareSpool(directory, server, dimension);
         List<SpoolFile> listing = spool.listDirectory();
-        spool.rememberWorld(listing);
+        try {
+            spool.marker.rememberWorld();
+        } catch (IOException unreadableMarker) {
+            World known = WorldMarker.worldOf(directory);
+            if (known != null) {
+                LOGGER.warn("geosurvey left the spool at {} alone: its marker names {} {}, not {} {}.",
+                        directory, known.server(), known.dimension(), server, dimension);
+                throw unreadableMarker;
+            }
+            Files.deleteIfExists(directory.resolve(WorldMarker.FILE_NAME));
+            spool.marker.rememberWorld();
+            LOGGER.warn("geosurvey replaced an unreadable spool marker at {} for {} {}.",
+                    directory, server, dimension);
+        }
         spool.recover(listing);
         return spool;
     }
 
-    // Names, from each world's own file; not the sanitised directory name.
+    // Names come from each world's file, not its directory.
     static List<World> worldsUnder(Path root) {
-        List<World> found = new ArrayList<>();
-        if (root != null && Files.isDirectory(root)) {
-            try (DirectoryStream<Path> entries = Files.newDirectoryStream(root)) {
-                for (Path entry : entries) {
-                    if (!Files.isDirectory(entry)) {
-                        continue;
-                    }
-                    World world = worldOf(entry);
-                    if (world != null) {
-                        found.add(world);
-                    }
-                }
-            } catch (IOException unreadable) {
-                LOGGER.warn("geosurvey could not read the upload spool at {}."
-                        + " Ground stays where it is.",
-                        root, unreadable);
-            }
-        }
-        return found;
+        return WorldMarker.worldsUnder(root);
     }
 
-    private static World worldOf(Path directory) {
-        Path world = directory.resolve(WORLD_FILE);
-        if (!Files.isRegularFile(world)) {
-            return null;
+    static long backlogBytes(Path root, String server, String dimension) {
+        String safeServer = sanitiseServer(server);
+        String folder = folderFor(safeServer, sanitiseDimension(dimension), server, dimension);
+        Path directory = root.resolve(folder);
+        Path earlier = earlierFolder(root, safeServer, folder);
+        if (earlier != null && namesWorld(earlier, server, dimension)) {
+            directory = earlier;
         }
-        World found;
-        try (DataInputStream in = new DataInputStream(
-                new BufferedInputStream(Files.newInputStream(world)))) {
-            String server = in.readUTF();
-            if (server.length() > Batch.MAX_NAME || server.isBlank()) {
-                found = refusedWorld(directory);
-            } else {
-                String dimension = in.readUTF();
-                if (dimension.length() > Batch.MAX_NAME || dimension.isBlank()) {
-                    found = refusedWorld(directory);
-                } else {
-                    found = new World(server, dimension);
-                }
-            }
-        } catch (IOException unreadable) {
-            LOGGER.warn("geosurvey is leaving the spool at {} alone: world file"
-                    + " unreadable ({}). Nothing deleted.",
-                    directory, unreadable.toString());
-            found = null;
-        }
-        return found;
+        return liveBytesUnder(directory);
     }
 
-    private static World refusedWorld(Path directory) {
-        LOGGER.warn("geosurvey is leaving the spool at {} alone: it names a"
-                + " world no batch could carry.", directory);
-        return null;
+    static long backlogRefusedRecords(Path root, String server, String dimension) {
+        return refusedRecordsUnder(root.resolve(folderFor(server, dimension)));
+    }
+
+    private static long bytesUnder(Path directory) {
+        long held = 0L;
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
+            for (Path entry : entries) {
+                if (Files.isRegularFile(entry)) {
+                    held += Files.size(entry);
+                }
+            }
+        } catch (IOException | RuntimeException unreadable) {
+            return held;
+        }
+        return held;
+    }
+
+    private static long liveBytesUnder(Path directory) {
+        long held = 0L;
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
+            for (Path entry : entries) {
+                String name = entry.getFileName().toString();
+                if ((SegmentSuffix.SEALED.matches(name) || SegmentSuffix.WRITING.matches(name))
+                        && Files.isRegularFile(entry)) {
+                    held += Files.size(entry);
+                }
+            }
+        } catch (IOException | RuntimeException unreadable) {
+            return held;
+        }
+        return held;
+    }
+
+    private static long refusedRecordsUnder(Path directory) {
+        long held = 0L;
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory,
+                "*" + REFUSED_SUFFIX)) {
+            for (Path entry : entries) {
+                if (Files.isRegularFile(entry)) {
+                    held += Files.size(entry) / RECORD_BYTES;
+                }
+            }
+        } catch (IOException | RuntimeException unreadable) {
+            return held;
+        }
+        return held;
     }
 
     private static Path earlierFolder(Path root, String safeServer, String current) {
@@ -353,7 +368,7 @@ final class ShareSpool implements AutoCloseable {
     }
 
     private static boolean namesWorld(Path directory, String server, String dimension) {
-        World world = worldOf(directory);
+        World world = WorldMarker.worldOf(directory);
         return world != null && server.equals(world.server())
                 && dimension.equals(world.dimension());
     }
@@ -365,7 +380,6 @@ final class ShareSpool implements AutoCloseable {
 
     private static String folderFor(String safeServer, String safeDimension,
             String server, String dimension) {
-        // A separator no host name or resource id can hold.
         int hash = 0;
         for (int i = 0; i < server.length(); i++) {
             hash = HASH_MULTIPLIER * hash + server.charAt(i);
@@ -379,62 +393,11 @@ final class ShareSpool implements AutoCloseable {
                 + "00000000".substring(hex.length()) + hex;
     }
 
-    private void rememberWorld(List<SpoolFile> listing) throws IOException {
-        sweepWorldLeftovers(listing);
-        Path world = directory.resolve(WORLD_FILE);
-        if (!Files.isRegularFile(world)) {
-            Path staging = Files.createTempFile(directory, WORLD_FILE + ".", ".writing");
-            boolean moved = false;
-            try {
-                try (DataOutputStream out = new DataOutputStream(
-                        new BufferedOutputStream(Files.newOutputStream(staging)))) {
-                    out.writeUTF(server);
-                    out.writeUTF(dimension);
-                }
-                move(staging, world);
-                moved = true;
-            } finally {
-                if (!moved) {
-                    Files.deleteIfExists(staging);
-                }
-            }
-        }
-    }
-
-    private void sweepWorldLeftovers(List<SpoolFile> listing) {
-        String ours = WORLD_FILE + ".";
-        long leftOverBy = System.currentTimeMillis() - WORLD_LEFTOVER_MILLIS;
-        for (SpoolFile each : listing) {
-            removeWorldLeftoverIfOld(each.file(), ours, leftOverBy);
-        }
-    }
-
-    private void removeWorldLeftoverIfOld(Path name, String ours, long leftOverBy) {
-        String leaf = name.getFileName().toString();
-        if (!leaf.startsWith(ours) || !leaf.endsWith(".writing")) {
-            return;
-        }
-        try {
-            if (Files.isRegularFile(name)
-                    && Files.getLastModifiedTime(name).toMillis() <= leftOverBy) {
-                if (Files.deleteIfExists(name)) {
-                    LOGGER.info("geosurvey removed {}: an unfinished world marker for"
-                            + " {} {}."
-                            + " Nothing reads it.", name, server, dimension);
-                }
-            }
-        } catch (IOException | RuntimeException leftBehind) {
-            LOGGER.warn("geosurvey could not remove {}: a leftover world marker for"
-                    + " {} {} ({}). Delete it by hand"
-                    + ".", name, server, dimension, leftBehind.toString());
-        }
-    }
-
-    // Seals a leftover .part from a stopped session; only its torn tail is lost.
     private void recover(List<SpoolFile> listing) throws IOException {
 
         long highest = -1;
         Map<Path, Long> oversized = null;
+        int refusedBatches = 0;
         for (SpoolFile each : listing) {
             Path entry = each.file();
             String name = entry.getFileName().toString();
@@ -452,7 +415,6 @@ final class ShareSpool implements AutoCloseable {
                 int stamp = stampOf(name, stemEnd);
                 highest = Math.max(highest, sequenceIn(name, stemEnd, stamp));
 
-                // Checks the stride of a file this process did not write.
                 int stride = strideOf(name, stemEnd, stamp);
                 if (stride != RECORD_BYTES) {
                     setAside(entry, name, size, stride);
@@ -474,10 +436,12 @@ final class ShareSpool implements AutoCloseable {
                     highest = Math.max(highest, sequenceIn(name, stemEnd, stamp));
                     refusedBacklog.quarantinedRecords += heldAt(strideOf(name, stemEnd, stamp), size);
                     refusedBacklog.quarantinedBytes += size;
+                    refusedBatches++;
                 }
             }
         }
         nextSequence = highest + 1;
+        int offeredAgain = waitsOutSetAside(listing);
         if (oversized != null) {
             for (Map.Entry<Path, Long> each : oversized.entrySet()) {
                 respool(each.getKey(), each.getValue());
@@ -485,14 +449,108 @@ final class ShareSpool implements AutoCloseable {
         }
         if (records > 0) {
             LOGGER.info("geosurvey found {} surveyed chunks queued for"
-                    + " {} {} and will send them.",
+                    + " {} {}.",
                     records, server, dimension);
         }
         if (refusedBacklog.quarantinedRecords > 0) {
-            LOGGER.warn("geosurvey is holding {} surveyed chunks for {} {} that the"
-                    + " collector refused. Set aside at {}, not retried. New ground"
-                    + " is unaffected.",
+            sayHeldAside(refusedBatches, offeredAgain);
+        }
+    }
+
+    private void sayHeldAside(int batches, int offeredAgain) {
+        if (offeredAgain >= batches) {
+            LOGGER.warn("geosurvey holds {} surveyed chunks for {} {} that the"
+                    + " collector refused; new ground goes up. Set aside at {}; each batch retries after"
+                    + " its wait.",
                     refusedBacklog.quarantinedRecords, server, dimension, directory);
+        } else if (offeredAgain > 0) {
+            LOGGER.warn("geosurvey holds {} surveyed chunks for {} {} that the"
+                    + " collector refused; new ground goes up. Set aside at {}; {} of {} batches retry"
+                    + " after their wait, the rest do"
+                    + " not.",
+                    refusedBacklog.quarantinedRecords, server, dimension, directory,
+                    offeredAgain, batches);
+        } else {
+            LOGGER.warn("geosurvey holds {} surveyed chunks for {} {} that the"
+                    + " collector refused; new ground goes up. Set aside at {}; they do not retry"
+                    + " on their own.",
+                    refusedBacklog.quarantinedRecords, server, dimension, directory);
+        }
+    }
+
+    private int waitsOutSetAside(List<SpoolFile> listing) {
+        List<SpoolFile> markers = null;
+        List<SpoolFile> unmarked = null;
+        for (SpoolFile each : listing) {
+            String name = each.file().getFileName().toString();
+            if (name.endsWith(SetAsideSchedule.MARKER_SUFFIX)) {
+                if (markers == null) {
+                    markers = new ArrayList<>();
+                }
+                markers.add(each);
+            } else if (SegmentSuffix.REFUSED.matches(name)) {
+                if (unmarked == null) {
+                    unmarked = new ArrayList<>();
+                }
+                unmarked.add(each);
+            }
+        }
+        int waiting = markers == null ? 0 : waitsOutMarked(markers, listing);
+        return unmarked == null ? waiting : waiting + waitsOutUnmarked(unmarked);
+    }
+
+    private int waitsOutMarked(List<SpoolFile> markers, List<SpoolFile> listing) {
+        java.util.Set<String> batches = new java.util.HashSet<>();
+        for (SpoolFile each : listing) {
+            String name = each.file().getFileName().toString();
+            if (SegmentSuffix.REFUSED.matches(name) || SegmentSuffix.SEALED.matches(name)) {
+                batches.add(name);
+            }
+        }
+        long wallNow = System.currentTimeMillis();
+        long nowNanos = System.nanoTime();
+        int waiting = 0;
+        for (SpoolFile marker : markers) {
+            Path markerFile = marker.file();
+            Path aside = setAside.refusedBeside(markerFile);
+            String asideName = aside.getFileName().toString();
+            if (batches.contains(asideName)) {
+                waitsOut(aside, SetAsideSchedule.refusalsFrom(marker.size()),
+                        SetAsideSchedule.timeOf(markerFile, wallNow), wallNow, nowNanos);
+                waiting++;
+            } else if (!batches.contains(liveBeside(aside).getFileName().toString())) {
+                synchronized (this) {
+                    setAside.stopWaiting(aside);
+                }
+                IOException leftBehind = setAside.deleteMark(aside);
+                if (leftBehind != null) {
+                    LOGGER.debug("geosurvey could not delete the retry mark {} beside a"
+                            + " missing batch ({}).", markerFile,
+                            leftBehind.toString());
+                }
+            }
+        }
+        return waiting;
+    }
+
+    private int waitsOutUnmarked(List<SpoolFile> refused) {
+        long wallNow = System.currentTimeMillis();
+        long nowNanos = System.nanoTime();
+        int waiting = 0;
+        for (SpoolFile each : refused) {
+            Path aside = each.file();
+            if (!setAside.hasRetryMark(aside) && !setAside.hasUnbuiltMark(aside)) {
+                waitsOut(aside, 1, SetAsideSchedule.timeOf(aside, wallNow), wallNow, nowNanos);
+                waiting++;
+            }
+        }
+        return waiting;
+    }
+
+    private void waitsOut(Path aside, int refusals, long refusedAtMillis, long wallNowMillis,
+                          long nowNanos) {
+        synchronized (this) {
+            setAside.waitsOut(aside, refusals, refusedAtMillis, wallNowMillis, nowNanos);
         }
     }
 
@@ -513,10 +571,10 @@ final class ShareSpool implements AutoCloseable {
             bytes = Math.max(0L, bytes - written * RECORD_BYTES);
             keepOversized(segment, size, written);
             LOGGER.warn("geosurvey found {} surveyed chunks for {} {} in {}, too big for"
-                    + " one batch, and could not rewrite them as batches"
-                    + " that can be sent ({}). Left in place, set aside"
-                    + " instead of sent in part; {} already written and will be"
-                    + " sent. Nothing deleted.",
+                    + " one batch. The rewrite failed"
+                    + " ({}); geosurvey set it aside and"
+                    + " will send the {} chunks already"
+                    + " written.",
                     size / RECORD_BYTES, server, dimension, segment,
                     couldNotRespool.toString(), written);
             batched = false;
@@ -531,17 +589,17 @@ final class ShareSpool implements AutoCloseable {
                 records = Math.max(0L, records - respooled);
                 bytes = Math.max(0L, bytes - respooled * RECORD_BYTES);
                 keepOversized(segment, size, respooled);
-                LOGGER.warn("geosurvey wrote the {} surveyed chunks in {} out again as batches"
-                        + " that can be sent, and could not delete the original ({})."
-                        + " Set aside instead of sent twice. Delete it by"
+                LOGGER.warn("geosurvey rewrote {} surveyed chunks in {} as batches"
+                        + " but could not delete the original ({})."
+                        + " Set aside; delete it by"
                         + " hand.", respooled, segment, couldNotDelete.toString());
                 deleted = false;
             }
             if (deleted) {
                 LOGGER.info("geosurvey found {} surveyed chunks for {} {} in {}, too big for"
-                        + " one batch. Rewrote as batches and removed it."
-                        + " {} bytes after the last whole chunk were"
-                        + " never finished.", respooled, server, dimension,
+                        + " one batch. It rewrote them as batches and removed the segment;"
+                        + " {} bytes were an unfinished"
+                        + " chunk.", respooled, server, dimension,
                         segment.getFileName(), size - respooled * RECORD_BYTES);
             }
         }
@@ -551,7 +609,6 @@ final class ShareSpool implements AutoCloseable {
         refusedBacklog.keepOversized(segment, size, rewritten);
     }
 
-    // Moves an unreadable-stride segment to .refused rather than reading it.
     private void setAside(Path segment, String name, long size, int stride) {
         refusedBacklog.setAside(segment, name, size, stride);
     }
@@ -571,7 +628,7 @@ final class ShareSpool implements AutoCloseable {
         IOException failure;
         try {
             if (!Files.deleteIfExists(file)) {
-                LOGGER.debug("geosurvey found {} already gone when it tried to delete it.",
+                LOGGER.debug("geosurvey could not find {} to delete it.",
                         file);
             }
             failure = null;
@@ -591,7 +648,6 @@ final class ShareSpool implements AutoCloseable {
         changes++;
     }
 
-    // Keeps the quarantine under MAX_REFUSED_BYTES, oldest first.
     private record RefusedFile(long sequence, Path path) {
     }
 
@@ -651,19 +707,19 @@ final class ShareSpool implements AutoCloseable {
                 IOException couldNotMove = moveFailure(segment, aside);
                 if (couldNotMove != null) {
                     LOGGER.warn("geosurvey found {} bytes of surveyed ground at {} written"
-                            + " at a record size this build does not read, and"
-                            + " could not move it aside ({}). Left in place,"
+                            + " at a different record size."
+                            + " The move aside failed ({}); it stays in place,"
                             + " not contributed.",
                             size, segment, couldNotMove.toString());
                 } else {
+                    owner.setAside.markUnbuilt(aside);
                     synchronized (owner) {
                         quarantinedRecords += heldAt(stride, size);
                         quarantinedBytes += size;
                     }
                     LOGGER.warn("geosurvey set {} bytes of surveyed ground for {} {} aside at"
-                            + " {}: different record size."
-                            + " Nothing deleted; your map still has it."
-                            + "",
+                            + " {}: a different record size."
+                            + " Your map still has it.",
                             size, owner.server, owner.dimension, aside);
                 }
             } finally {
@@ -693,12 +749,14 @@ final class ShareSpool implements AutoCloseable {
         private List<RefusedFile> refusedOldestFirst() {
             List<RefusedFile> oldestFirst = new ArrayList<>();
             boolean listed;
-            try (DirectoryStream<Path> entries =
+                try (DirectoryStream<Path> entries =
                          Files.newDirectoryStream(owner.directory, "*" + REFUSED_SUFFIX)) {
-                for (Path entry : entries) {
-                    oldestFirst.add(new RefusedFile(
-                            sequenceOf(entry.getFileName().toString(), REFUSED_SUFFIX), entry));
-                }
+                    for (Path entry : entries) {
+                    if (Files.isRegularFile(entry)) {
+                        oldestFirst.add(new RefusedFile(
+                                sequenceOf(entry.getFileName().toString(), REFUSED_SUFFIX), entry));
+                    }
+                    }
                 listed = true;
             } catch (IOException unreadable) {
                 listed = false;
@@ -724,7 +782,6 @@ final class ShareSpool implements AutoCloseable {
             boolean trimming = true;
             while (trimming && quarantinedBytes > cap) {
                 if (next >= oldestFirst.size()) {
-                    // When the total and the directory disagree, trust the directory.
                     synchronized (owner) {
                         if (quiet && owner.changes == expected) {
                             quarantinedBytes = 0;
@@ -837,6 +894,9 @@ final class ShareSpool implements AutoCloseable {
                     }
                     try {
                         IOException stillCannotMove = moveFailure(segment, aside);
+                        if (stillCannotMove == null) {
+                            owner.setAside.markUnbuilt(aside);
+                        }
                         synchronized (owner) {
                             if (stillCannotMove == null) {
                                 if (unmoved.remove(segment) == null) {
@@ -853,7 +913,7 @@ final class ShareSpool implements AutoCloseable {
                         }
                         if (stillCannotMove == null) {
                             LOGGER.warn("geosurvey moved {} aside on a retry:"
-                                    + " {} surveyed chunks now at {}.",
+                                    + " {} surveyed chunks at {}.",
                                     segment, info.held(), aside);
                         }
                     } finally {
@@ -877,15 +937,17 @@ final class ShareSpool implements AutoCloseable {
                     synchronized (owner) {
                         quarantinedBytes -= size;
                         quarantinedRecords -= held;
+                        owner.setAside.stopWaiting(oldest);
                     }
+                    owner.leftNoMarkBehind(oldest);
                     LOGGER.warn("geosurvey deleted {} set-aside chunks for {} {} ({}): backlog"
-                            + " over {} MiB. New ground still goes"
+                            + " over {} MiB. New ground goes"
                             + " up.",
                             held, owner.server, owner.dimension, oldest.getFileName(),
                             cap >> MIB_SHIFT);
                     outcome = Trimmed.DELETED;
                 } else {
-                    LOGGER.debug("geosurvey found {} already gone when it tried to delete it.",
+                    LOGGER.debug("geosurvey could not find {} to delete it.",
                             oldest);
                     outcome = Trimmed.GONE;
                 }
@@ -919,13 +981,13 @@ final class ShareSpool implements AutoCloseable {
                     }
                     if (removedHere) {
                         LOGGER.warn("geosurvey deleted {} set-aside chunks for {} {} ({}): backlog"
-                                + " over {} MiB; its move aside had failed. New"
-                                + " ground still goes"
+                                + " over {} MiB; the move aside failed. New"
+                                + " ground goes"
                                 + " up.",
                                 info.held(), owner.server, owner.dimension,
                                 segment.getFileName(), cap >> MIB_SHIFT);
                     } else {
-                        LOGGER.debug("geosurvey found {} already gone when it tried to delete"
+                        LOGGER.debug("geosurvey could not find {} to delete"
                                 + " it.", segment);
                     }
                 }
@@ -967,7 +1029,7 @@ final class ShareSpool implements AutoCloseable {
             }
             if (!overtaken) {
                 if (tries < MAX_ATTEMPTS) {
-                    LOGGER.debug("geosurvey could not read a spool segment back", why);
+                    LOGGER.debug("geosurvey could not read a spool segment", why);
                 } else {
                     String name = segment.getFileName().toString();
                     Path aside = owner.directory.resolve(
@@ -976,6 +1038,9 @@ final class ShareSpool implements AutoCloseable {
                     long held = size / RECORD_BYTES;
                     try {
                         IOException couldNotMove = moveFailure(segment, aside);
+                        if (couldNotMove == null) {
+                            owner.setAside.markUnbuilt(aside);
+                        }
                         boolean gone = couldNotMove instanceof java.nio.file.NoSuchFileException;
                         boolean left = couldNotMove == null || gone;
                         synchronized (owner) {
@@ -1002,18 +1067,18 @@ final class ShareSpool implements AutoCloseable {
                             }
                         }
                         if (gone) {
-                            LOGGER.debug("geosurvey found {} already gone when it tried to set it"
+                            LOGGER.debug("geosurvey could not find {} to set it"
                                     + " aside.", segment);
                         } else if (couldNotMove != null) {
-                            LOGGER.warn("geosurvey could not read {} after {} tries ({}) and"
-                                    + " could not move it aside either ({}). Stepped"
-                                    + " over. Nothing"
+                            LOGGER.warn("geosurvey could not read {} after {} tries ({}) or"
+                                    + " move it aside ({}); stepped"
+                                    + " over, nothing"
                                     + " deleted.", segment, MAX_ATTEMPTS, why.toString(),
                                     couldNotMove.toString());
                         } else {
                             LOGGER.warn("geosurvey could not read {} bytes of surveyed ground for"
                                     + " {} {} after {} tries ({}). Set aside at {}, not"
-                                    + " offered again. Nothing deleted; your"
+                                    + " retried; your"
                                     + " map still has it.", size, owner.server,
                                     owner.dimension, MAX_ATTEMPTS, why.toString(), aside);
                             trim(1);
@@ -1049,6 +1114,9 @@ final class ShareSpool implements AutoCloseable {
                                 + REFUSED_SUFFIX);
                 try {
                     IOException couldNotMove = moveFailure(segment, aside);
+                    if (couldNotMove == null) {
+                        owner.setAside.markUnbuilt(aside);
+                    }
                     boolean gone = couldNotMove instanceof java.nio.file.NoSuchFileException;
                     if (couldNotMove != null && !gone) {
                         synchronized (owner) {
@@ -1061,7 +1129,7 @@ final class ShareSpool implements AutoCloseable {
                         }
                         LOGGER.warn("geosurvey found {} surveyed chunks in {}, too big for"
                                 + " one batch, and could not move it aside ({})."
-                                + " Stepped over, not sent in part. Nothing"
+                                + " Stepped over, not sent in part; nothing"
                                 + " deleted.", held,
                                 segment, couldNotMove.toString());
                     } else {
@@ -1076,14 +1144,13 @@ final class ShareSpool implements AutoCloseable {
                             }
                         }
                         if (gone) {
-                            LOGGER.debug("geosurvey found {} already gone when it tried to set it"
+                            LOGGER.debug("geosurvey could not find {} to set it"
                                     + " aside.", segment);
                         } else {
                             LOGGER.warn("geosurvey set {} surveyed chunks for {} {} aside at {}:"
-                                    + " one batch would have dropped the rest."
-                                    + " Nothing deleted; your own map still has"
-                                    + " it."
-                                    + "", held, owner.server, owner.dimension, aside);
+                                    + " too big for one batch."
+                                    + " Your map still has"
+                                    + " it.", held, owner.server, owner.dimension, aside);
                             trim(1);
                         }
                     }
@@ -1097,7 +1164,7 @@ final class ShareSpool implements AutoCloseable {
         }
     }
 
-    // The sequence from a segment's name, or -1 if this spool did not write it.
+    // -1 for a name this spool did not write.
     static long sequenceOf(String name, String suffix) {
         SEQUENCE_OF_CALLS.incrementAndGet();
         int end = name.length() - suffix.length();
@@ -1260,7 +1327,7 @@ final class ShareSpool implements AutoCloseable {
         return MapStorage.sanitise(dimension);
     }
 
-    // The record stride from a segment's name; RECORD_BYTES if unstamped, -1 if it will not parse.
+    // RECORD_BYTES if no stride; -1 if unparsable.
     private static int strideOf(String name, int end, int stamp) {
         if (stamp < 0) {
             return RECORD_BYTES;
@@ -1342,7 +1409,6 @@ final class ShareSpool implements AutoCloseable {
         return refusedBacklog.quarantinedRecords;
     }
 
-    // What set-aside ground takes on disk, against MAX_REFUSED_BYTES.
     long refusedBytes() {
         return refusedBacklog.quarantinedBytes;
     }
@@ -1360,7 +1426,7 @@ final class ShareSpool implements AutoCloseable {
         DataOutputStream out;
         synchronized (this) {
             if (closed) {
-                throw new IOException("this spool has been closed");
+                throw new IOException("this spool is closed");
             }
             takeWriteTurn();
             out = writing;
@@ -1371,7 +1437,6 @@ final class ShareSpool implements AutoCloseable {
                 openSegment();
                 out = writing;
             }
-            // Counts the same length-prefix-and-record bytes Batch.encode would send.
             recordSink.cursor = PREFIX_BYTES;
             writer.write(recordOut, sample);
             due = flushRecord(out);
@@ -1442,7 +1507,7 @@ final class ShareSpool implements AutoCloseable {
 
     private void takeWriteTurn() throws IOException {
         if (writeTurn != null) {
-            throw new IOException("another thread is writing to this spool");
+            throw new IOException("another thread writes to this spool");
         }
         writeTurn = Thread.currentThread();
     }
@@ -1463,9 +1528,16 @@ final class ShareSpool implements AutoCloseable {
         return sealNow;
     }
 
-    // Seals on the interval, but only while nothing sealed is already waiting.
     void sealIfDue(long intervalMillis) throws IOException {
         sealOpenSegment(true, intervalMillis);
+        long nowNanos = System.nanoTime();
+        boolean offeredAgain;
+        synchronized (this) {
+            offeredAgain = sealedSegments <= 0 && setAside.dueAtOrBefore(nowNanos);
+        }
+        if (offeredAgain) {
+            offerDueSetAside(nowNanos);
+        }
     }
 
     void seal() throws IOException {
@@ -1515,8 +1587,8 @@ final class ShareSpool implements AutoCloseable {
                 if (sealedName == null) {
                     closeDetached(out, open, false);
                     if (!Files.deleteIfExists(toClose)) {
-                        LOGGER.debug("geosurvey found {} already gone when the empty segment's"
-                                + " seal tried to delete it.", toClose);
+                        LOGGER.debug("geosurvey could not find the empty segment {}"
+                                + " to delete it.", toClose);
                     }
                 } else {
                     Path sealed = directory.resolve(sealedName);
@@ -1572,7 +1644,6 @@ final class ShareSpool implements AutoCloseable {
 
     private void openSegment() throws IOException {
 
-        // Name format: a 12-digit sequence, then the stride; the width keeps names in sequence order.
         synchronized (this) {
             writingFile = directory.resolve(buildOpenSegmentName(nextSequence++, RECORD_BYTES));
             inSegment = 0;
@@ -1585,8 +1656,7 @@ final class ShareSpool implements AutoCloseable {
             channel = FileChannel.open(writingFile, NEW_SEGMENT_OPEN_OPTIONS);
         }
 
-        // Set up before writing, so append() never sees one without the other.
-        // Buffered the same way Batch.encode is, so the byte count matches it exactly.
+        // Measures the compressed bytes Batch.encode would write.
         if (sizing == null) {
             measured = new Counting(GZIP_HEADER_BYTES);
             sizing = new Sizing(measured);
@@ -1620,7 +1690,6 @@ final class ShareSpool implements AutoCloseable {
 
     private void closeSegment(boolean durable) throws IOException {
 
-        // Must run first; this is the only part holding native deflater state.
         stopMeasuring();
         DataOutputStream out = writing;
         FileChannel open = channel;
@@ -1673,7 +1742,6 @@ final class ShareSpool implements AutoCloseable {
         }
     }
 
-    // Writes nowhere; counts bytes only.
     private static final class Counting extends java.io.OutputStream {
 
         private long count;
@@ -1807,7 +1875,7 @@ final class ShareSpool implements AutoCloseable {
 
         private void drain() throws IOException {
             if (failed) {
-                throw new IOException("geosurvey could not finish writing a segment;"
+                throw new IOException("geosurvey could not finish a segment write;"
                         + " bytes already sent will not replay.");
             }
             if (filled == 0) {
@@ -1983,11 +2051,9 @@ final class ShareSpool implements AutoCloseable {
         private Loaded outcomeLoaded;
     }
 
-    // Null when nothing is sealed; the file stays until done() removes it.
-    // Holds the monitor only to reserve and to finish; the read and decode run without it.
+    // Null when no segment waits; the file stays until done() or failed().
     Loaded take() throws IOException {
 
-        // A local: two takes can run at once without the monitor held.
         DecodeScratch scratch = spareOrNewScratch();
         try {
             return takeFrom(scratch);
@@ -2004,7 +2070,6 @@ final class ShareSpool implements AutoCloseable {
             boolean shut;
             synchronized (this) {
 
-                // Closed: the directory may now belong to a different, newer spool.
                 shut = closed;
                 era = epoch;
             }
@@ -2035,12 +2100,10 @@ final class ShareSpool implements AutoCloseable {
                 retry = setAsideOversized(oldest, size, era);
             } else {
 
-                // Unlocked from here to the finally; this block touches no field, only locals.
                 decodeSegment(oldest, size, scratch);
                 boolean overtaken;
                 synchronized (this) {
 
-                    // Overtaken meanwhile: say nothing; never call giveUpOnReading.
                     overtaken = closed || epoch != era;
                 }
                 if (overtaken) {
@@ -2050,7 +2113,6 @@ final class ShareSpool implements AutoCloseable {
                 }
             }
 
-            // Stamped for done()/failed() to reuse later, not just compared here.
             handedOff = scratch.outcomeLoaded != null;
         } finally {
 
@@ -2144,7 +2206,7 @@ final class ShareSpool implements AutoCloseable {
         } else if (scratch.decodedOversized) {
             retry = setAsideOversized(oldest, size, era);
         } else if (scratch.decodedCandidate.samples().isEmpty()) {
-            LOGGER.warn("geosurvey is letting go of {}: no whole"
+            LOGGER.warn("geosurvey lets go of {}: no whole"
                     + " surveyed chunk, only {} bytes.",
                     oldest, scratch.decodedTorn);
             drop(oldest, size, 0, era);
@@ -2152,7 +2214,7 @@ final class ShareSpool implements AutoCloseable {
         } else {
             Loaded candidate = scratch.decodedCandidate;
             if (scratch.decodedTorn > 0) {
-                LOGGER.warn("geosurvey read {} whole surveyed chunks out of"
+                LOGGER.warn("geosurvey read {} whole surveyed chunks from"
                         + " {}: {} bytes were an unfinished chunk. Those"
                         + " bytes are gone; the chunks"
                         + " are not.",
@@ -2258,11 +2320,9 @@ final class ShareSpool implements AutoCloseable {
             SpoolFile file = sealedFiles.get(name);
             Path entry = file.file();
 
-            // Stepped over, not re-offered.
             Integer tries = spent.get(entry);
             boolean steppedOver = tries != null && tries >= MAX_ATTEMPTS;
 
-            // Already being read: skipped, not waited for, so this take tries the next one.
             if (steppedOver || reading.contains(entry)) {
                 name = sealedFiles.higherKey(name);
             } else {
@@ -2277,14 +2337,160 @@ final class ShareSpool implements AutoCloseable {
         return lastChooseVisited;
     }
 
-    // Returns true once set aside (a repeatable refusal); false and the caller retries otherwise.
-    // Leaves the live total and credits the refused total, whether or not the move succeeds.
+    // True once given up on; false means a retry.
     private boolean giveUpOnReading(Path segment, long size, IOException why, long era) {
         return refusedBacklog.giveUpOnReading(segment, size, why, era);
     }
 
     private boolean setAsideOversized(Path segment, long size, long era) {
         return refusedBacklog.setAsideOversized(segment, size, era);
+    }
+
+    void offerRefused() {
+        List<SpoolFile> offered = new ArrayList<>();
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory,
+                "*" + REFUSED_SUFFIX)) {
+            for (Path aside : entries) {
+                if (!Files.isRegularFile(aside)) {
+                    continue;
+                }
+                String refusedName = aside.getFileName().toString();
+                String liveName = refusedName.substring(0,
+                        refusedName.length() - REFUSED_SUFFIX.length()) + SEALED_SUFFIX;
+                long size = Files.size(aside);
+                Path segment = directory.resolve(liveName);
+                IOException couldNotMove = moveFailure(aside, segment);
+                if (couldNotMove == null) {
+                    offered.add(new SpoolFile(segment, size));
+                } else {
+                    LOGGER.warn("geosurvey could not retry {} after its key enrolled ({}).",
+                            aside, couldNotMove.toString());
+                }
+            }
+        } catch (IOException unreadable) {
+            LOGGER.warn("geosurvey could not list set-aside ground after its key enrolled.",
+                    unreadable);
+        }
+        if (!offered.isEmpty()) {
+            synchronized (this) {
+                for (SpoolFile offeredFile : offered) {
+                    setAside.stopWaiting(asideBeside(offeredFile.file()));
+                    tookBackFromSetAside(offeredFile);
+                }
+            }
+        }
+    }
+
+    private Path asideBeside(Path segment) {
+        String name = segment.getFileName().toString();
+        return directory.resolve(
+                name.substring(0, name.length() - SEALED_SUFFIX.length()) + REFUSED_SUFFIX);
+    }
+
+    private Path liveBeside(Path aside) {
+        String name = aside.getFileName().toString();
+        return directory.resolve(
+                name.substring(0, name.length() - REFUSED_SUFFIX.length()) + SEALED_SUFFIX);
+    }
+
+    private void tookBackFromSetAside(SpoolFile offeredFile) {
+        String name = offeredFile.file().getFileName().toString();
+        String refusedName = name.substring(0,
+                name.length() - SEALED_SUFFIX.length()) + REFUSED_SUFFIX;
+        long size = offeredFile.size();
+        sealedFiles.put(name, offeredFile);
+        sealedSegments++;
+        records += heldAside(refusedName, size);
+        bytes += size;
+        refusedBacklog.quarantinedRecords = Math.max(0L,
+                refusedBacklog.quarantinedRecords - heldAside(refusedName, size));
+        refusedBacklog.quarantinedBytes = Math.max(0L,
+                refusedBacklog.quarantinedBytes - size);
+        changes++;
+    }
+
+    void offerDueSetAside(long nowNanos) throws IOException {
+        Path aside;
+        int refusals;
+        synchronized (this) {
+            aside = setAside.nextDue(nowNanos);
+            refusals = aside == null ? 0 : setAside.refusalsOf(aside);
+        }
+        if (aside == null) {
+            return;
+        }
+        if (Files.notExists(aside)) {
+            synchronized (this) {
+                setAside.stopWaiting(aside);
+            }
+            if (Files.notExists(liveBeside(aside))) {
+                leftNoMarkBehind(aside);
+            }
+        } else {
+            offerAgain(aside, refusals, nowNanos);
+        }
+    }
+
+    private void offerAgain(Path aside, int refusals, long nowNanos) {
+        long size = sizeOf(aside);
+        Path segment = liveBeside(aside);
+        IOException couldNotMove = moveFailure(aside, segment);
+        if (couldNotMove == null) {
+            long held;
+            synchronized (this) {
+                setAside.stopWaiting(aside);
+                tookBackFromSetAside(new SpoolFile(segment, size));
+                held = heldAside(aside.getFileName().toString(), size);
+            }
+            LOGGER.info("geosurvey retries {} surveyed chunks for {} {},"
+                    + " {} hours after it set them aside. Refused {} times"
+                    + " again, they wait {} hours.", held, server, dimension,
+                    SetAsideSchedule.waitHours(refusals), MAX_ATTEMPTS,
+                    SetAsideSchedule.waitHours(refusals + 1));
+        } else {
+            keepsWaiting(aside, refusals, nowNanos, couldNotMove);
+        }
+    }
+
+    private void keepsWaiting(Path aside, int refusals, long nowNanos, IOException failure) {
+        int counted = Math.max(refusals, 1);
+        boolean marked = setAside.mark(aside, counted);
+        synchronized (this) {
+            if (marked) {
+                setAside.refusedAgain(aside, counted, nowNanos);
+            } else {
+                setAside.stopWaiting(aside);
+            }
+        }
+        if (marked) {
+            LOGGER.warn("geosurvey could not retry the set-aside batch {} ({})."
+                    + " It retries in {}"
+                    + " hours.", aside, failure.toString(), SetAsideSchedule.waitHours(counted));
+        } else {
+            LOGGER.warn("geosurvey could not retry the set-aside batch {} ({})."
+                    + " It does not retry"
+                    + " on its own.", aside, failure.toString());
+        }
+    }
+
+    private void leftNoMarkBehind(Path aside) {
+        IOException notDeleted = setAside.deleteMark(aside);
+        if (notDeleted != null) {
+            LOGGER.debug("geosurvey could not delete the retry mark beside {} ({}).",
+                    aside, notDeleted.toString());
+        }
+    }
+
+    // 0 when marking failed.
+    private int markedForReOffer(Path aside) {
+        int refusals = setAside.nextRefusals(aside);
+        boolean marked = setAside.mark(aside, refusals);
+        if (marked) {
+            synchronized (this) {
+                setAside.refusedAgain(aside, refusals, System.nanoTime());
+            }
+        }
+        return marked ? refusals : 0;
     }
 
     // The collector took it.
@@ -2307,7 +2513,7 @@ final class ShareSpool implements AutoCloseable {
         }
     }
 
-    // The collector would not take it. Returns true once set aside, for a refusal it will repeat.
+    // The collector would not take it. True once set aside.
     boolean failed(Loaded loaded, boolean permanent) {
         boolean setAside;
         try {
@@ -2344,7 +2550,6 @@ final class ShareSpool implements AutoCloseable {
                             if (current) {
                                 unsealed(file, name);
                                 records = Math.max(0L, records - held);
-                                // Bytes move with the file: off the live total, onto the refused one.
                                 bytes = Math.max(0L, bytes - moved);
                             } else {
                                 letGoAfterDiscard(file, name, moved);
@@ -2367,14 +2572,23 @@ final class ShareSpool implements AutoCloseable {
                         }
                     }
                     if (gone) {
-                        LOGGER.debug("geosurvey found {} already gone when it tried to set it"
+                        LOGGER.debug("geosurvey could not find {} to set it"
                                 + " aside.", file);
                     } else if (couldNotMove == null) {
-                        LOGGER.warn("geosurvey has set aside {} surveyed chunks for {} {}: the"
-                                + " collector refused it {} times. Now at {}, not"
-                                + " deleted, not sent again on its"
-                                + " own.",
-                                held, server, dimension, MAX_ATTEMPTS, aside);
+                        int waits = markedForReOffer(aside);
+                        if (waits > 0) {
+                            LOGGER.warn("geosurvey set aside {} surveyed chunks for {} {}:"
+                                    + " the collector refused it {} times. Kept at {};"
+                                    + " retried in {} hours.",
+                                    held, server, dimension, MAX_ATTEMPTS, aside,
+                                    SetAsideSchedule.waitHours(waits));
+                        } else {
+                            LOGGER.warn("geosurvey set aside {} surveyed chunks for {} {}:"
+                                    + " the collector refused it {} times. Kept at {}, unmarked; it"
+                                    + " does not retry"
+                                    + " on its own.",
+                                    held, server, dimension, MAX_ATTEMPTS, aside);
+                        }
                         trimRefused();
                     } else {
                         LOGGER.warn("geosurvey could not set aside {} ({})."
@@ -2396,7 +2610,6 @@ final class ShareSpool implements AutoCloseable {
         return setAside;
     }
 
-    // Releases a finished segment: posted, or holding no whole record.
     private void drop(Path file, long fileBytes, int held, long era) {
         boolean claimed;
         synchronized (this) {
@@ -2433,8 +2646,8 @@ final class ShareSpool implements AutoCloseable {
                 }
                 if (stillThere != null) {
                     LOGGER.warn("geosurvey could not delete {} after it was contributed ({})."
-                            + " Stepped over from here on."
-                            + " Delete the file by"
+                            + " Stepped over;"
+                            + " delete the file by"
                             + " hand.", file,
                             stillThere.toString());
                 }
@@ -2447,8 +2660,6 @@ final class ShareSpool implements AutoCloseable {
         }
     }
 
-    // One sealed segment leaves the count; clamped so it cannot go under zero.
-    // Two calls for the same file are possible; nothing ever walks the count back up.
     private void unsealed(Path segment) {
         unsealed(segment, segment.getFileName().toString());
     }
@@ -2473,7 +2684,7 @@ final class ShareSpool implements AutoCloseable {
         bytes = Math.max(0L, bytes - fileBytes);
     }
 
-    // Deletes this world's backlog. Returns how much WENT, not how much was held.
+    // Returns the records removed, not those held.
     long discard() {
         long held;
         long limit;
@@ -2487,7 +2698,6 @@ final class ShareSpool implements AutoCloseable {
         synchronized (this) {
             held = records;
 
-            // Bumps epoch first, before any file goes, so a take() or post already in flight is abandoned.
             epoch = EPOCHS.incrementAndGet();
             beginFileWork();
             limit = nextSequence;
@@ -2506,7 +2716,6 @@ final class ShareSpool implements AutoCloseable {
             }
             attempts.clear();
 
-            // Cleared beside attempts: a refilled spool owes nothing to a segment that is gone.
             spent.keySet().retainAll(refusedBacklog.unmoved.keySet());
             sealedBefore = sealedSegments;
             bytesBefore = bytes;
@@ -2522,7 +2731,6 @@ final class ShareSpool implements AutoCloseable {
             long leftBytes = removeAll(SEALED_SUFFIX, limit, spare, leftSealed);
             long leftParts = removeAll(WRITING_SUFFIX, limit, spare, leftSealed);
 
-            // Recounted from the directory, not zeroed or computed, so a failed delete still counts right.
             java.util.TreeMap<String, SpoolFile> stillSealed = new java.util.TreeMap<>();
             long walked = recount(limit, spare, stillSealed);
             boolean fromDeletes = walked < 0L && leftBytes >= 0L && leftParts >= 0L;
@@ -2563,13 +2771,12 @@ final class ShareSpool implements AutoCloseable {
         try {
             closeDetached(out, open, false);
         } catch (IOException notClosed) {
-            LOGGER.debug("geosurvey could not close a spool segment it was letting go of",
+            LOGGER.debug("geosurvey could not close a spool segment it let go of",
                     notClosed);
         }
     }
 
-    // Recounts only the live totals; refused ground has its own totals, untouched here.
-    // If the directory cannot be walked, every total is left as it was.
+    // Returns the live bytes, or -1 if unreadable.
     private long recount(long limit, Path spare, java.util.TreeMap<String, SpoolFile> stillSealed) {
         long spared = sparedSequence(spare, limit);
         long live = 0;
@@ -2596,15 +2803,14 @@ final class ShareSpool implements AutoCloseable {
                 }
             }
         } catch (IOException | java.nio.file.DirectoryIteratorException unreadable) {
-            LOGGER.warn("geosurvey could not read the spool at {} back after letting"
-                    + " go of it ({}). Totals are unchanged."
-                    + "", directory, unreadable.toString());
+            LOGGER.warn("geosurvey could not read the spool at {} after it"
+                    + " let go of the backlog ({}). Totals are unchanged.", directory, unreadable.toString());
             live = -1L;
         }
         return live;
     }
 
-    // Deletes every file with that suffix, one at a time; one failure does not stop the rest.
+    // Returns the bytes not deleted, or -1 if unreadable.
     private long removeAll(String suffix, long limit, Path spare,
             java.util.TreeMap<String, SpoolFile> left) {
         long spared = sparedSequence(spare, limit);
@@ -2618,21 +2824,21 @@ final class ShareSpool implements AutoCloseable {
                 }
                 try {
                     if (!Files.deleteIfExists(entry)) {
-                        LOGGER.debug("geosurvey found {} already gone while letting go"
-                                + " of the backlog for {} {}.", entry, server, dimension);
+                        LOGGER.debug("geosurvey could not find {} to delete from"
+                                + " the backlog for {} {}.", entry, server, dimension);
                     }
                 } catch (IOException stillThere) {
-                    LOGGER.warn("geosurvey could not delete {} while letting go of"
+                    LOGGER.warn("geosurvey could not delete {} from"
                             + " the backlog for {} {} ({}). Still counted, queued"
-                            + " for next launch. Delete it by"
+                            + " for the next launch; delete it by"
                             + " hand.",
                             entry, server, dimension, stillThere.toString());
                     leftBytes += leftBehind(entry, left);
                 }
             }
         } catch (IOException | java.nio.file.DirectoryIteratorException unreadable) {
-            LOGGER.warn("geosurvey could not read the spool directory {} while"
-                    + " letting go of its backlog ({}). Nothing"
+            LOGGER.warn("geosurvey could not read the spool directory {} when"
+                    + " it let go of its backlog ({}). Nothing"
                     + " deleted.", directory, unreadable.toString());
             leftBytes = -1L;
         }
@@ -2683,8 +2889,7 @@ final class ShareSpool implements AutoCloseable {
         goneMidDiscard.clear();
     }
 
-    // Seals and releases handles; the files stay, and appending can resume later.
-    // Only removeIfEmpty ends the spool for good.
+    // Seals the open segment; appending can resume.
     @Override
     public void close() {
         sealOnTheWayOut();
@@ -2699,13 +2904,12 @@ final class ShareSpool implements AutoCloseable {
         try {
             seal();
         } catch (IOException notSealed) {
-            LOGGER.debug("geosurvey could not seal a spool segment on the way out",
+            LOGGER.debug("geosurvey could not seal a spool segment when it closed",
                     notSealed);
         }
     }
 
-    // Ends this spool's Deflater for good; for retiring the object, not necessarily its directory.
-    // Different from close(): close() must not end it, since reopen() reuses it.
+    // Ends the Deflater, after the current writer if another thread holds the write turn.
     synchronized void endForGood() {
         Thread turn = writeTurn;
         if (turn == null || turn == Thread.currentThread()) {
@@ -2764,9 +2968,8 @@ final class ShareSpool implements AutoCloseable {
         try {
             listing = listDirectory();
         } catch (IOException unreadable) {
-            LOGGER.warn("geosurvey could not read the spool at {} back after a write"
-                    + " failed ({}). Totals are unchanged."
-                    + "", directory, unreadable.toString());
+            LOGGER.warn("geosurvey could not read the spool at {} after a write"
+                    + " failed ({}). Totals are unchanged.", directory, unreadable.toString());
             listing = null;
         }
         Restock answer;
@@ -2821,7 +3024,7 @@ final class ShareSpool implements AutoCloseable {
                         renamed.add(sealing);
                     } else {
                         LOGGER.debug("geosurvey could not seal a spool segment after a"
-                                + " write to it failed", stillWriting);
+                                + " failed write", stillWriting);
                     }
                 }
             }
@@ -2884,20 +3087,19 @@ final class ShareSpool implements AutoCloseable {
         sealedFiles = stillSealed;
     }
 
-    // Removes a spool that holds nothing, so the directory does not accrete.
     boolean removeIfEmpty() {
         if (!shutIfEmpty()) {
             return false;
         }
         boolean removed;
         try {
-            Path worldFile = directory.resolve(WORLD_FILE);
+            Path worldFile = directory.resolve(WorldMarker.FILE_NAME);
             if (!Files.deleteIfExists(worldFile)) {
-                LOGGER.debug("geosurvey found {} already gone when it tried to delete it.",
+                LOGGER.debug("geosurvey could not find {} to delete it.",
                         worldFile);
             }
             if (!Files.deleteIfExists(directory)) {
-                LOGGER.debug("geosurvey found {} already gone when it tried to delete it.",
+                LOGGER.debug("geosurvey could not find {} to delete it.",
                         directory);
             }
             removed = true;
@@ -2933,7 +3135,7 @@ final class ShareSpool implements AutoCloseable {
             nothing = true;
             java.util.Iterator<Path> each = entries.iterator();
             while (nothing && each.hasNext()) {
-                nothing = each.next().getFileName().toString().equals(WORLD_FILE);
+                nothing = each.next().getFileName().toString().equals(WorldMarker.FILE_NAME);
             }
         } catch (IOException | RuntimeException unreadable) {
             nothing = false;
@@ -2941,10 +3143,10 @@ final class ShareSpool implements AutoCloseable {
         return nothing;
     }
 
-    private static void move(Path from, Path to) throws IOException {
+    static void move(Path from, Path to) throws IOException {
         try {
             Files.move(from, to, MOVE_OPTIONS);
-        } catch (java.nio.file.AtomicMoveNotSupportedException acrossDevices) {
+        } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
             Files.move(from, to, MOVE_FALLBACK_OPTIONS);
         }
     }

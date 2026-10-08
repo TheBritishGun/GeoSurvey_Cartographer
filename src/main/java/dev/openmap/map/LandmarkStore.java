@@ -1,5 +1,6 @@
 package dev.openmap.map;
 
+import dev.openmap.json.AtomicFileReplace;
 import dev.openmap.json.JsonBind;
 import dev.openmap.json.JsonParseException;
 import dev.openmap.symbol.Affiliation;
@@ -30,6 +31,10 @@ public final class LandmarkStore {
 
     private static final DiskCopy NO_DISK_COPY = new DiskCopy(null, -1L);
 
+    // The one sequence that every store's revisions come from.
+    private static final java.util.concurrent.atomic.AtomicLong REVISIONS =
+            new java.util.concurrent.atomic.AtomicLong();
+
     private record DiskCopy(Path path, long revision) {
     }
 
@@ -43,7 +48,7 @@ public final class LandmarkStore {
 
     private Path unreadablePath;
 
-    private volatile long revision;
+    private volatile long revision = REVISIONS.incrementAndGet();
 
     private volatile DiskCopy onDisk = NO_DISK_COPY;
 
@@ -66,7 +71,7 @@ public final class LandmarkStore {
         landmarks.add(landmark);
         gridAdd(landmark);
         nameIndexAdd(landmark);
-        revision++;
+        revision = REVISIONS.incrementAndGet();
     }
 
     public boolean remove(Landmark landmark) {
@@ -74,7 +79,7 @@ public final class LandmarkStore {
         if (removed) {
             gridRemove(landmark);
             nameIndexRemove(landmark);
-            revision++;
+            revision = REVISIONS.incrementAndGet();
         }
         return removed;
     }
@@ -83,45 +88,60 @@ public final class LandmarkStore {
         landmarks.clear();
         grid.clear();
         nameIndex.clear();
-        revision++;
+        revision = REVISIONS.incrementAndGet();
     }
 
-    // Keeps the name index and the revision counter in step; returns the
-    // name actually stored, after normalising.
+    // Puts back a list and a revision this store held before; each marker keeps its fields.
+    public void restore(List<Landmark> held, long heldRevision) {
+        List<Landmark> kept = new ArrayList<>(held);
+        landmarks.clear();
+        grid.clear();
+        nameIndex.clear();
+        for (Landmark landmark : kept) {
+            landmarks.add(landmark);
+            gridAdd(landmark);
+            nameIndexAdd(landmark);
+        }
+        revision = heldRevision;
+    }
+
+    // Returns the normalised name.
     public String rename(Landmark landmark, String newName) {
         nameIndexRemove(landmark);
         landmark.setName(newName);
         nameIndexAdd(landmark);
-        revision++;
+        revision = REVISIONS.incrementAndGet();
         return landmark.name();
     }
 
-    // Keeps the revision counter in step. A zero-alpha colour becomes
-    // opaque.
+    // Zero-alpha colours become opaque.
     public void setColour(Landmark landmark, int argb) {
         landmark.setColour(argb);
-        revision++;
+        revision = REVISIONS.incrementAndGet();
     }
 
-    // Keeps the revision counter in step.
     public void setIcon(Landmark landmark, SymbolIcon icon) {
         landmark.setIcon(icon);
-        revision++;
+        revision = REVISIONS.incrementAndGet();
     }
 
-    // Whose it is (MIL-STD-2525). Keeps the revision counter in step.
     public void setAffiliation(Landmark landmark, Affiliation affiliation) {
         landmark.setAffiliation(affiliation);
-        revision++;
+        revision = REVISIONS.incrementAndGet();
     }
 
-    // Matches by trimmed, case-insensitive name. Empty, never null; a copy.
+    // shared may be null: the marker is not shared.
+    public void setShared(Landmark landmark, String shared) {
+        landmark.setShared(shared);
+        revision = REVISIONS.incrementAndGet();
+    }
+
+    // A copy; never null.
     public List<Landmark> byName(String typed) {
         ArrayList<Landmark> found = nameIndex.get(nameKey(typed));
         return found == null ? Collections.emptyList() : new ArrayList<>(found);
     }
 
-    // Same match as byName, without building the list.
     public int countByName(String typed) {
         ArrayList<Landmark> found = nameIndex.get(nameKey(typed));
         return found == null ? 0 : found.size();
@@ -306,17 +326,28 @@ public final class LandmarkStore {
     public static LandmarkStore load(Path path) {
         LandmarkStore store = new LandmarkStore();
         boolean readable = path != null;
+        boolean absent = false;
         if (readable) {
             try {
                 readable = isRegularFile(path);
-            } catch (NoSuchFileException ignored) {
+            } catch (NoSuchFileException notThere) {
                 readable = false;
+                absent = true;
             } catch (IOException e) {
                 String message = e.getMessage();
                 store.unreadable = e.getClass().getSimpleName()
                         + (message == null ? "" : ": " + message);
                 store.unreadablePath = path;
                 readable = false;
+            }
+        }
+        if (absent) {
+            try {
+                readable = AtomicFileReplace.recoverStaleAside(path) && isRegularFile(path);
+            } catch (IOException e) {
+                String message = e.getMessage();
+                store.unreadable = e.getClass().getSimpleName()
+                        + (message == null ? "" : ": " + message);
             }
         }
         if (readable) {
@@ -332,15 +363,14 @@ public final class LandmarkStore {
                     int kept = store.landmarks.size();
                     if (kept < total) {
                         store.unreadable = (total - kept) + " of " + total
-                                + " landmarks could not be read";
+                                + " landmarks unreadable";
                         store.unreadablePath = path;
                     }
                 } else {
-                    store.unreadable = "the document held no landmark list";
+                    store.unreadable = "no landmark list found";
                     store.unreadablePath = path;
                 }
             } catch (IOException | JsonParseException e) {
-                // Unreadable, not simply empty.
                 store.landmarks.clear();
                 store.grid.clear();
                 store.nameIndex.clear();
@@ -353,8 +383,7 @@ public final class LandmarkStore {
         return persisted(store, path);
     }
 
-    // Why this store is empty, or "" when it is simply empty. A caller
-    // that writes must check this first.
+    // The read failure, or empty.
     public String unreadable() {
         clearUnreadableWhenMovedAside();
         return unreadable;
@@ -382,22 +411,19 @@ public final class LandmarkStore {
         unreadablePath = null;
     }
 
-    // How many times add, remove, clear or rename has changed this store.
-    // Missed by a direct call to a Landmark setter.
+    // Ignores Landmark setters called directly.
     public long revision() {
         return revision;
     }
 
-    // Whether a save to path right now would write the same bytes already
-    // there. False again if the file was deleted or moved externally.
+    // A save would change nothing.
     public boolean isPersisted(Path path) {
         DiskCopy held = onDisk;
         return path != null && path.equals(held.path()) && revision == held.revision()
                 && Files.exists(path);
     }
 
-    // Writes the whole store atomically. Refuses when the store came from
-    // a file that could not be read.
+    // Refuses after a failed load.
     public void save(Path path) throws IOException {
         save(path, false);
     }
@@ -406,7 +432,7 @@ public final class LandmarkStore {
         long written = revision;
         Path aside = writeAside(path, force);
         if (aside != null) {
-            moveInto(aside, path, written, MapStorage.FileReplace.ALWAYS);
+            moveInto(aside, path, written, AtomicFileReplace.ALWAYS);
         }
     }
 
@@ -414,8 +440,8 @@ public final class LandmarkStore {
         clearUnreadableWhenMovedAside();
         if (!unreadable.isEmpty()) {
             throw new IOException(path + " could not be read (" + unreadable
-                    + "); not saved over."
-                    + " Move that file aside to start a fresh one.");
+                    + ")."
+                    + " Move that file aside; the next save starts fresh.");
         }
         Path aside;
         if (!force && isPersisted(path)) {
@@ -427,30 +453,23 @@ public final class LandmarkStore {
             }
             aside = path.resolveSibling(path.getFileName() + "."
                     + Thread.currentThread().threadId() + ".tmp");
-            try {
-                try (Writer writer = Files.newBufferedWriter(aside, StandardCharsets.UTF_8)) {
+            AtomicFileReplace.writeTemp(aside, written -> {
+                try (Writer writer = Files.newBufferedWriter(written, StandardCharsets.UTF_8)) {
                     JSON.toJson(landmarks, writer);
                 }
-            } catch (IOException | RuntimeException failed) {
-                try {
-                    Files.deleteIfExists(aside);
-                } catch (IOException | RuntimeException undeletable) {
-                    failed.addSuppressed(undeletable);
-                }
-                throw failed;
-            }
+            });
         }
         return aside;
     }
 
-    void moveInto(Path aside, Path path, long written, MapStorage.FileReplace.Turn turn)
+    void moveInto(Path aside, Path path, long written, AtomicFileReplace.Turn turn)
             throws IOException {
-        MapStorage.FileReplace.Moved moved =
-                MapStorage.FileReplace.replace(aside, path, !atomicMoveUnsupported, turn);
-        if (moved == MapStorage.FileReplace.Moved.WITHOUT_ATOMIC_MOVE) {
+        AtomicFileReplace.Moved moved =
+                AtomicFileReplace.replace(aside, path, !atomicMoveUnsupported, turn);
+        if (moved == AtomicFileReplace.Moved.WITHOUT_ATOMIC_MOVE) {
             atomicMoveUnsupported = true;
         }
-        if (moved != MapStorage.FileReplace.Moved.UNWANTED) {
+        if (moved != AtomicFileReplace.Moved.UNWANTED) {
             onDisk = new DiskCopy(path, written);
         }
     }

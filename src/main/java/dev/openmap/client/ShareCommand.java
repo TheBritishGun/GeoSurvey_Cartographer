@@ -5,6 +5,7 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import dev.openmap.LandNav;
+import dev.openmap.json.AtomicFileReplace;
 import dev.openmap.claim.ClaimBook;
 import dev.openmap.claim.Claims;
 import dev.openmap.config.LandNavConfig;
@@ -16,9 +17,12 @@ import dev.sandpaper.Sandpaper;
 import dev.sandpaper.core.WorkPool;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -44,27 +48,112 @@ public final class ShareCommand {
     record Answer(boolean ok, String text) {
     }
 
+    record CollectorAddress(boolean accepted, String address, String refusal) {
+    }
+
     private ShareCommand() {
     }
 
     private static final org.slf4j.Logger LOGGER =
-            org.slf4j.LoggerFactory.getLogger("geosurvey");
+            org.slf4j.LoggerFactory.getLogger(CollectorMod.MOD_ID);
 
     public static void register(Supplier<MapStorage> storage) {
+        worlds = storage;
         Markers markers = new Markers(storage);
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, access) -> {
             CLAIMS.workPool(Sandpaper.workPool());
             CLAIMS.saveFailureSink(problem -> LOGGER.warn(
                     "could not write the claim book; a temporary file may"
-                            + " have been left beside it", problem));
+                            + " remain beside it", problem));
             dispatcher.register(tree(LandNav::config, SETTINGS, CLAIMS, markers,
                     ShareCommand::standingOf, Sandpaper::workPool));
         });
     }
 
-    // The path is resolved on use, not here.
-    private static final Claims CLAIMS = new Claims(() ->
-            LandNav.dataDir().resolve(ClaimBook.FILE));
+    // Set by register; read on the client thread.
+    private static volatile Supplier<MapStorage> worlds = () -> null;
+
+    private static Path sharedBook() {
+        return LandNav.dataDir().resolve(ClaimBook.FILE);
+    }
+
+    private record Placed(Path world, Path book) {
+    }
+
+    private static volatile Placed placed;
+
+    private static final Claims CLAIMS = claims();
+
+    private static Claims claims() {
+        Claims claims = new Claims(ShareCommand::currentBook, ShareCommand::sharedBook);
+        claims.listenerFailureNote(LOGGER::warn);
+        return claims;
+    }
+
+    // Client thread only.
+    public static Path claimBook() {
+        MapStorage storage = worlds.get();
+        if (storage == null) {
+            return null;
+        }
+        return claimBook(storage, ShareCommand::sharedBook);
+    }
+
+    // Client thread only; null without a world.
+    static Path claimBook(MapStorage storage, Supplier<Path> shared) {
+        Path world = storage == null ? null : storage.root();
+        Placed was = placed;
+        Path book;
+        if (was != null && Objects.equals(was.world(), world)) {
+            book = was.book();
+        } else {
+            book = ClaimBook.bookIn(world);
+            placed = new Placed(world, book);
+            if (book != null) {
+                CLAIMS.retireAndPortOnceAsync(book, shared.get(), ShareCommand::portNote);
+            }
+        }
+        return book;
+    }
+
+    // Any thread; returns the book claimBook last resolved.
+    static Path currentBook() {
+        Placed was = placed;
+        return was == null ? null : was.book();
+    }
+
+    private static volatile Consumer<Claims.Said> portNotes = ShareCommand::logPortNote;
+
+    // listener may be null: nobody is told of a saved claims book.
+    public static void afterClaimsSaved(Claims.BookSaved listener) {
+        CLAIMS.afterSave(listener);
+    }
+
+    // lookup may be null: no shared claim's entry is known.
+    public static void sharedClaimsFrom(Claims.SharedFrom lookup) {
+        CLAIMS.sharedFrom(lookup);
+    }
+
+    public static void claimsPortNotes(Consumer<Claims.Said> notes) {
+        portNotes = (notes == null) ? ShareCommand::logPortNote : notes;
+    }
+
+    private static void logPortNote(Claims.Said said) {
+        LOGGER.info("{}", said.text());
+    }
+
+    // Each line of a note goes to the sink alone.
+    private static void portNote(Claims.Said said) {
+        String text = said.text();
+        int from = 0;
+        boolean more = true;
+        while (more) {
+            int next = text.indexOf('\n', from);
+            more = next >= 0;
+            portNotes.accept(new Claims.Said(said.ok(), text.substring(from, more ? next : text.length())));
+            from = next + 1;
+        }
+    }
 
     private static final class DirectSettings implements Persist {
 
@@ -75,7 +164,7 @@ public final class ShareCommand {
 
         @Override
         public LandNav.Write staged() {
-            return LandNav.stageWrite();
+            return null;
         }
     }
 
@@ -101,8 +190,8 @@ public final class ShareCommand {
             Function<CommandContext<FabricClientCommandSource>, Claims.Standing> where,
             Supplier<WorkPool> pools) {
         return ClientCommands.literal("geosurvey")
-                .then(claimTree(claims, where))
-                .then(markerTree(markers, where))
+                .then(claimTree(settings, claims, where))
+                .then(markerTree(settings, markers, where))
                 .then(ClientCommands.literal("share")
                         .executes(context -> speak(context, status(settings.get())))
                         .then(ClientCommands.literal("off")
@@ -112,46 +201,29 @@ public final class ShareCommand {
                         .then(ClientCommands.literal("on")
                                 .executes(context ->
                                         spoken(context, on(settings.get()),
-                                                persist, pools))))
+                                                persist, pools)))
+                        .then(ClientCommands.literal("proof")
+                                .then(ClientCommands.literal("on")
+                                        .executes(context ->
+                                                spoken(context, proof(settings.get(), true),
+                                                        persist, pools)))
+                                .then(ClientCommands.literal("off")
+                                        .executes(context ->
+                                                spoken(context, proof(settings.get(), false),
+                                                        persist, pools)))))
                 .then(ClientCommands.literal("collector")
                         .then(ClientCommands.literal("clear")
-                                .executes(context -> spoken(context,
-                                        forgetCollector(settings.get()), persist,
-                                        pools)))
-                        // find only offers addresses; naming one is the choice.
+                                .executes(context -> speak(context, new Answer(false,
+                                        "Nothing was set. Empty the collector address in the settings."))))
                         .then(ClientCommands.literal("find")
                                 .executes(context -> CollectorFinder.offer(
                                         context.getSource(), settings.get())))
                         .then(ClientCommands.argument("address",
                                         StringArgumentType.greedyString())
-                                // The same addresses collector find prints.
                                 .suggests(Suggest.of(any ->
                                         CollectorFinder.seeds(settings.get())))
-                                .executes(context -> spoken(context, collector(
-                                        settings.get(),
-                                        StringArgumentType.getString(context, "address")),
-                                        persist, pools))))
-                .then(ClientCommands.literal("friend")
-                        .executes(context -> speak(context, friends(settings.get())))
-                        .then(ClientCommands.literal("add")
-                                .then(ClientCommands.argument("player",
-                                                StringArgumentType.greedyString())
-                                        // Online players only; a friend may be named while offline.
-                                        .suggests(Suggest.filtered(context ->
-                                                context.getSource().getOnlinePlayerNames()))
-                                        .executes(context -> spoken(context, addFriend(
-                                                settings.get(),
-                                                StringArgumentType.getString(context, "player")),
-                                                persist, pools))))
-                        .then(ClientCommands.literal("remove")
-                                .then(ClientCommands.argument("player",
-                                                StringArgumentType.greedyString())
-                                        .suggests(Suggest.cleaned(any ->
-                                                settings.get().friends))
-                                        .executes(context -> spoken(context, removeFriend(
-                                                settings.get(),
-                                                StringArgumentType.getString(context, "player")),
-                                                persist, pools)))))
+                                .executes(context -> CollectorFinder.check(context.getSource(), settings.get(),
+                                        StringArgumentType.getString(context, "address"), persist))))
                 .then(ClientCommands.literal("server")
                         .executes(context -> speak(context, servers(settings.get())))
                         .then(ClientCommands.literal("add")
@@ -173,69 +245,125 @@ public final class ShareCommand {
                                                 persist, pools)))));
     }
 
-    // /geosurvey claim: create, edit, list and remove a claim.
     private static LiteralArgumentBuilder<FabricClientCommandSource> claimTree(
-            Claims claims,
+            Supplier<LandNavConfig> settings, Claims claims,
             Function<CommandContext<FabricClientCommandSource>, Claims.Standing> where) {
         return ClientCommands.literal("claim")
-                .executes(context -> say(context, claims.list()))
+                .executes(context -> {
+                    claimBook();
+                    return say(context, claims.list());
+                })
                 .then(ClientCommands.literal("start")
                         .then(ClientCommands.argument("name",
                                         StringArgumentType.greedyString())
-                                .executes(context -> answered(claims.startAsync(
-                                        where.apply(context), arg(context, "name"),
-                                        said -> say(context, said))))))
+                                .executes(context -> {
+                                    claimBook();
+                                    return answered(claims.startAsync(where.apply(context),
+                                            arg(context, "name"), said -> say(context, said)));
+                                })))
                 .then(ClientCommands.literal("corner")
-                        .executes(context ->
-                                say(context, claims.corner(where.apply(context)))))
+                        .executes(context -> {
+                            claimBook();
+                            return say(context, claims.corner(where.apply(context)));
+                        }))
                 .then(ClientCommands.literal("undo")
-                        .executes(context -> say(context, claims.undo())))
+                        .executes(context -> {
+                            claimBook();
+                            return say(context, claims.undo());
+                        }))
                 .then(ClientCommands.literal("cancel")
-                        .executes(context -> say(context, claims.cancel())))
+                        .executes(context -> {
+                            claimBook();
+                            return say(context, claims.cancel());
+                        }))
                 .then(ClientCommands.literal("finish")
-                        .executes(context -> answered(claims.finishAsync(
-                                where.apply(context),
-                                said -> say(context, said)))))
+                        .executes(context -> {
+                            claimBook();
+                            return answered(claims.finishAsync(where.apply(context),
+                                    said -> say(context, said)));
+                        }))
                 .then(ClientCommands.literal("colour")
                         .then(ClientCommands.argument("colour",
                                         StringArgumentType.word())
                                 .suggests(Suggest.of(any -> Suggest.COLOURS()))
-                                .executes(context -> say(context,
-                                        claims.penColour(arg(context, "colour"))))))
+                                .executes(context -> {
+                                    claimBook();
+                                    return say(context, claims.penColour(arg(context, "colour")));
+                                })
+                                .then(ClientCommands.argument("name",
+                                                StringArgumentType.greedyString())
+                                        .suggests(Suggest.of(any -> claimNames(claims)))
+                                        .executes(context -> {
+                                            claimBook();
+                                            return answered(claims.recolourAsync(
+                                                    arg(context, "name"), arg(context, "colour"),
+                                                    said -> say(context, said)));
+                                        }))))
                 .then(ClientCommands.literal("rename")
                         .then(ClientCommands.argument("name",
                                         StringArgumentType.string())
-                                .suggests(Suggest.quoting(any -> claims.names()))
+                                .suggests(Suggest.quoting(any -> claimNames(claims)))
                                 .then(ClientCommands.argument("newName",
                                                 StringArgumentType.greedyString())
-                                        .executes(context -> answered(claims.renameAsync(
-                                                arg(context, "name"), arg(context, "newName"),
-                                                said -> say(context, said)))))))
-                .then(ClientCommands.literal("recolour")
-                        .then(ClientCommands.argument("name",
-                                        StringArgumentType.string())
-                                .suggests(Suggest.quoting(any -> claims.names()))
-                                .then(ClientCommands.argument("colour",
-                                                StringArgumentType.word())
-                                        .suggests(Suggest.of(any -> Suggest.COLOURS()))
-                                        .executes(context -> answered(claims.recolourAsync(
-                                                arg(context, "name"), arg(context, "colour"),
-                                                said -> say(context, said)))))))
+                                        .executes(context -> {
+                                            claimBook();
+                                            return answered(claims.renameAsync(
+                                                    arg(context, "name"), arg(context, "newName"),
+                                                    said -> say(context, said)));
+                                        }))))
                 .then(ClientCommands.literal("remove")
                         .then(ClientCommands.argument("name",
                                         StringArgumentType.greedyString())
-                                // Greedy: takes the rest of the line, typed bare.
-                                .suggests(Suggest.of(any -> claims.names()))
-                                .executes(context -> answered(claims.removeAsync(
-                                        arg(context, "name"),
-                                        said -> say(context, said))))))
+                                .suggests(Suggest.of(any -> claimNames(claims)))
+                                .executes(context -> {
+                                    claimBook();
+                                    Claims.Standing here = where.apply(context);
+                                    String playerId = here == null ? "" : here.playerId();
+                                    return answered(claims.removeAsync(arg(context, "name"), playerId,
+                                            said -> say(context, said)));
+                                })))
+                .then(ClientCommands.literal("share")
+                        .then(ClientCommands.argument("name",
+                                        StringArgumentType.greedyString())
+                                .suggests(Suggest.of(any -> claimNames(claims)))
+                                .executes(context -> {
+                                    claimBook();
+                                    Claims.Standing here = where.apply(context);
+                                    String playerId = here == null ? "" : here.playerId();
+                                    return answered(claims.shareAsync(arg(context, "name"),
+                                            settings.get().shareCollector, playerId,
+                                            said -> say(context, said)));
+                                })))
+                .then(ClientCommands.literal("unshare")
+                        .then(ClientCommands.argument("name",
+                                        StringArgumentType.greedyString())
+                                .suggests(Suggest.of(any -> claimNames(claims)))
+                                .executes(context -> {
+                                    claimBook();
+                                    Claims.Standing here = where.apply(context);
+                                    String playerId = here == null ? "" : here.playerId();
+                                    return answered(claims.unshareAsync(arg(context, "name"), playerId,
+                                            said -> say(context, said)));
+                                })))
                 .then(ClientCommands.literal("where")
-                        .executes(context -> say(context, claims.where())));
+                        .executes(context -> {
+                            claimBook();
+                            return say(context, claims.where());
+                        }))
+                .then(ClientCommands.literal("port")
+                        .executes(context -> {
+                            claimBook();
+                            return answered(claims.portAsync(said -> say(context, said)));
+                        }));
     }
 
-    // /geosurvey marker: place, list, edit and remove a marker.
+    private static java.util.List<String> claimNames(Claims claims) {
+        claimBook();
+        return claims.names();
+    }
+
     private static LiteralArgumentBuilder<FabricClientCommandSource> markerTree(
-            Markers markers,
+            Supplier<LandNavConfig> settings, Markers markers,
             Function<CommandContext<FabricClientCommandSource>, Claims.Standing> where) {
         return ClientCommands.literal("marker")
                 .executes(context ->
@@ -255,25 +383,25 @@ public final class ShareCommand {
                                                     (int) Math.floor(here.x()),
                                                     (int) Math.floor(here.z()),
                                                     name));
-                                })))
-                .then(ClientCommands.literal("at")
-                        .then(ClientCommands.argument("x",
-                                        IntegerArgumentType.integer())
-                                .then(ClientCommands.argument("z",
+                                }))
+                        .then(ClientCommands.literal("at")
+                                .then(ClientCommands.argument("x",
                                                 IntegerArgumentType.integer())
-                                        .then(ClientCommands.argument("name",
-                                                        StringArgumentType.greedyString())
-                                                .executes(context -> {
-                                                    String name = arg(context, "name");
-                                                    return markNamed(context, name,
-                                                            () -> markers.add(
-                                                                    worldOf(where, context),
-                                                                    IntegerArgumentType.getInteger(
-                                                                            context, "x"),
-                                                                    IntegerArgumentType.getInteger(
-                                                                            context, "z"),
-                                                                    name));
-                                                })))))
+                                        .then(ClientCommands.argument("z",
+                                                        IntegerArgumentType.integer())
+                                                .then(ClientCommands.argument("name",
+                                                                StringArgumentType.greedyString())
+                                                        .executes(context -> {
+                                                            String name = arg(context, "name");
+                                                            return markNamed(context, name,
+                                                                    () -> markers.add(
+                                                                            worldOf(where, context),
+                                                                            IntegerArgumentType.getInteger(
+                                                                                    context, "x"),
+                                                                            IntegerArgumentType.getInteger(
+                                                                                    context, "z"),
+                                                                            name));
+                                                        }))))))
                 .then(ClientCommands.literal("remove")
                         .then(ClientCommands.argument("name",
                                         StringArgumentType.greedyString())
@@ -281,6 +409,25 @@ public final class ShareCommand {
                                         markers.names(worldOf(where, context))))
                                 .executes(context -> mark(context,
                                         markers.remove(worldOf(where, context),
+                                                arg(context, "name"))))))
+                .then(ClientCommands.literal("share")
+                        .then(ClientCommands.argument("name",
+                                        StringArgumentType.greedyString())
+                                .suggests(Suggest.of(context ->
+                                        markers.names(worldOf(where, context))))
+                                .executes(context -> {
+                                    Claims.Standing here = where.apply(context);
+                                    return mark(context, markers.share(worldOf(where, context),
+                                            arg(context, "name"), settings.get().shareCollector,
+                                            here == null ? "" : here.player()));
+                                })))
+                .then(ClientCommands.literal("unshare")
+                        .then(ClientCommands.argument("name",
+                                        StringArgumentType.greedyString())
+                                .suggests(Suggest.of(context ->
+                                        markers.names(worldOf(where, context))))
+                                .executes(context -> mark(context,
+                                        markers.unshare(worldOf(where, context),
                                                 arg(context, "name"))))))
                 .then(ClientCommands.literal("rename")
                         .then(ClientCommands.argument("name",
@@ -295,7 +442,6 @@ public final class ShareCommand {
                                                         worldOf(where, context),
                                                         arg(context, "name"),
                                                         arg(context, "newName"))))))
-                        // Addresses a marker by position, not name.
                         .then(ClientCommands.literal("at")
                                 .then(ClientCommands.argument("x",
                                                 IntegerArgumentType.integer())
@@ -320,9 +466,8 @@ public final class ShareCommand {
                                 .suggests(Suggest.quoting(context ->
                                         markers.names(worldOf(where, context))))
                                 .then(ClientCommands.argument("colour",
-                                                // word() cannot hold '#', so this uses greedyString.
                                                 StringArgumentType.greedyString())
-                                        // Named colours are suggested; a hex code is accepted but not suggested.
+                                        // Also accepts a hex code, not suggested.
                                         .suggests(Suggest.of(any -> Suggest.COLOURS()))
                                         .executes(context -> mark(context,
                                                 markers.colour(
@@ -358,7 +503,7 @@ public final class ShareCommand {
                                                         arg(context, "affiliation")))))));
     }
 
-    // The dimension a marker is stored under, or null outside a world.
+    // A marker's dimension, or null outside a world.
     private static String worldOf(
             Function<CommandContext<FabricClientCommandSource>, Claims.Standing> where,
             CommandContext<FabricClientCommandSource> context) {
@@ -372,7 +517,7 @@ public final class ShareCommand {
 
     private static int mark(CommandContext<FabricClientCommandSource> context,
             Markers.Said said) {
-        return speak(context, new Answer(said.ok(), drawable(said.text())));
+        return speak(context, new Answer(said.ok(), drawableLines(said.text())));
     }
 
     static Answer undrawableName(String typed) {
@@ -394,7 +539,7 @@ public final class ShareCommand {
         return refused == null ? mark(context, command.get()) : speak(context, refused);
     }
 
-    // Where the player is standing, or null when there is no world.
+    // Null without a world.
     private static Claims.Standing standingOf(
             CommandContext<FabricClientCommandSource> context) {
         FabricClientCommandSource source = context.getSource();
@@ -421,7 +566,7 @@ public final class ShareCommand {
 
     private static int say(CommandContext<FabricClientCommandSource> context,
             Claims.Said said) {
-        return speak(context, new Answer(said.ok(), drawable(said.text())));
+        return speak(context, new Answer(said.ok(), drawableLines(said.text())));
     }
 
     private static int answered(Claims.Outcome outcome) {
@@ -432,93 +577,56 @@ public final class ShareCommand {
     }
 
 
-    // /geosurvey friend: who is drawn blue rather than neutral.
-    static Answer friends(LandNavConfig config) {
-        if (config.friends.isEmpty()) {
-            return new Answer(true, "No friends named: every player is drawn neutral."
-                    + " Name one with /geosurvey friend add <player> and they turn blue"
-                    + " on the map and compass.");
-        }
-        return new Answer(true, config.friends.size() + " friend"
-                + (config.friends.size() == 1 ? "" : "s") + ": "
-                + joined(config.friends)
-                + ". Remove one with /geosurvey friend remove <player>.");
-    }
+    private static final String SERVER_COMMANDS =
+            "Add one with /geosurvey server add <ip>; remove one with /geosurvey server remove <ip>.";
 
-    static Answer addFriend(LandNavConfig config, String typed, Persist persist) {
-        return settle(addFriend(config, typed), persist);
-    }
-
-    private static Answer addFriend(LandNavConfig config, String typed) {
-        String name = typed == null ? "" : typed.trim();
-        if (name.isEmpty()) {
-            return new Answer(false, "Give the player's name."
-                    + " Ex. /geosurvey friend add Steve.");
-        }
-        String drawnName = drawable(name);
-        if (!drawnName.equals(name)) {
-            return new Answer(false, "Nothing was added. \"" + shownDrawable(drawnName)
-                    + "\" has a character chat cannot show.");
-        }
-        String shownName = shownDrawable(drawnName);
-        if (config.isFriend(name)) {
-            return new Answer(false, shownName + " is already a friend.");
-        }
-        Answer added;
-        if (!config.addFriend(name)) {
-            added = new Answer(false, "The friends list is full at "
-                    + LandNavConfig.MOST_FRIENDS + ". Remove somebody first.");
-        } else {
-        // Names the account name, which may differ from a typed nickname.
-            added = new Answer(true, "Added " + shownName + " as a friend."
-                    + " They are drawn blue wherever their account name is "
-                    + shownName.toLowerCase(java.util.Locale.ROOT) + ".");
-        }
-        return added;
-    }
-
-    static Answer removeFriend(LandNavConfig config, String typed, Persist persist) {
-        return settle(removeFriend(config, typed), persist);
-    }
-
-    private static Answer removeFriend(LandNavConfig config, String typed) {
-        String name = typed == null ? "" : typed.trim();
-        String seen = drawable(name.toLowerCase(Locale.ROOT));
-        boolean removed = config.removeFriend(name);
-        for (String friend : new java.util.ArrayList<>(config.friends)) {
-            if (!seen.isEmpty() && seen.equals(drawable(friend))) {
-                removed |= config.removeFriend(friend);
-            }
-        }
-        Answer answer;
-        if (!removed) {
-            answer = new Answer(false, "\"" + shown(name) + "\" is not on the friends"
-                    + " list. /geosurvey friend shows who is.");
-        } else {
-            answer = new Answer(true, "Removed " + shown(name) + " from the friends list."
-                    + " They are drawn neutral again.");
-        }
-        return answer;
-    }
+    private static final String NO_SERVER_APPROVED =
+            "No server is approved; add one with /geosurvey server add <ip>.";
 
     static Answer servers(LandNavConfig config) {
         if (!ChunkCapture.gating(config)) {
             return new Answer(true, "Contributing from every server."
-                    + " Add a server to filter using: /geosurvey server add"
+                    + " Limit it with /geosurvey server add"
                     + " <ip>");
         }
-        java.util.List<String> list = ChunkCapture.approvedServers(config);
-        if (list.isEmpty()) {
-            return new Answer(true, "The approved-server list is empty:"
-                    + " nothing is collected on any server. Single-player worlds"
-                    + " are contributed either way. Add one with /geosurvey server"
-                    + " add <ip>.");
-        }
+        java.util.List<String> list = shownServers(ChunkCapture.approvedServers(config));
         int count = list.size();
-        return new Answer(true, "Collecting from " + count + " server"
-                + (count == 1 ? "" : "s") + ": " + joinedServers(list)
-                + ". Nothing is collected on any other server. Add one with /geosurvey"
-                + " server add <ip>, remove one with /geosurvey server remove <ip>.");
+        String said;
+        if (count == 0) {
+            said = NO_SERVER_APPROVED;
+        } else if (count == 1) {
+            said = "Contributing from 1 server: " + joinedServers(list) + ". " + SERVER_COMMANDS;
+        } else {
+            said = serverLines(list, count);
+        }
+        return new Answer(true, said);
+    }
+
+    // The count, 1 line for each server, then how to change the list.
+    private static String serverLines(java.util.List<String> entries, int count) {
+        StringBuilder out = new StringBuilder(JOINED_SERVERS_CAPACITY)
+                .append("Contributing from ").append(count).append(" servers:");
+        for (int i = 0; i < count; i++) {
+            out.append('\n');
+            withAsciiForm(out, drawable(String.valueOf(entries.get(i))));
+        }
+        return out.append('\n').append(SERVER_COMMANDS).toString();
+    }
+
+    // The entries a reply shows: not null, not blank once drawn.
+    private static java.util.List<String> shownServers(java.util.List<String> entries) {
+        java.util.List<String> shown = new java.util.ArrayList<>(entries.size());
+        for (String entry : entries) {
+            if (entry != null && !drawable(entry).isBlank()) {
+                shown.add(entry);
+            }
+        }
+        return shown;
+    }
+
+    // The line that names the servers shown, or says that none is approved.
+    private static String fromLine(java.util.List<String> shown) {
+        return shown.isEmpty() ? NO_SERVER_APPROVED : "Contributing from " + someServers(shown) + ".";
     }
 
     static Answer addServer(LandNavConfig config, String typed, Persist persist) {
@@ -529,9 +637,9 @@ public final class ShareCommand {
         String key = ChunkCapture.serverKey(typed);
         if (key.isEmpty()) {
             return new Answer(false, "\"" + shown(typed) + "\" is not a server"
-                    + " address. Give a host name or IP,"
-                    + " with or without a port. Ex. /geosurvey server add"
-                    + " avn.gg.");
+                    + " address. Use a host name or IP,"
+                    + " with or without a"
+                    + " port.");
         }
         String drawnKey = drawable(key);
         if (!drawnKey.equals(key)) {
@@ -540,20 +648,19 @@ public final class ShareCommand {
         }
         if (ChunkCapture.gatesOn(config, typed)) {
             return new Answer(false, withAsciiForm(key)
-                    + " is already on the approved-server list.");
+                    + " is already approved.");
         }
         boolean arming = !ChunkCapture.gating(config);
         java.util.List<String> list = ChunkCapture.approvedServers(config);
-        // Stores the port-aware world key; matching still goes by host.
         list.add(ChunkCapture.serverWorldKey(typed));
         config.approvedServersConfigured = true;
         String named = withAsciiForm(key);
-        return new Answer(true, "Added " + named + " to the approved-server list."
+        return new Answer(true, "Added " + named + ";"
                 + (arming
-                        ? " The list is now in force: GeoSurvey only collects from "
-                                + named + " and single-player worlds."
-                        : " Now contributing from "
-                                + joinedServers(list) + "."));
+                        ? " contributing from "
+                                + named + " only."
+                        : " contributing from "
+                                + someServers(shownServers(list)) + "."));
     }
 
     static Answer removeServer(LandNavConfig config, String typed, Persist persist) {
@@ -563,28 +670,32 @@ public final class ShareCommand {
     private static Answer removeServer(LandNavConfig config, String typed) {
         String seen = drawable(keyOrFolded(typed));
         String seenFold = drawable(fold(typed));
-        // Used only when the entry has a parseable host.
         String seenJoined = drawable(ChunkCapture.serverWorldKey(typed));
         java.util.List<String> list = ChunkCapture.approvedServers(config);
         if (seen.isEmpty()
                 || !list.removeIf(entry -> matchesRemoval(entry, seenFold, seenJoined))) {
-            return new Answer(false, "\"" + shown(typed) + "\" is not on the"
-                    + " approved-server list. /geosurvey server shows what is.");
+            return new Answer(false, "\"" + shown(typed) + "\" is not approved."
+                    + " /geosurvey server shows the list.");
         }
         config.approvedServersConfigured = true;
-        return new Answer(true, "Removed " + withAsciiForm(seen) + "."
-                + " No new ground is contributed from there. The worldmap"
-                + " on disk is unchanged."
-                + (list.isEmpty()
-                        ? " The list is now empty: nothing is contributed from"
-                                + " any server. Single-player worlds are unaffected."
-                        : " Still contributing from " + joinedServers(list)
-                                + "."));
+        config.settleServerList();
+        String rest;
+        if (!list.isEmpty()) {
+            rest = "\n" + fromLine(shownServers(list));
+        } else if (config.takeEmptyServerListTurnedOff()) {
+            stopSending(config);
+            rest = "\nContribute ground is off;"
+                    + " turn it on with /geosurvey share on"
+                    + " for every server.";
+        } else {
+            rest = "\nThe list is empty;"
+                    + " contribute ground is off.";
+        }
+        return new Answer(true, "Removed " + withAsciiForm(seen) + "." + rest);
     }
 
     private static boolean matchesRemoval(String entry, String seenFold, String seenJoined) {
         String entryKey = ChunkCapture.serverKey(entry);
-        // Matches by host and port; a bare host matches only bare entries.
         return entryKey.isEmpty() ? seenFold.equals(drawable(fold(entry)))
                 : seenJoined.equals(drawable(ChunkCapture.serverWorldKey(entry)));
     }
@@ -622,6 +733,25 @@ public final class ShareCommand {
 
     static String drawable(String text) {
         return drawable(text, Integer.MAX_VALUE);
+    }
+
+    // Each line alone; the line breaks stay.
+    static String drawableLines(String text) {
+        String raw = text == null ? "" : text;
+        StringBuilder out = new StringBuilder(raw.length());
+        int from = 0;
+        boolean more = true;
+        while (more) {
+            int next = raw.indexOf('\n', from);
+            int end = next < 0 ? raw.length() : next;
+            out.append(drawable(raw.substring(from, end)));
+            more = next >= 0;
+            if (more) {
+                out.append('\n');
+                from = next + 1;
+            }
+        }
+        return out.toString();
     }
 
     private static String drawable(String text, int limit) {
@@ -679,7 +809,7 @@ public final class ShareCommand {
         return kept == null ? raw : kept.toString();
     }
 
-    // Whether drawable(text) would return text unchanged.
+    // drawable(text) would return text unchanged.
     static boolean isDrawable(String text) {
         if (text == null) {
             return false;
@@ -712,22 +842,6 @@ public final class ShareCommand {
         return glyph < SPACE || (glyph >= DELETE && glyph <= LAST_C1_CONTROL);
     }
 
-    private static final int JOINED_LIST_CAPACITY = 128;
-
-    static String joined(java.util.List<String> entries) {
-        if (entries.size() == 1) {
-            return drawable(String.valueOf(entries.get(0)));
-        }
-        StringBuilder out = new StringBuilder(JOINED_LIST_CAPACITY);
-        for (int i = 0; i < entries.size(); i++) {
-            if (i > 0) {
-                out.append(", ");
-            }
-            out.append(drawable(String.valueOf(entries.get(i))));
-        }
-        return out.toString();
-    }
-
     private static final int JOINED_SERVERS_CAPACITY = 192;
 
     static String joinedServers(java.util.List<String> entries) {
@@ -742,6 +856,23 @@ public final class ShareCommand {
             withAsciiForm(out, drawable(String.valueOf(entries.get(i))));
         }
         return out.toString();
+    }
+
+    private static final int SERVERS_LISTED = 8;
+
+    // The first servers, then how many more.
+    private static String someServers(java.util.List<String> entries) {
+        if (entries.size() <= SERVERS_LISTED) {
+            return joinedServers(entries);
+        }
+        StringBuilder out = new StringBuilder(JOINED_SERVERS_CAPACITY);
+        for (int i = 0; i < SERVERS_LISTED; i++) {
+            if (i > 0) {
+                out.append(", ");
+            }
+            withAsciiForm(out, drawable(String.valueOf(entries.get(i))));
+        }
+        return out.append(" and ").append(entries.size() - SERVERS_LISTED).append(" more").toString();
     }
 
     private static String withAsciiForm(String key) {
@@ -765,10 +896,8 @@ public final class ShareCommand {
     }
 
 
-    // Appended when the ground switch turns publishing on too.
     private static final String ALSO_PUBLISHES =
-            " Publishing is already on for ground. This build does not publish your name"
-                    + " and your live position, or the players you can see.";
+            "\nThis build does not publish your live position or player list.";
 
     static Answer off(LandNavConfig config, Persist persist) {
         return settle(off(config), persist);
@@ -777,7 +906,7 @@ public final class ShareCommand {
     private static Answer off(LandNavConfig config) {
         config.shareEnabled = false;
         stopSending(config);
-        return new Answer(true, "Contributing is off. Nothing more is uploaded.");
+        return new Answer(true, "Contributing is off.");
     }
 
     static Answer on(LandNavConfig config, Persist persist) {
@@ -785,73 +914,106 @@ public final class ShareCommand {
     }
 
     private static Answer on(LandNavConfig config) {
-        String address = address(config);
-        if (address.isEmpty()) {
-            return new Answer(false, "No collector address is set. Set one with "
-                    + "/geosurvey collector <address>.");
+        String typed = address(config);
+        String joined = typed.isEmpty() ? ChunkCapture.joinedServer() : null;
+        String found = ChunkCapture.knownCollector(joined);
+        if (typed.isEmpty() && found.isEmpty()) {
+            return onWithNoCollector(config);
         }
+        if (!found.isEmpty()) {
+            config.shareCollector = found;
+        }
+        String address = typed.isEmpty() ? found : typed;
         config.shareEnabled = true;
         URI parsed = uriOf(address);
-        return new Answer(true, "Contributing is on. Ground is uploaded to "
-                + drawable(address) + ", carrying your Minecraft UUID and not your name. This "
-                + "does not put you on a live map. Run /geosurvey share to see which "
-                + "key is signing it."
+        return new Answer(true, "Contributing is on; ground goes to "
+                + drawable(address) + ", with your Minecraft UUID."
+                + " A shared claim or marker sends your player name."
+                + (found.isEmpty() ? "" : "\nAddress found for "
+                        + ChunkCapture.serverKey(joined) + ".")
+                + "\nThis does not put you on a"
+                + " live map."
                 + (config.sharePresence ? ALSO_PUBLISHES : "")
-                // Warned, not refused.
                 + unusable(parsed) + inClear(parsed));
+    }
+
+    private static Answer proof(LandNavConfig config, boolean on) {
+        config.shareSessionProof = on;
+        String said;
+        if (on) {
+            said = "Prove this account to the collector"
+                    + " is on; it sends your player name"
+                    + " to the collector and"
+                    + " to Mojang.";
+        } else {
+            config.shareSessionProofAutoEnabled = true;
+            said = "Prove this account to the collector is off;"
+                    + " a collector that needs it"
+                    + " refuses your ground.";
+        }
+        return new Answer(true, said);
+    }
+
+    private static Answer onWithNoCollector(LandNavConfig config) {
+        config.shareEnabled = true;
+        return new Answer(true, "Contribute ground is on; nothing is uploaded until"
+                + " a collector address is set.\n" + setWhenJoined());
+    }
+
+    private static String setWhenJoined() {
+        return "Set one with /geosurvey collector <address>, or join a known server: "
+                + LandNavConfig.KnownServers.names()
+                + ".";
     }
 
     static Answer collector(LandNavConfig config, String typed, Persist persist) {
         return settle(collector(config, typed), persist);
     }
 
-    private static Answer collector(LandNavConfig config, String typed) {
+    static CollectorAddress collectorAddress(String typed) {
         String address = typed == null ? "" : typed.trim();
         if (address.isEmpty()) {
-            return forgetCollector(config);
+            return new CollectorAddress(false, "", "Nothing was set. Set an address with"
+                    + " /geosurvey collector <address>, or stop"
+                    + " contributing with /geosurvey share off.");
         }
         if (!drawable(address).equals(address)) {
-            return new Answer(false, "Nothing was set. That address has a character"
+            return new CollectorAddress(false, "", "Nothing was set. That address has a character"
                     + " chat cannot show.");
         }
+        if (!looksUsable(address)) {
+            return new CollectorAddress(false, "", "Nothing was set. Use"
+                    + " an http:// or https:// address.");
+        }
+        if (cleartextAwayFromHome(address)) {
+            return new CollectorAddress(false, "", "Nothing was set: that http:// address"
+                    + " is off your network and would send"
+                    + " your Minecraft UUID in clear text."
+                    + " Use its"
+                    + " https:// address,"
+                    + " or name"
+                    + " this one"
+                    + " in"
+                    + " geosurvey.json"
+                    + " by hand.");
+        }
+        return new CollectorAddress(true, address, "");
+    }
+
+    static Answer collector(LandNavConfig config, String typed) {
+        CollectorAddress requested = collectorAddress(typed);
+        if (!requested.accepted()) {
+            return new Answer(false, requested.refusal());
+        }
+        String address = requested.address();
         URI parsed = uriOf(address);
-        // Refused, and nothing is written: not the address, not the switch.
-        if (cleartextAwayFromHome(parsed)) {
-            return new Answer(false, "Nothing was set. That address is http:// and off"
-                    + " your own network. It would send your Minecraft"
-                    + " UUID with every chunk, and, while publishing is"
-                    + " on, your name, live position, and the players"
-                    + " you can see, all in clear text. Anything on the"
-                    + " way can read that, or answer as the collector;"
-                    + " this client trusts it, and the ground behind"
-                    + " that answer is lost. Use the https:// address of"
-                    + " the same collector. One with no https:// can be"
-                    + " named in geosurvey.json by hand.");
-        }
         config.shareCollector = address;
-        String state;
-        if (config.shareEnabled) {
-            state = " Contributing is on. Ground goes there.";
-        } else {
-            config.shareEnabled = true;
-            state = " Contributing was off and is now on. Stop it with"
-                    + " /geosurvey share off."
-                    + (config.sharePresence ? ALSO_PUBLISHES : "");
-        }
+        String state = config.shareEnabled
+                ? "\nContributing is on."
+                : "\nContribute ground is off; turn it on with /geosurvey share"
+                        + " on.";
         return new Answer(true,
                 "Collector address set to " + address + "." + state + unusable(parsed));
-    }
-
-    static Answer forgetCollector(LandNavConfig config, Persist persist) {
-        return settle(forgetCollector(config), persist);
-    }
-
-    private static Answer forgetCollector(LandNavConfig config) {
-        config.shareCollector = "";
-        config.shareEnabled = false;
-        stopSending(config);
-        return new Answer(true, "Collector address cleared. Contributing is off,"
-                + " nothing is uploaded.");
     }
 
     private static void stopSending(LandNavConfig config) {
@@ -861,36 +1023,54 @@ public final class ShareCommand {
         }
     }
 
-    // Reports both switches; changes neither.
     static Answer status(LandNavConfig config) {
         String address = address(config);
+        ShareSender sender = ShareSender.live();
+        String steps = steps(config, sender);
         if (address.isEmpty()) {
-            return new Answer(true, config.shareEnabled
-                    ? "Contributing: off. The switch is on but no collector address"
-                            + " is set. Set one with /geosurvey collector <address>."
-                    : "Contributing: off. No collector address is set.");
+            return new Answer(true, (config.shareEnabled
+                    ? "Contributing: off; contribute ground is on but no collector address"
+                            + " is set. " + setWhenJoined()
+                    : "Contributing: off; no collector address is set.") + steps
+                    + proofLine(config));
         }
         URI parsed = uriOf(address);
-        ShareSender sender = ShareSender.live();
         return new Answer(true, config.shareEnabled
-                ? ground(sender) + "Contributing: on. Ground is uploaded to " + drawable(address)
+                ? ground(sender) + "Contributing: on; ground goes to " + drawable(address)
                         + ". Stop with /geosurvey share off." + unusable(parsed)
-                        + inClear(parsed) + where(config) + doing(sender)
-                : "Contributing: off. The collector address is " + drawable(address)
-                        + " and the switch is off. Nothing is sent."
-                        + unusable(parsed) + inClear(parsed));
+                        + inClear(parsed) + where(config) + steps + proofLine(config)
+                        + doing(sender)
+                : "Contributing: off; the collector address is " + drawable(address)
+                        + " and contribute ground is off."
+                        + unusable(parsed) + inClear(parsed) + steps + proofLine(config));
     }
 
-    // Empty unless the approved-server list is narrowed or emptied.
+    private static String proofLine(LandNavConfig config) {
+        return config.shareSessionProof
+                ? "\nProve this account to the collector: on; it sends your player name to the"
+                        + " collector and to Mojang. Turn it off with /geosurvey"
+                        + " share proof off."
+                : "\nProve this account to the collector: off. Turn it on with /geosurvey"
+                        + " share proof on; it sends your player name to the collector"
+                        + " and to Mojang.";
+    }
+
+    private static final int STEPS_CAPACITY = 512;
+
+    // sender may be null.
+    private static String steps(LandNavConfig config, ShareSender sender) {
+        StringBuilder out = new StringBuilder(STEPS_CAPACITY);
+        for (String line : CollectorSettings.Setup.now(config, sender).lines()) {
+            out.append('\n').append(line);
+        }
+        return out.toString();
+    }
+
     private static String where(LandNavConfig config) {
         java.util.List<String> keys = ChunkCapture.approvedServers(config);
-        CollectorSettings.Where whereState =
-                CollectorSettings.whereOf(ChunkCapture.gating(config), keys);
-        return switch (whereState) {
+        return switch (CollectorSettings.whereOf(keys)) {
             case ALL -> "";
-            case NONE -> " The approved-server list is empty:"
-                    + " nothing is contributed from any server.";
-            case LISTED -> " Collecting from " + joinedServers(keys) + ".";
+            case LISTED -> "\n" + fromLine(shownServers(keys));
         };
     }
 
@@ -920,7 +1100,7 @@ public final class ShareCommand {
             int staleRetries) {
         Answer result;
         Throwable writeFailure;
-        MapStorage.FileReplace.beginNoWait();
+        AtomicFileReplace.beginNoWait();
         try {
             if (write == null) {
                 persist.save();
@@ -929,12 +1109,12 @@ public final class ShareCommand {
             }
             writeFailure = null;
         } catch (IOException | RuntimeException couldNotWrite) {
-            if (write != null && couldNotWrite instanceof MapStorage.FileReplace.Refused) {
+            if (write != null && couldNotWrite instanceof AtomicFileReplace.Refused) {
                 CollectorOptions.keepForTheStopFlush(write);
             }
             writeFailure = couldNotWrite;
         } finally {
-            MapStorage.FileReplace.endNoWait();
+            AtomicFileReplace.endNoWait();
         }
         if (writeFailure == null) {
             if (write == null || write.latest()) {
@@ -964,8 +1144,8 @@ public final class ShareCommand {
     private static Answer landed(String said, Throwable couldNotWrite) {
         return couldNotWrite == null
                 ? new Answer(true, said + " Saved.")
-                : new Answer(false, said + " But the settings file could not be "
-                        + "written. A restart may undo it: " + couldNotWrite + ".");
+                : new Answer(false, said + " Not saved;"
+                        + " a restart can undo it: " + couldNotWrite + ".");
     }
 
     private static Answer settle(Answer decided, Persist persist) {
@@ -978,6 +1158,15 @@ public final class ShareCommand {
             return speak(context, decided);
         }
         return new Saving(context, decided.text(), persist, pools).start();
+    }
+
+    static int saved(FabricClientCommandSource source, Answer decided, Persist persist,
+                     Supplier<WorkPool> pools) {
+        if (!decided.ok()) {
+            source.sendError(Component.literal(decided.text()));
+            return 0;
+        }
+        return new Saving(source, decided.text(), persist, pools).start();
     }
 
     private static WorkPool poolOrNull(Supplier<WorkPool> pools) {
@@ -1005,12 +1194,12 @@ public final class ShareCommand {
     }
 
     private static IOException neverRan() {
-        return new IOException("the work pool let the settings write go before it ran");
+        return new IOException("the work pool dropped the settings write unrun");
     }
 
     private static final class Saving {
 
-        private final CommandContext<FabricClientCommandSource> context;
+        private final Consumer<Answer> reply;
 
         private final String said;
 
@@ -1024,7 +1213,23 @@ public final class ShareCommand {
 
         Saving(CommandContext<FabricClientCommandSource> context, String said,
                 Persist persist, Supplier<WorkPool> pools) {
-            this.context = context;
+            this(answer -> speak(context, answer), said, persist, pools);
+        }
+
+        Saving(FabricClientCommandSource source, String said,
+                Persist persist, Supplier<WorkPool> pools) {
+            this(answer -> {
+                if (answer.ok()) {
+                    source.sendFeedback(Component.literal(answer.text()));
+                } else {
+                    source.sendError(Component.literal(answer.text()));
+                }
+            }, said, persist, pools);
+        }
+
+        private Saving(Consumer<Answer> reply, String said,
+                       Persist persist, Supplier<WorkPool> pools) {
+            this.reply = reply;
             this.said = said;
             this.persist = persist;
             this.pools = pools;
@@ -1057,7 +1262,13 @@ public final class ShareCommand {
                         CollectorOptions.keepForTheStopFlush(queued);
                     }
                 }
-                result = handed ? 1 : say(writeHere(persist, stagedWrite, said));
+                if (handed) {
+                    result = 1;
+                } else {
+                    Answer answer = writeHere(persist, stagedWrite, said);
+                    say(answer);
+                    result = answer.ok() ? 1 : 0;
+                }
             } else {
                 result = say(landed(said, stagingFailure));
             }
@@ -1081,7 +1292,10 @@ public final class ShareCommand {
         }
 
         private int say(Answer answer) {
-            return answered.compareAndSet(false, true) ? speak(context, answer) : 1;
+            if (answered.compareAndSet(false, true)) {
+                reply.accept(answer);
+            }
+            return 1;
         }
     }
 
@@ -1135,21 +1349,20 @@ public final class ShareCommand {
         }
         String groundReason = sender.groundReason();
         if (!groundReason.isEmpty()) {
-            sent.append(" Last failure: ").append(groundReason).append('.');
+            sent.append("\nLast failure: ").append(groundReason).append('.');
         }
         long queued = sender.spooled();
         if (queued > 0) {
             long bytes = sender.spoolBytes();
-            sent.append(' ').append(queued).append(" chunks waiting to go, ")
+            sent.append('\n').append(queued).append(" chunks waiting, ")
                     .append(bytes < BYTES_PER_MIB ? "under 1" : bytes >> ShareSpool.MIB_SHIFT)
                     .append(" MiB on disk.");
         }
         long aside = sender.spoolRefused();
         if (aside > 0) {
-            sent.append(' ').append(aside).append(" set aside after the collector"
-                    + " refused them. They do not hold up new ground.");
+            sent.append(queued > 0 ? ' ' : '\n').append(aside).append(" set aside; the collector"
+                    + " refused them.");
         }
-        // Each section on its own line.
         StringBuilder out = new StringBuilder(STATUS_REPORT_CAPACITY);
         appendLine(out, sent.toString());
         appendLine(out, identity(sender));
@@ -1161,7 +1374,6 @@ public final class ShareCommand {
         return out.toString();
     }
 
-    // One section, on its own line, or nothing at all.
     private static void appendLine(StringBuilder out, String said) {
         String only = said.trim();
         if (!only.isEmpty()) {
@@ -1169,40 +1381,36 @@ public final class ShareCommand {
         }
     }
 
-    // Said only when the count is not zero.
     private static String held(ShareSender sender) {
         long held = sender.heldForLength();
         if (held == 0) {
             return "";
         }
-        return " Held back: " + held + " players had a name too long to search for a"
-                + " vanish marker. This client does not report them.";
+        return " Held back: " + held + " players had a name too long to check for a"
+                + " vanish marker.";
     }
 
-    // Said only when the count is not zero.
     private static String capped(ShareSender sender) {
         long over = sender.heldForRosterCap();
         if (over == 0) {
             return "";
         }
-        return " Roster limit: " + over + " players did not fit. One report carries "
-                + RosterReport.MAX_PLAYERS + " players. This client sends the same "
-                + RosterReport.MAX_PLAYERS + " every time, ordered by account, and"
-                + " skips the rest.";
+        return " Roster limit: " + over + " players did not fit. A report carries "
+                + RosterReport.MAX_PLAYERS + " players: the same "
+                + RosterReport.MAX_PLAYERS + " every time,"
+                + " ordered by account.";
     }
 
-    // Said only when the count is not zero.
     private static String hidden(ShareSender sender) {
         long held = sender.heldWhileHidden();
         if (held == 0) {
             return "";
         }
         return " Held while hidden: " + held + " surveyed chunks were not contributed"
-                + "; this client was vanished. Your own map kept every one of"
+                + ". Your map kept"
                 + " them.";
     }
 
-    // Empty when there is no running capture.
     private static String saves() {
         ChunkCapture capture = ChunkCapture.live();
         return capture == null ? "" : saves(capture.savesStarted(),
@@ -1211,42 +1419,42 @@ public final class ShareCommand {
 
     private static final int SAVES_LINE_CAPACITY = 96;
 
-    // Said only when work is waiting or something failed.
     static String saves(long started, long finished, long failed) {
         long waiting = started - finished;
         if (waiting <= 0 && failed == 0) {
             return "";
         }
         StringBuilder said = new StringBuilder(SAVES_LINE_CAPACITY).append(" Map saves: ");
-        said.append(started).append(" region writes handed to the work pool and ")
-                .append(finished).append(" accounted for.");
+        said.append(started).append(" region writes started and ")
+                .append(finished).append(" finished.");
         if (failed > 0) {
-            said.append(' ').append(failed).append(" of those failed. Each one is in"
-                    + " the log with its world and its region, and goes back on the"
-                    + " list unless that world has already been left.");
+            said.append(' ').append(failed).append(" failed; each is in"
+                    + " the log and retried"
+                    + " unless its world was left.");
         }
         if (waiting > 0) {
-            said.append(' ').append(waiting).append(" have not come back. One for a"
-                    + " moment is a write still running; one that does not move is a"
-                    + " write whose outcome this client cannot confirm.");
+            said.append(failed > 0 ? '\n' : ' ').append(waiting).append(" have not finished;"
+                    + " a count that does not move"
+                    + " means the outcome is unknown.");
         }
         return said.toString();
     }
 
     private static String identity(ShareSender sender) {
         if (!sender.signing()) {
-            return " NOTHING CAN BE SENT: this client has no identity to sign a"
-                    + " contribution with yet.";
+            return " NOTHING CAN BE SENT: this client has no identity"
+                    + " to sign with.";
         }
         if (!sender.localIdentity()) {
-            return " Identity: signed by Mojang. Any collector that accepts"
-                    + " contributions at all can attribute this to you.";
+            return " Identity: signed by Mojang. Any collector"
+                    + " can attribute it to you.";
         }
-        return " Identity: a key of this client's own. Mojang does not vouch"
-                + " for it. A collector refuses it until its operator has been told to"
-                + " trust the key. Give them this fingerprint: "
+        return " Identity: a key of this client's own; Mojang does not vouch"
+                + " for it. A collector accepts it after you prove this account,"
+                + " or its operator can trust"
+                + " fingerprint "
                 + sender.identityFingerprint()
-                + ". It is also in the log, where it can be copied.";
+                + ".";
     }
 
     private static final int POSITION_SECTION_CAPACITY = 384;
@@ -1262,60 +1470,62 @@ public final class ShareCommand {
                     .append(presenceLastStatus).append(" to one.");
         }
         if (!sender.addressed()) {
-            said.append(" NONE IS BEING REPORTED: there is no address to post it to."
-                    + " The website shows no players, no server clock and no"
-                    + " weather. Those three are one feature, not three.");
+            said.append("\nWith no address,"
+                    + " the website shows no players, server clock"
+                    + " or weather.");
         } else {
             String stalled = sender.presenceReason();
             if (!stalled.isEmpty()) {
-                said.append(" It is not going out: ").append(stalled).append('.');
+                said.append("\nNot sent: ").append(stalled).append('.');
             } else if (!sender.isSending()) {
-                said.append(" None has been reported yet: the sender only starts once"
-                        + " there is surveyed ground to send. Nothing has run to"
-                        + " report a position yet.");
+                said.append("\nNone reported: sending starts"
+                        + " when there is surveyed ground"
+                        + " to send.");
             }
-        // Quiet when nothing is wrong.
-            said.append(sender.beatHealth());
+            said.append(beatLines(sender.beatHealth()));
         }
         return said.toString();
     }
 
-    // Empty when the walk is finished and nothing was asked.
+    // Each beat on a line of its own.
+    private static String beatLines(String health) {
+        return health.isEmpty() ? "" : "\n" + health.strip().replace(". ", ".\n");
+    }
+
     private static String ground(ShareSender sender) {
         if (sender == null || sender.groundProven() || !sender.groundWorthSaying()) {
             return "";
         }
-        return drawable(sender.groundSaying()) + "\n";
+        return drawableLines(sender.groundSaying()) + "\n";
     }
 
     private static String unusable(String address) {
         return looksUsable(address) ? ""
-                : " That is not an http:// or https:// address. Nothing can be sent "
-                        + "to it.";
+                : "\nNothing is sent; use an http:// or https://"
+                        + " address.";
     }
 
     private static String unusable(URI parsed) {
         return looksUsable(parsed) ? ""
-                : " That is not an http:// or https:// address. Nothing can be sent "
-                        + "to it.";
+                : "\nNothing is sent; use an http:// or https://"
+                        + " address.";
     }
 
     private static boolean looksUsable(URI parsed) {
         return parsed != null;
     }
 
-    // Never fires alongside unusable().
     private static String inClear(String address) {
         return cleartextAwayFromHome(address)
-                ? " That address is http:// and is not on your own network. What"
-                        + " goes to it crosses the internet in clear."
+                ? "\nThat http:// address is off your network; it is"
+                        + " readable on the way."
                 : "";
     }
 
     private static String inClear(URI parsed) {
         return cleartextAwayFromHome(parsed)
-                ? " That address is http:// and is not on your own network. What"
-                        + " goes to it crosses the internet in clear."
+                ? "\nThat http:// address is off your network; it is"
+                        + " readable on the way."
                 : "";
     }
 
@@ -1332,12 +1542,10 @@ public final class ShareCommand {
         return !CollectorGuess.atHome(host.toLowerCase(Locale.ROOT));
     }
 
-    // Package-visible for CollectorSettings.
     static boolean looksUsable(String address) {
         return uriOf(address) != null;
     }
 
-    // Whether posting here would send a signed record of movement in clear.
     public static boolean cleartextAwayFromHome(String address) {
         URI parsed = uriOf(address);
         if (parsed == null) {
@@ -1352,19 +1560,13 @@ public final class ShareCommand {
         return !CollectorGuess.atHome(host.toLowerCase(Locale.ROOT));
     }
 
-    // The typed address as a URI, or null when it is not one.
+    // Null when the address is not a URI.
     private static URI uriOf(String address) {
         return ShareSender.endpointOf(address, "");
     }
 
-    private static int speak(CommandContext<FabricClientCommandSource> context,
-            Answer answer) {
-        // One feedback line per line of text; an error stays one line.
-        if (!answer.ok()) {
-            context.getSource().sendError(Component.literal(answer.text()));
-            return 0;
-        }
-        String text = answer.text();
+    // Each non-blank line of the text, trimmed, in order.
+    static void eachLine(String text, Consumer<String> sink) {
         int length = text.length();
         int from = 0;
         while (from <= length) {
@@ -1372,14 +1574,24 @@ public final class ShareCommand {
             int end = next < 0 ? length : next;
             String said = text.substring(from, end);
             if (!said.isBlank()) {
-                context.getSource().sendFeedback(
-                        Component.literal(said.trim()).withStyle(ChatFormatting.GRAY));
+                sink.accept(said.trim());
             }
             if (next < 0) {
                 break;
             }
             from = next + 1;
         }
+    }
+
+    private static int speak(CommandContext<FabricClientCommandSource> context,
+            Answer answer) {
+        FabricClientCommandSource source = context.getSource();
+        if (!answer.ok()) {
+            eachLine(answer.text(), line -> source.sendError(Component.literal(line)));
+            return 0;
+        }
+        eachLine(answer.text(), line -> source.sendFeedback(
+                Component.literal(line).withStyle(ChatFormatting.GRAY)));
         return 1;
     }
 }

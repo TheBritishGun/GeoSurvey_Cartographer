@@ -1,6 +1,6 @@
 package dev.openmap.config;
 
-// Which wording a shared waypoint uses in chat.
+// Chat format of a shared waypoint.
 public enum ChatShareFormat {
 
     LANDNAV("Grid reference"),

@@ -1,6 +1,11 @@
 package dev.openmap.config;
 
 import dev.openmap.json.JsonBind;
+import dev.openmap.json.JsonElement;
+import dev.openmap.json.JsonObject;
+import dev.openmap.json.JsonParser;
+import dev.openmap.json.AtomicFileReplace;
+import dev.openmap.json.SaveWriter;
 import dev.openmap.live.MapBackend;
 import dev.openmap.map.Landmark;
 import dev.openmap.map.MapStorage.FileReplace;
@@ -15,9 +20,15 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Collections;
+import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.function.BooleanSupplier;
 
 public final class LandNavConfig {
+
+    private static final Map<LandNavConfig, JsonObject> UNDECLARED =
+            Collections.synchronizedMap(new WeakHashMap<>());
 
     private static final int DEFAULT_GRID_REFERENCE_X = 4;
     private static final int DEFAULT_GRID_REFERENCE_Y = 4;
@@ -44,13 +55,14 @@ public final class LandNavConfig {
     private static final int WEB_MAP_PORT_MOVE_VERSION = 4;
     private static final int SHARE_PRESENCE_SPLIT_VERSION = 5;
     private static final int APPROVED_SERVER_PORTS_VERSION = 6;
+    // The configVersion that GeoSurvey 0.1.11-i writes.
+    private static final int GEOSURVEY_CONFIG_VERSION = 5;
     private static final int ALPHA_SHIFT = 24;
 
     public int configVersion;
 
-    public static final int CURRENT_VERSION = 7;
+    public static final int CURRENT_VERSION = 8;
 
-    // What version 2 shipped in liveMapWorlds.
     private static final class LegacyWorldsHolder {
         private static final java.util.Map<String, java.util.List<String>> LEGACY_WORLDS =
                 java.util.Map.of(
@@ -62,12 +74,11 @@ public final class LandNavConfig {
     public boolean gridReferenceEnabled = true;
     public boolean gridReferenceDebugOnly = true;
 
-    // What Default resolves to.
     public static final int SHIPPED_GRID_REFERENCE_COLOUR = 0xFFC8E6C9;
 
     public int gridReferenceColour = SHIPPED_GRID_REFERENCE_COLOUR;
 
-    // The colour's preset name, or a custom value; null means not yet chosen.
+    // A preset name or custom value; null until chosen.
     public String gridReferenceColourSwatch;
 
     public static final float DEFAULT_GRID_REFERENCE_SCALE = 1.0f;
@@ -87,7 +98,6 @@ public final class LandNavConfig {
     public static final int MIN_WOODLAND_RADIUS = 0;
     public static final int MAX_WOODLAND_RADIUS = 16;
 
-    // Shared by the slider and normalise().
     public static final float MIN_WOODLAND_THRESHOLD = 0.05f;
     public static final float MAX_WOODLAND_THRESHOLD = 1.0f;
 
@@ -100,24 +110,29 @@ public final class LandNavConfig {
 
     public boolean shareEnabled = false;
 
-    // Whether this client publishes its name, Minecraft UUID and position.
+    public boolean claimGreetings = false;
+
+    // Publishes the name, Minecraft UUID and position.
     public boolean sharePresence = false;
 
-    // Whether normalise() just turned publication off for this owner.
+    // Whether normalise() turned publication off.
     private transient boolean sharePresenceSplit;
 
     public String shareCollector = "";
 
-    // A seed collector address for "/geosurvey collector find". Ships blank.
+    // A seed address for "/geosurvey collector find".
     public String shareDirectorySeed = "";
 
     // Server-published collector cards, pasted here as text.
     public String shareMapCards = "";
 
-    // The third road onto a collector: proves the account via Mojang's session service.
+    // Proves the account through Mojang's session service.
     public boolean shareSessionProof = false;
 
-    // Vanish tab-list markers, comma separated. Blank means the default list, not none.
+    // Whether the one automatic turn-on is spent.
+    public boolean shareSessionProofAutoEnabled = false;
+
+    // Vanish tab-list markers, comma separated. Blank means the default list.
     public String shareVanishMarkers = "vanish,[v],(v)";
 
     // Staff tab-list markers, comma separated. Blank means none.
@@ -129,10 +144,12 @@ public final class LandNavConfig {
     public java.util.List<String> approvedServers =
             new java.util.ArrayList<>();
 
-    // True once the server list has been set, even to empty.
+    // Whether the server list narrows contributing.
     public boolean approvedServersConfigured = false;
 
     private transient boolean loadedBeforeApprovedPorts;
+
+    private transient boolean emptyServerListTurnedOff;
 
     public java.util.List<String> importSearchPaths = new java.util.ArrayList<>();
 
@@ -140,7 +157,7 @@ public final class LandNavConfig {
 
     public boolean showCaptureRange = false;
 
-    // Share of the shorter map-window side the protractor plate covers.
+    // Share of the shorter map-window side the plate covers.
     public int protractorPercent = DEFAULT_PROTRACTOR_PERCENT;
 
     public static final int MIN_PROTRACTOR_PERCENT = 25;
@@ -153,13 +170,77 @@ public final class LandNavConfig {
     public static final int MIN_CASUALTIES_KEPT = 1;
     public static final int MAX_CASUALTIES_KEPT = 100;
 
-    private static final java.util.List<String> DEFAULT_IMPORT_SERVER_ALIASES =
-            java.util.List.of("avience.org", "avn.gg", "jaystechvault.com");
+    public static final class KnownServers {
+
+        private static final java.util.List<Group> GROUPS = java.util.List.of(
+                new Group("avience.org", "https://avience.live", "https://avience.uk",
+                        java.util.List.of("avience.org", "avn.gg", "jaystechvault.com")));
+
+        private static final String NAMES = joinedNames();
+
+        private record Group(String name, String collector, String webMap,
+                             java.util.List<String> members) {
+        }
+
+        private KnownServers() {
+        }
+
+        // key: a lower-case host, plus ":port" if the port is not 25565, or null.
+        public static String nameOf(String key) {
+            Group group = groupOf(key);
+            return group == null ? "" : group.name();
+        }
+
+        // key as for nameOf.
+        public static String collectorOf(String key) {
+            Group group = groupOf(key);
+            return group == null ? "" : group.collector();
+        }
+
+        public static String webMapOf(String key) {
+            Group group = groupOf(key);
+            return group == null ? "" : group.webMap();
+        }
+
+        public static String names() {
+            return NAMES;
+        }
+
+        private static java.util.List<java.util.List<String>> memberLists() {
+            java.util.List<java.util.List<String>> lists =
+                    new java.util.ArrayList<>(GROUPS.size());
+            for (int at = 0; at < GROUPS.size(); at++) {
+                lists.add(new java.util.ArrayList<>(GROUPS.get(at).members()));
+            }
+            return lists;
+        }
+
+        private static String joinedNames() {
+            StringBuilder joined = new StringBuilder();
+            for (int at = 0; at < GROUPS.size(); at++) {
+                if (at > 0) {
+                    joined.append(", ");
+                }
+                joined.append(GROUPS.get(at).name());
+            }
+            return joined.toString();
+        }
+
+        private static Group groupOf(String key) {
+            Group found = null;
+            if (key != null) {
+                for (int at = 0; at < GROUPS.size() && found == null; at++) {
+                    if (GROUPS.get(at).members().contains(key)) {
+                        found = GROUPS.get(at);
+                    }
+                }
+            }
+            return found;
+        }
+    }
 
     private static java.util.List<java.util.List<String>> defaultImportServerAliases() {
-        java.util.List<java.util.List<String>> outer = new java.util.ArrayList<>(1);
-        outer.add(new java.util.ArrayList<>(DEFAULT_IMPORT_SERVER_ALIASES));
-        return outer;
+        return KnownServers.memberLists();
     }
 
     public java.util.List<java.util.List<String>> importServerAliases =
@@ -187,13 +268,11 @@ public final class LandNavConfig {
 
     public int webMapPort = DEFAULT_WEB_MAP_PORT;
 
-    // Below 1024 needs privileges the game does not have.
     public static final int MIN_WEB_MAP_PORT = 1024;
     public static final int MAX_WEB_MAP_PORT = 65535;
 
     public boolean webMapAllowLan = false;
 
-    // Whether normalise() just moved this off the old node port.
     private transient boolean webMapPortMoved;
 
     public boolean liveMapEnabled = false;
@@ -206,7 +285,6 @@ public final class LandNavConfig {
 
     public String liveMapBackend = DEFAULT_LIVE_BACKEND;
 
-    // Set by normalise() when liveMapBackend names no known backend.
     private transient String liveMapBackendProblem = "";
 
     public boolean liveMapPlayers = false;
@@ -215,7 +293,7 @@ public final class LandNavConfig {
 
     public boolean liveMapAreas = true;
 
-    // Whether to draw claims this client authored, regardless of liveMapAreas.
+    // Draws claims this client authored, regardless of liveMapAreas.
     public boolean showAuthoredClaims = true;
 
     public java.util.List<String> liveMapLayers = new java.util.ArrayList<>();
@@ -257,12 +335,11 @@ public final class LandNavConfig {
     public HudAnchor associationAnchor = HudAnchor.TOP_LEFT;
     public int associationX = DEFAULT_ASSOCIATION_X;
     public int associationY = DEFAULT_ASSOCIATION_Y;
-    // What Default resolves to.
     public static final int SHIPPED_ASSOCIATION_COLOUR = 0xFFC8E6C9;
 
     public int associationColour = SHIPPED_ASSOCIATION_COLOUR;
 
-    // The colour's preset name, or a custom value; null means not yet chosen.
+    // A preset name or custom value; null until chosen.
     public String associationColourSwatch;
 
     public static final int MIN_ASSOCIATION_COUNT = 1;
@@ -291,14 +368,14 @@ public final class LandNavConfig {
 
     public boolean locatorBarEnabled = true;
 
-    // Dimension of the tracked waypoint; empty means none tracked.
+    // Empty when no waypoint is tracked.
     public String compassTrackedDimension = "";
 
     public int compassTrackedX;
 
     public int compassTrackedZ;
 
-    // Display only; not part of the tracked identity.
+    // Display only.
     public String compassTrackedName = "";
 
     public boolean trackingIn(String dimension) {
@@ -322,81 +399,61 @@ public final class LandNavConfig {
 
     private transient java.util.Set<String> friendLookup = new FriendLookup();
 
-    // Cap on the friends list length.
     public static final int MOST_FRIENDS = 512;
 
-    // Case-insensitive membership test.
     public boolean isFriend(String name) {
         if (name == null || name.isBlank()) {
             return false;
         }
-        if (friends instanceof FriendList counted) {
-            if (!lookupTracks(counted)) {
-                friendLookup = rebuildLookup(friends);
-            }
-        }
-        if (!(friends instanceof FriendList)
-                && friendLookup.size() != (friends == null ? 0 : friends.size())) {
+        if (!(friendLookup instanceof FriendLookup cache)
+                || cache.source != friends || cache.stamp != changeCount(friends)
+                || cache.reading != reading(friends)) {
             friendLookup = rebuildLookup(friends);
         }
         return friendLookup.contains(name.trim().toLowerCase(java.util.Locale.ROOT));
     }
 
-    private boolean lookupTracks(FriendList list) {
-        return friendLookup instanceof FriendLookup cache
-                && cache.source == list
-                && cache.stamp == list.changeCount();
-    }
-
-    private java.util.Set<String> rebuildLookup(java.util.List<String> list) {
-        FriendLookup rebuilt = new FriendLookup();
-        if (list != null) {
-            for (String entry : list) {
-                if (entry != null) {
-                    rebuilt.add(entry.trim().toLowerCase(java.util.Locale.ROOT));
-                }
-            }
-        }
-        if (list instanceof FriendList counted) {
-            rebuilt.stamp = counted.changeCount();
-            rebuilt.source = counted;
-        }
-        return rebuilt;
-    }
-
-    private void syncStampFromFriends() {
-        if (friends instanceof FriendList counted && friendLookup instanceof FriendLookup cache) {
-            cache.stamp = counted.changeCount();
-            cache.source = counted;
-        }
-    }
-
-    // Returns whether the list changed.
     public boolean addFriend(String name) {
         if (name == null || name.isBlank() || friends.size() >= MOST_FRIENDS) {
             return false;
         }
         String tidied = name.trim().toLowerCase(java.util.Locale.ROOT);
-        boolean absent = !friends.contains(tidied);
-        if (absent) {
-            friends.add(tidied);
-            friendLookup.add(tidied);
-            syncStampFromFriends();
+        if (isFriend(tidied)) {
+            return false;
         }
-        return absent;
+        friends.add(tidied);
+        friendLookup.add(tidied);
+        return true;
     }
 
     public boolean removeFriend(String name) {
         if (name == null) {
             return false;
         }
-        String tidied = name.trim().toLowerCase(java.util.Locale.ROOT);
-        boolean removed = friends.remove(tidied);
+        boolean removed = friends.remove(name.trim().toLowerCase(java.util.Locale.ROOT));
         if (removed) {
-            friendLookup.remove(tidied);
-            syncStampFromFriends();
+            friendLookup.remove(name.trim().toLowerCase(java.util.Locale.ROOT));
         }
         return removed;
+    }
+
+    private static long changeCount(java.util.List<String> list) {
+        return list instanceof FriendList tracked ? tracked.changeCount() : -1L;
+    }
+
+    private static int reading(java.util.List<String> list) {
+        return list instanceof FriendList ? list.hashCode() : 0;
+    }
+
+    private static java.util.Set<String> rebuildLookup(java.util.List<String> list) {
+        FriendLookup rebuilt = new FriendLookup();
+        if (list != null) {
+            rebuilt.addAll(list);
+        }
+        rebuilt.source = list;
+        rebuilt.stamp = changeCount(list);
+        rebuilt.reading = reading(list);
+        return rebuilt;
     }
 
     public void stopTracking() {
@@ -411,60 +468,68 @@ public final class LandNavConfig {
 
     public boolean gridEnabled = true;
 
-    // What Default resolves to.
     public static final int SHIPPED_GRID_COLOUR = 0x66203038;
 
     public int gridColour = SHIPPED_GRID_COLOUR;
 
-    // The colour's preset name, or a custom value; null means not yet chosen.
+    // A preset name or custom value; null until chosen.
     public String gridColourSwatch;
 
-    // What Default resolves to.
     public static final int SHIPPED_GRID_SQUARE_COLOUR = 0xAA1A2630;
 
     public int gridSquareColour = SHIPPED_GRID_SQUARE_COLOUR;
 
-    // The colour's preset name, or a custom value; null means not yet chosen.
+    // A preset name or custom value; null until chosen.
     public String gridSquareColourSwatch;
 
     public boolean contoursEnabled = true;
     public int contourInterval = DEFAULT_CONTOUR_INTERVAL;
     public int contourIndexEvery = DEFAULT_CONTOUR_INDEX_EVERY;
 
-    // What Default resolves to.
     public static final int SHIPPED_CONTOUR_COLOUR = 0x996B4A2F;
 
     public int contourColour = SHIPPED_CONTOUR_COLOUR;
 
-    // The colour's preset name, or a custom value; null means not yet chosen.
+    // A preset name or custom value; null until chosen.
     public String contourColourSwatch;
 
-    // What Default resolves to.
     public static final int SHIPPED_CONTOUR_INDEX_COLOUR = 0xDD8A5A33;
 
     public int contourIndexColour = SHIPPED_CONTOUR_INDEX_COLOUR;
 
-    // The colour's preset name, or a custom value; null means not yet chosen.
+    // A preset name or custom value; null until chosen.
     public String contourIndexColourSwatch;
 
     public static final int MIN_CONTOUR_INTERVAL = 1;
     public static final int MAX_CONTOUR_INTERVAL = 64;
 
-    // Shared by the slider and normalise().
     public static final int MIN_CONTOUR_INDEX_EVERY = 1;
     public static final int MAX_CONTOUR_INDEX_EVERY = 20;
 
     public int hudCadenceFrames = DEFAULT_HUD_CADENCE_FRAMES;
+
+    private static final boolean SHIPPED_RESURVEY_ENABLED = true;
+
+    private static final int SHIPPED_RESURVEY_SECONDS = 5;
+
+    static final java.util.Set<String> PINNED_TO_SHIPPED =
+            java.util.Set.of("resurveyEnabled", "resurveySeconds");
+
+    public boolean resurveyEnabled = SHIPPED_RESURVEY_ENABLED;
+
+    public int resurveySeconds = SHIPPED_RESURVEY_SECONDS;
+
+    public static final int MIN_RESURVEY_SECONDS = 1;
+
+    public static final int MAX_RESURVEY_SECONDS = 600;
 
     public static final int MIN_CADENCE = 1;
     public static final int MAX_CADENCE = 20;
     public static final float MIN_SCALE = 0.5f;
     public static final float MAX_SCALE = 3.0f;
 
-    // Set by load() when the file could not be read; empty otherwise.
     private transient String loadProblem = "";
 
-    // Whether the load-problem toast has already been shown this session.
     private transient boolean loadProblemNoticeShown;
 
     // Colour names the last normalise() could not read.
@@ -474,7 +539,6 @@ public final class LandNavConfig {
         return java.util.List.copyOf(colourProblems);
     }
 
-    // Suffix for the copy left beside an unreadable settings file.
     public static final String UNREADABLE_SUFFIX = ".unreadable";
 
     private static final JsonBind JSON = JsonBind.prettyWithNulls();
@@ -485,22 +549,23 @@ public final class LandNavConfig {
 
     static final int SET_ASIDE_RETRY_MILLIS = 40;
 
-    // A hash of the settable fields, for skipping a redundant normalise() pass.
+    // A hash of the settable fields.
     public long stateVersion() {
         return StateHash.versionOf(this);
     }
 
-    // Normalises in place, using the in-memory tie-break rule (the number wins).
+    // In-memory tie-break rule: the number wins.
     public LandNavConfig normalise() {
         return normalise(false);
     }
 
-    // True when reading from disk, where a colour's name is the fresher half.
+    // True when reading from disk.
     private LandNavConfig normalise(boolean namesAreFresher) {
         if (gridReferenceAnchor == null) {
             gridReferenceAnchor = HudAnchor.BOTTOM_LEFT;
         }
         hudCadenceFrames = Bounds.clamp(hudCadenceFrames, MIN_CADENCE, MAX_CADENCE);
+        resurveySeconds = Bounds.clamp(resurveySeconds, MIN_RESURVEY_SECONDS, MAX_RESURVEY_SECONDS);
         contourInterval = Bounds.clamp(contourInterval, MIN_CONTOUR_INTERVAL, MAX_CONTOUR_INTERVAL);
         woodlandRadius = Bounds.clamp(woodlandRadius,
                 MIN_WOODLAND_RADIUS, MAX_WOODLAND_RADIUS);
@@ -556,6 +621,7 @@ public final class LandNavConfig {
         if (approvedServers == null) {
             approvedServers = new java.util.ArrayList<>();
         }
+        settleServerList();
         casualtyMarkersKept = Bounds.clamp(casualtyMarkersKept,
                 MIN_CASUALTIES_KEPT, MAX_CASUALTIES_KEPT);
         if (compassAnchor == null) {
@@ -613,6 +679,8 @@ public final class LandNavConfig {
                 MIN_SCALE, MAX_SCALE);
         gridReferenceX = Math.max(0, gridReferenceX);
         gridReferenceY = Math.max(0, gridReferenceY);
+        resurveyEnabled = SHIPPED_RESURVEY_ENABLED;
+        resurveySeconds = SHIPPED_RESURVEY_SECONDS;
         configVersion = Math.max(configVersion, CURRENT_VERSION);
         return this;
     }
@@ -629,7 +697,6 @@ public final class LandNavConfig {
             BACKEND_RESOLUTIONS.incrementAndGet();
             liveMapBackend = resolvedLiveBackend.label();
         } else {
-            // Kept as typed, not replaced with the default.
             liveMapBackendProblem = "liveMapBackend \"" + clipped(liveMapBackend)
                     + "\" is unknown. Choices: "
                     + choiceList() + ".";
@@ -681,11 +748,14 @@ public final class LandNavConfig {
                 && approvedServers != null && !approvedServers.isEmpty()) {
             loadedBeforeApprovedPorts = true;
         }
+
+        if ((configVersion <= GEOSURVEY_CONFIG_VERSION) && liveMapEnabled) {
+            claimGreetings = true;
+        }
     }
 
     static final class SwatchReconciler {
 
-        // The text to store and the packed ARGB to draw.
         private record Reconciled(String text, int argb) {}
 
         private record SwatchProblem(String stored, String message) {}
@@ -700,7 +770,6 @@ public final class LandNavConfig {
             return FULL_PATH_RECONCILES.get();
         }
 
-        // Settles one colour's name against its number, using namesAreFresher as tie-break.
         static Reconciled reconcileColour(String stored, int held, int shipped, String key,
                 boolean namesAreFresher, java.util.List<String> problems) {
             if (held == shipped && "Default".equals(stored)) {
@@ -720,8 +789,8 @@ public final class LandNavConfig {
                 } else {
                     message = key + "Swatch holds \"" + LandNavConfig.clipped(stored)
                             + "\", not a preset or hex colour."
-                            + " The colour is unchanged."
-                            + " The name is kept.";
+                            + " The colour and the name"
+                            + " are unchanged.";
                     SWATCH_PROBLEM_CACHE.put(key, new SwatchProblem(stored, message));
                 }
                 problems.add(message);
@@ -736,7 +805,6 @@ public final class LandNavConfig {
         }
     }
 
-    // Sets the colour from text; returns false when the text names no known colour.
     public boolean setGridColour(String swatch) {
         ColourSwatch named = ColourSwatch.parse(swatch, gridColour >>> ALPHA_SHIFT);
         if (named == null) {
@@ -747,7 +815,6 @@ public final class LandNavConfig {
         return true;
     }
 
-    // Sets the colour from text; returns false when the text names no known colour.
     public boolean setGridSquareColour(String swatch) {
         ColourSwatch named = ColourSwatch.parse(swatch, gridSquareColour >>> ALPHA_SHIFT);
         if (named == null) {
@@ -758,7 +825,6 @@ public final class LandNavConfig {
         return true;
     }
 
-    // Sets the colour from text; returns false when the text names no known colour.
     public boolean setGridReferenceColour(String swatch) {
         ColourSwatch named = ColourSwatch.parse(swatch, gridReferenceColour >>> ALPHA_SHIFT);
         if (named == null) {
@@ -769,7 +835,6 @@ public final class LandNavConfig {
         return true;
     }
 
-    // Sets the colour from text; returns false when the text names no known colour.
     public boolean setAssociationColour(String swatch) {
         ColourSwatch named = ColourSwatch.parse(swatch, associationColour >>> ALPHA_SHIFT);
         if (named == null) {
@@ -780,7 +845,6 @@ public final class LandNavConfig {
         return true;
     }
 
-    // Sets the colour from text; returns false when the text names no known colour.
     public boolean setContourColour(String swatch) {
         ColourSwatch named = ColourSwatch.parse(swatch, contourColour >>> ALPHA_SHIFT);
         if (named == null) {
@@ -791,7 +855,6 @@ public final class LandNavConfig {
         return true;
     }
 
-    // Sets the colour from text; returns false when the text names no known colour.
     public boolean setContourIndexColour(String swatch) {
         ColourSwatch named = ColourSwatch.parse(swatch, contourIndexColour >>> ALPHA_SHIFT);
         if (named == null) {
@@ -802,7 +865,6 @@ public final class LandNavConfig {
         return true;
     }
 
-    // Returns shipped when value is NaN.
     private static float notANumber(float value, float shipped) {
         return Float.isNaN(value) ? shipped : value;
     }
@@ -811,19 +873,17 @@ public final class LandNavConfig {
         return Double.isNaN(value) ? shipped : value;
     }
 
-    // Why liveMapBackend names no backend, or empty.
+    // Empty when liveMapBackend names a backend.
     public String liveMapBackendProblem() {
         return liveMapBackendProblem;
     }
 
-    // Returns and clears whether this load moved the port.
     public boolean takeWebMapPortMoved() {
         boolean moved = webMapPortMoved;
         webMapPortMoved = false;
         return moved;
     }
 
-    // Returns and clears whether this load turned publication off.
     public boolean takeSharePresenceSplit() {
         boolean split = sharePresenceSplit;
         sharePresenceSplit = false;
@@ -836,7 +896,23 @@ public final class LandNavConfig {
         return loaded;
     }
 
-    // Shared by the settings screen and normalise().
+    public void settleServerList() {
+        if (approvedServersConfigured
+                && (approvedServers == null || approvedServers.isEmpty())) {
+            approvedServersConfigured = false;
+            if (shareEnabled) {
+                shareEnabled = false;
+                emptyServerListTurnedOff = true;
+            }
+        }
+    }
+
+    public boolean takeEmptyServerListTurnedOff() {
+        boolean turnedOff = emptyServerListTurnedOff;
+        emptyServerListTurnedOff = false;
+        return turnedOff;
+    }
+
     public static java.util.List<String> liveMapBackendChoices() {
         return BACKEND_CHOICES;
     }
@@ -889,7 +965,7 @@ public final class LandNavConfig {
         return CHOICE_LIST;
     }
 
-    // Max characters of a field's value quoted in a message.
+    // Most characters quoted from a field value.
     private static final int PROBLEM_QUOTE_LIMIT = 64;
 
     private static String clipped(String text) {
@@ -917,25 +993,42 @@ public final class LandNavConfig {
         return length <= PROBLEM_QUOTE_LIMIT ? head : head + "...";
     }
 
-    // Loads settings from path, or shipped defaults when it cannot be read.
+    // Shipped defaults when the file is unreadable.
     public static LandNavConfig load(Path path) {
-        LandNavConfig result;
-        if (path == null) {
-            result = new LandNavConfig().normalise();
-        } else {
-            try (Reader reader = new InputStreamReader(Files.newInputStream(path),
-                    StandardCharsets.UTF_8)) {
-                LandNavConfig loaded = JSON.fromJson(new Capped(reader), LandNavConfig.class);
-                if (loaded != null) {
-                    // True: read from disk, so the name is the fresher half.
-                    result = loaded.normalise(true);
-                } else {
-                    result = unreadable(path, "holds no document");
+        LandNavConfig result = new LandNavConfig().normalise();
+        if (path != null) {
+            boolean recovered = false;
+            boolean retry = true;
+            while (retry) {
+                retry = false;
+                try {
+                    try (Reader input = new InputStreamReader(Files.newInputStream(path),
+                            StandardCharsets.UTF_8)) {
+                        StringBuilder source = new StringBuilder();
+                        Reader reader = new CapturingReader(input, source);
+                        LandNavConfig loaded = JSON.fromJson(new Capped(reader), LandNavConfig.class);
+                        if (loaded != null) {
+                            JsonElement parsed = JsonParser.parseString(source.toString());
+                            UNDECLARED.put(loaded, undeclared(parsed, loaded));
+                            result = loaded.normalise(true);
+                        } else {
+                            result = unreadable(path, "holds no document");
+                        }
+                    }
+                } catch (NoSuchFileException absent) {
+                    try {
+                        if (!recovered && AtomicFileReplace.recoverStaleAside(path)) {
+                            recovered = true;
+                            retry = true;
+                        } else {
+                            result = new LandNavConfig().normalise();
+                        }
+                    } catch (IOException recoveryFailed) {
+                        result = unreadableOrDefaults(path, recoveryFailed);
+                    }
+                } catch (IOException | RuntimeException notOpened) {
+                    result = unreadableOrDefaults(path, notOpened);
                 }
-            } catch (NoSuchFileException absent) {
-                result = new LandNavConfig().normalise();
-            } catch (IOException | RuntimeException notOpened) {
-                result = unreadableOrDefaults(path, notOpened);
             }
         }
         return result;
@@ -964,25 +1057,25 @@ public final class LandNavConfig {
 
     private static LandNavConfig unreadable(Path path, String why) {
         LandNavConfig shipped = new LandNavConfig();
-        shipped.approvedServersConfigured = true;
         shipped.loadProblem = setAside(path, why)
-                + " The approved-server list was cleared."
-                + " Contributing stays off until you name a server again.";
+                + " The server list was cleared and"
+                + " contribute ground stays off; turn it on"
+                + " for every server.";
         return shipped.normalise();
     }
 
-    // Copies the unreadable file beside itself and returns what to tell the player.
+    // Returns player text.
     private static String setAside(Path path, String why) {
         String name = String.valueOf(path.getFileName());
         String unreadableName = name + UNREADABLE_SUFFIX;
         String said = name + " could not be read (" + why
-                + "). Every setting is at its shipped value for this session.";
+                + ")";
         Path copy = path.resolveSibling(unreadableName);
         String result;
         try {
             Files.copy(path, copy, StandardCopyOption.REPLACE_EXISTING);
-            result = said + " The file was copied to " + unreadableName
-                    + ". The next save writes over the original.";
+            result = said + "; a copy is in " + unreadableName
+                    + "; the next save writes over the original.";
         } catch (IOException | RuntimeException firstFailure) {
             Object lastFailure = firstFailure;
             boolean retry = SET_ASIDE_ATTEMPTS > 1;
@@ -1012,11 +1105,11 @@ public final class LandNavConfig {
                 }
             }
             if (lastFailure == null) {
-                result = said + " The file was copied to " + unreadableName
-                        + ". The next save writes over the original.";
+                result = said + "; a copy is in " + unreadableName
+                        + "; the next save writes over the original.";
             } else {
-                result = said + " It could not be copied aside either (" + lastFailure
-                        + "). The next save writes over it.";
+                result = said + "; it could not be copied aside (" + lastFailure
+                        + "); the next save writes over it.";
             }
         }
         return result;
@@ -1051,6 +1144,32 @@ public final class LandNavConfig {
         }
     }
 
+    private static final class CapturingReader extends Reader {
+
+        private final Reader input;
+
+        private final StringBuilder captured;
+
+        CapturingReader(Reader input, StringBuilder captured) {
+            this.input = input;
+            this.captured = captured;
+        }
+
+        @Override
+        public int read(char[] buffer, int offset, int count) throws IOException {
+            int read = input.read(buffer, offset, count);
+            if (read > 0) {
+                captured.append(buffer, offset, read);
+            }
+            return read;
+        }
+
+        @Override
+        public void close() throws IOException {
+            input.close();
+        }
+    }
+
     // What stopped the last load, or empty.
     public String loadProblem() {
         return loadProblem;
@@ -1065,7 +1184,6 @@ public final class LandNavConfig {
         return true;
     }
 
-    // Set once ATOMIC_MOVE fails, so a later save does not retry it.
     private static volatile boolean atomicMoveUnsupported;
 
     private static final java.util.concurrent.atomic.AtomicInteger DIRECTORY_CREATIONS =
@@ -1075,13 +1193,81 @@ public final class LandNavConfig {
         return DIRECTORY_CREATIONS.get();
     }
 
-    // No lock: callers must not save one config from two threads at once.
+    // No lock: never save one config from two threads at once.
     public void save(Path path) throws IOException {
         normalise();
-        land(writeFile(path), path, FileReplace.ALWAYS);
+        save(path, stateVersion(), null);
     }
 
-    // Same write; skips normalise() when normalisedState still matches stateVersion().
+    public SaveWriter.Document document() throws IOException {
+        normalise();
+        JsonObject output = documentObject();
+        StringBuilder text = new StringBuilder();
+        JSON.toJson(output, text);
+        return new SettingsDocument(copy(), text.toString());
+    }
+
+    public static void writeDocument(Path path, SaveWriter.Document document) throws IOException {
+        if (document instanceof SettingsDocument settingsDocument) {
+            settingsDocument.write(path);
+        } else {
+            SaveWriter.writeOne(path, document);
+        }
+    }
+
+    private static final class SettingsDocument implements SaveWriter.Document {
+
+        private final LandNavConfig snapshot;
+        private final String text;
+
+        private SettingsDocument(LandNavConfig snapshot, String text) {
+            this.snapshot = snapshot;
+            this.text = text;
+        }
+
+        @Override
+        public void writeTo(Path temp) throws IOException {
+            Files.writeString(temp, text, StandardCharsets.UTF_8);
+        }
+
+        private void write(Path path) throws IOException {
+            snapshot.save(path);
+        }
+    }
+
+    private JsonObject documentObject() {
+        JsonObject output = JSON.toJsonTree(this).getAsJsonObject();
+        JsonObject preserved = UNDECLARED.get(this);
+        if (preserved != null) {
+            for (Map.Entry<String, JsonElement> entry : preserved.entrySet()) {
+                if (output.get(entry.getKey()) == null) {
+                    output.add(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+        return output;
+    }
+
+    private static JsonObject undeclared(JsonElement parsed, LandNavConfig loaded) {
+        JsonObject kept = new JsonObject();
+        if (!parsed.isJsonObject()) {
+            return kept;
+        }
+        JsonObject known = JSON.toJsonTree(loaded).getAsJsonObject();
+        for (java.util.Map.Entry<String, JsonElement> entry : parsed.getAsJsonObject().entrySet()) {
+            if (known.get(entry.getKey()) == null && !retired(entry.getKey())) {
+                kept.add(entry.getKey(), entry.getValue());
+            }
+        }
+        return kept;
+    }
+
+    private static boolean retired(String key) {
+        return key.equals("fontId") || key.equals("fontScope")
+                || key.equals("fontSize") || key.equals("fontOversample");
+    }
+
+    // Skips normalise() when normalisedState matches stateVersion().
     public void save(Path path, long normalisedState) throws IOException {
         save(path, normalisedState, null);
     }
@@ -1097,7 +1283,6 @@ public final class LandNavConfig {
         }
     }
 
-    // The write itself.
     private Path writeFile(Path path) throws IOException {
         Path parent = path.getParent();
         if (parent != null && !Files.isDirectory(parent)) {
@@ -1113,7 +1298,7 @@ public final class LandNavConfig {
                                     .onMalformedInput(java.nio.charset.CodingErrorAction.REPLACE)
                                     .onUnmappableCharacter(
                                             java.nio.charset.CodingErrorAction.REPLACE))))) {
-                JSON.toJson(this, writer);
+                JSON.toJson(documentObject(), writer);
             }
         } catch (IOException | RuntimeException failed) {
             try {
@@ -1183,8 +1368,11 @@ public final class LandNavConfig {
     public LandNavConfig copy() {
         LandNavConfig copy = JSON.fromJson(JSON.toJsonTree(this), LandNavConfig.class);
         if (copy != null) {
-            copy.friendLookup = new java.util.HashSet<>(
-                    copy.friends == null ? java.util.List.of() : copy.friends);
+            JsonObject preserved = UNDECLARED.get(this);
+            if (preserved != null) {
+                UNDECLARED.put(copy, preserved);
+            }
+            copy.friendLookup = rebuildLookup(copy.friends);
         }
         return copy;
     }
@@ -1200,6 +1388,8 @@ public final class LandNavConfig {
         this.gridReferenceX = other.gridReferenceX;
         this.gridReferenceY = other.gridReferenceY;
         this.hudCadenceFrames = other.hudCadenceFrames;
+        this.resurveyEnabled = other.resurveyEnabled;
+        this.resurveySeconds = other.resurveySeconds;
         this.generaliseWoodland = other.generaliseWoodland;
         this.woodlandRadius = other.woodlandRadius;
         this.woodlandThreshold = other.woodlandThreshold;
@@ -1214,6 +1404,7 @@ public final class LandNavConfig {
         this.shareDirectorySeed = other.shareDirectorySeed;
         this.shareMapCards = other.shareMapCards;
         this.shareSessionProof = other.shareSessionProof;
+        this.shareSessionProofAutoEnabled = other.shareSessionProofAutoEnabled;
         this.shareVanishMarkers = other.shareVanishMarkers;
         this.shareStaffMarkers = other.shareStaffMarkers;
         this.shareVanishProbe = other.shareVanishProbe;
@@ -1228,7 +1419,6 @@ public final class LandNavConfig {
         this.showCaptureRange = other.showCaptureRange;
         this.protractorPercent = other.protractorPercent;
 
-        // Copied, not shared: importServerAliases holds nested lists too.
         java.util.List<java.util.List<String>> copiedAliases = new java.util.ArrayList<>(
                 other.importServerAliases == null ? 0 : other.importServerAliases.size());
         if (other.importServerAliases != null) {
@@ -1246,6 +1436,7 @@ public final class LandNavConfig {
         this.webMapPort = other.webMapPort;
         this.webMapAllowLan = other.webMapAllowLan;
         this.liveMapEnabled = other.liveMapEnabled;
+        this.claimGreetings = other.claimGreetings;
         this.liveMapUrl = other.liveMapUrl;
         this.liveMapServer = other.liveMapServer;
         this.liveMapBackend = other.liveMapBackend;
@@ -1303,11 +1494,16 @@ public final class LandNavConfig {
         this.contourColourSwatch = other.contourColourSwatch;
         this.contourIndexColour = other.contourIndexColour;
         this.contourIndexColourSwatch = other.contourIndexColourSwatch;
+        JsonObject preserved = UNDECLARED.get(other);
+        if (preserved == null) {
+            UNDECLARED.remove(this);
+        } else {
+            UNDECLARED.put(this, preserved);
+        }
         normalise();
     }
 
 
-    // Lower-cases, dedupes and caps a friends list read from a file.
     private java.util.List<String> tidyFriends(java.util.List<String> raw) {
         if (raw == null) {
             friendLookup = new FriendLookup();
@@ -1323,15 +1519,10 @@ public final class LandNavConfig {
                 out.add(tidied);
             }
         }
-        FriendLookup cache = new FriendLookup();
-        cache.addAll(out);
-        cache.stamp = out.changeCount();
-        cache.source = out;
-        friendLookup = cache;
+        friendLookup = rebuildLookup(out);
         return out;
     }
 
-    // Computes stateVersion() by reflection.
     private static final class StateHash {
 
         private static final long INITIAL_STAMP = 0xCBF29CE484222325L;
@@ -1370,7 +1561,7 @@ public final class LandNavConfig {
                 }
                 result = stamp;
             } catch (IllegalAccessException unreadable) {
-                // Unreachable; falls back to a value that always forces normalise().
+                // Unreachable; the new value forces normalise().
                 result = UNREADABLE_STATE.incrementAndGet();
             }
             return result;
@@ -1402,7 +1593,7 @@ public final class LandNavConfig {
             };
         }
 
-        // Declared, non-static, non-transient, non-synthetic fields: what JsonBind writes.
+        // The fields JsonBind writes.
         private static java.lang.reflect.Field[] stateFields() {
             java.lang.reflect.Field[] declared = LandNavConfig.class.getDeclaredFields();
             java.util.List<java.lang.reflect.Field> out =
@@ -1462,95 +1653,15 @@ public final class LandNavConfig {
             return super.set(index, element);
         }
 
-        @Override
-        public java.util.List<String> subList(int fromIndex, int toIndex) {
-            return new FriendListView(this, fromIndex, toIndex);
-        }
-
-        long changeCount() {
+        private long changeCount() {
             return (long) modCount + sets;
-        }
-
-        private int structuralChanges() {
-            return modCount;
-        }
-
-        private static final class FriendListView extends java.util.AbstractList<String>
-                implements java.util.RandomAccess {
-
-            private final FriendList owner;
-
-            private final int offset;
-
-            private int size;
-
-            private int expectedModCount;
-
-            private FriendListView(FriendList owner, int fromIndex, int toIndex) {
-                java.util.Objects.checkFromToIndex(fromIndex, toIndex, owner.size());
-                this.owner = owner;
-                this.offset = fromIndex;
-                this.size = toIndex - fromIndex;
-                this.expectedModCount = owner.structuralChanges();
-            }
-
-            @Override
-            public int size() {
-                checkForComodification();
-                return size;
-            }
-
-            @Override
-            public String get(int index) {
-                checkForComodification();
-                java.util.Objects.checkIndex(index, size);
-                return owner.get(offset + index);
-            }
-
-            @Override
-            public String set(int index, String element) {
-                checkForComodification();
-                java.util.Objects.checkIndex(index, size);
-                return owner.set(offset + index, element);
-            }
-
-            @Override
-            public void add(int index, String element) {
-                checkForComodification();
-                java.util.Objects.checkFromToIndex(index, index, size);
-                owner.add(offset + index, element);
-                size++;
-                expectedModCount = owner.structuralChanges();
-            }
-
-            @Override
-            public String remove(int index) {
-                checkForComodification();
-                java.util.Objects.checkIndex(index, size);
-                String out = owner.remove(offset + index);
-                size--;
-                expectedModCount = owner.structuralChanges();
-                return out;
-            }
-
-            @Override
-            public java.util.List<String> subList(int fromIndex, int toIndex) {
-                checkForComodification();
-                java.util.Objects.checkFromToIndex(fromIndex, toIndex, size);
-                return new FriendListView(owner, offset + fromIndex, offset + toIndex);
-            }
-
-            private void checkForComodification() {
-                if (owner.structuralChanges() != expectedModCount) {
-                    throw new java.util.ConcurrentModificationException();
-                }
-            }
         }
     }
 
     private static final class FriendLookup extends java.util.HashSet<String> {
 
         private long stamp;
+        private int reading;
         private java.util.List<String> source;
     }
 }
