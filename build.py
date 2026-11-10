@@ -124,19 +124,24 @@ def nested_jar(root=None):
     return name, path, was
 
 
-def mixinextras_jar(build):
-    loader = os.path.join(LIBS, "fabric-loader-0.19.3.jar")
-    entry = "META-INF/jars/mixinextras-fabric-0.5.4.jar"
+def mixinextras_jar(build, loader_version):
+    if not loader_version:
+        sys.exit("gradle.properties has no loader_version.")
+    loader = os.path.join(LIBS, "fabric-loader-%s.jar" % loader_version)
     if not os.path.isfile(loader):
         sys.exit("Fabric loader jar missing: %s" % loader)
     try:
         with zipfile.ZipFile(loader) as archive:
+            entries = sorted(n for n in archive.namelist()
+                             if n.startswith("META-INF/jars/mixinextras-fabric-")
+                             and n.endswith(".jar"))
+            if not entries:
+                sys.exit("MixinExtras nested jar missing from %s" % loader)
+            entry = entries[-1]
             contents = archive.read(entry)
-    except KeyError:
-        sys.exit("MixinExtras nested jar missing from %s: %s" % (loader, entry))
     except zipfile.BadZipFile:
         sys.exit("Fabric loader jar is not readable: %s" % loader)
-    path = os.path.join(build, "mixinextras-fabric-0.5.4.jar")
+    path = os.path.join(build, entry.rsplit("/", 1)[1])
     with open(path, "wb") as output:
         output.write(contents)
     return path
@@ -186,7 +191,7 @@ def main():
             shutil.rmtree(d)
         os.makedirs(d, exist_ok=True)
 
-    mixinextras_path = mixinextras_jar(build)
+    mixinextras_path = mixinextras_jar(build, p.get("loader_version", ""))
 
     jars = [os.path.join(LIBS, f).replace("\\", "/")
             for f in sorted(os.listdir(LIBS)) if f.endswith(".jar")]

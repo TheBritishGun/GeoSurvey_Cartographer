@@ -4,7 +4,7 @@ Has many ways to protect a live view from being overwritten by another server.
 
 Runs beside another map mod, such as Xaero's or JourneyMap.
 
-Minecraft 26.2, Fabric, Java 25. Client side.
+Minecraft 26.3, Fabric, Java 25. Client side.
 
 For players
 Put the jar in your mods folder, with Fabric API. GeoSurvey 0.1.12-i and newer already hold it; do not add it beside them.
@@ -35,7 +35,7 @@ Commands:
 /geosurvey marker ...	places, lists, edits, shares and removes a marker
 
 Build
-JDK 25 and Python 3, a built Sandpaper checkout beside this one (../sandpaper), and the Minecraft and Fabric jars in libs/. Then:
+JDK 25 and Python 3, a built Sandpaper checkout of its mc-26.3 branch beside this one (../sandpaper), and the Minecraft and Fabric jars in libs/. Then:
 
 python build.py
 

@@ -40,6 +40,12 @@ public final class LandCoverClassifier {
         return cover;
     }
 
+    // Minecraft 26.2 BlockState.blocksMotion(): solid, and not cobweb or bamboo sapling.
+    static boolean blocksMotion(BlockState state) {
+        Block block = state.getBlock();
+        return block != Blocks.COBWEB && block != Blocks.BAMBOO_SAPLING && state.isSolid();
+    }
+
     private static LandCover colourOf(BlockState state) {
         MapColor material = state.getMapColor(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         if (material == null || material == MapColor.NONE) {
@@ -52,7 +58,7 @@ public final class LandCoverClassifier {
         if (isBaseStoneGround(state)) {
             return LandCover.ROCK;
         }
-        return !state.blocksMotion() ? LandCover.SCRUB : LandCover.URBAN;
+        return !blocksMotion(state) ? LandCover.SCRUB : LandCover.URBAN;
     }
 
     private static int earlyVerdict(BlockState state) {
@@ -179,7 +185,7 @@ public final class LandCoverClassifier {
                 } else if (!state.getFluidState().isEmpty()) {
                     kind = StructureProbe.Kind.OTHER;
                 } else {
-                    kind = state.blocksMotion()
+                    kind = blocksMotion(state)
                             ? StructureProbe.Kind.WORKED : StructureProbe.Kind.OTHER;
                 }
             }

@@ -221,7 +221,7 @@ public final class ChunkSampler {
 
     private static boolean standsOnGround(BlockState state, Scratch scratch) {
         prepareMemo(state, scratch);
-        boolean passable = !state.blocksMotion() && state.getFluidState().isEmpty();
+        boolean passable = !LandCoverClassifier.blocksMotion(state) && state.getFluidState().isEmpty();
         if (!passable && !scratch.memoTreePartKnown) {
             scratch.memoTreePart = LandCoverClassifier.isTreePart(state);
             scratch.treePartCalls++;
