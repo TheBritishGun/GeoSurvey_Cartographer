@@ -380,7 +380,7 @@ public record Batch(
         return result;
     }
 
-    // The bytes left after the one already read, counted up to a ceiling.
+    // Bytes left past the one read, capped at a ceiling.
     private static String extraBytes(InputStream in) throws IOException {
         long extra = 1L;
         byte[] sink = new byte[EXTRA_SINK_BYTES];

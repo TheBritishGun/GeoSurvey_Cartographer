@@ -15,7 +15,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 
-// Places and edits markers by command, through the marker panel's LandmarkStore.
+// Edits markers by command, through LandmarkStore.
 // A duplicate name is refused.
 public final class Markers {
 
@@ -42,7 +42,7 @@ public final class Markers {
     public record Said(boolean ok, String text) {
     }
 
-    // Told, on the client thread, each time a dimension's markers are saved; source names the saved file.
+    // Client thread; told each save. Source names saved file.
     @FunctionalInterface
     public interface Saved {
 
@@ -230,7 +230,7 @@ public final class Markers {
                 || Math.abs((long) mark.z()) > SharedRecord.MAX_COORDINATE;
     }
 
-    // The store's revision moves with the mark, so the next save writes it.
+    // Store revision moves with the mark. Next save writes it.
     private static void setShared(LandmarkStore store, Landmark mark, String shared) {
         store.setShared(mark, shared);
     }
@@ -337,7 +337,7 @@ public final class Markers {
                 pick(store, mark, AFFILIATIONS, wanted, "an affiliation", "", LandmarkStore::setAffiliation));
     }
 
-    // Marker names for tab completion, without duplicates.
+    // Marker names, without duplicates.
     public List<String> names(String dimension) {
         if (blank(dimension)) {
             return List.of();

@@ -124,7 +124,7 @@ public final class ShareCommand {
 
     private static volatile Consumer<Claims.Said> portNotes = ShareCommand::logPortNote;
 
-    // listener may be null: nobody is told of a saved claims book.
+    // Listener may be null: nobody is told of saved books.
     public static void afterClaimsSaved(Claims.BookSaved listener) {
         CLAIMS.afterSave(listener);
     }
@@ -602,7 +602,7 @@ public final class ShareCommand {
         return new Answer(true, said);
     }
 
-    // The count, 1 line for each server, then how to change the list.
+    // Count, one line per server, then change instructions.
     private static String serverLines(java.util.List<String> entries, int count) {
         StringBuilder out = new StringBuilder(JOINED_SERVERS_CAPACITY)
                 .append("Contributing from ").append(count).append(" servers:");
@@ -613,7 +613,7 @@ public final class ShareCommand {
         return out.append('\n').append(SERVER_COMMANDS).toString();
     }
 
-    // The entries a reply shows: not null, not blank once drawn.
+    // Entries shown: not null, not blank once drawn.
     private static java.util.List<String> shownServers(java.util.List<String> entries) {
         java.util.List<String> shown = new java.util.ArrayList<>(entries.size());
         for (String entry : entries) {
@@ -624,7 +624,7 @@ public final class ShareCommand {
         return shown;
     }
 
-    // The line that names the servers shown, or says that none is approved.
+    // Line naming shown servers, or that none is approved.
     private static String fromLine(java.util.List<String> shown) {
         return shown.isEmpty() ? NO_SERVER_APPROVED : "Contributing from " + someServers(shown) + ".";
     }

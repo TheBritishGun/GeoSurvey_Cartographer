@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Objects;
 
-// The world part of the published cartographer; the capture tells it each change of the world folder.
+// World part of the published cartographer. Told each folder change.
 final class CollectorCartographerWorld implements CartographerWorld {
 
     private static final org.slf4j.Logger LOGGER =

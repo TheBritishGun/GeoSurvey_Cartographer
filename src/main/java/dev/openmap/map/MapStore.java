@@ -197,7 +197,7 @@ public final class MapStore implements ChunkSource {
         // A writer finishes it off this thread.
         QUEUED,
 
-        // The store keeps the sample and stops asking until the next drainDirtyRegions().
+        // Keeps sample, stops asking until next drainDirtyRegions().
         REFUSED
     }
 
@@ -209,7 +209,7 @@ public final class MapStore implements ChunkSource {
 
     private int loadsAllowed = UNLIMITED_LOADS;
 
-    // Caps how many more regions get() may read from disk.
+    // Caps regions get() may read from disk.
     public void allowRegionLoads(int regions) {
         this.loadsAllowed = Math.max(0, regions);
     }

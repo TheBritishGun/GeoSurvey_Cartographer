@@ -1,6 +1,6 @@
 package dev.openmap.symbol;
 
-// Standard identity: a frame shape with a fill colour.
+// Standard identity: a frame shape with a fill color.
 public enum Affiliation {
 
     // Light blue.
@@ -15,7 +15,7 @@ public enum Affiliation {
     // Light yellow.
     UNKNOWN(Frame.QUATREFOIL, Fills.UNKNOWN, "Unknown");
 
-    // One colour for all frame outlines and icons.
+    // One color for all frame outlines and icons.
     public static final int LINE = 0xFF101010;
 
     private static final class Fills {
@@ -48,7 +48,7 @@ public enum Affiliation {
         return frame;
     }
 
-    // Fill colour as ARGB.
+    // Fill color as ARGB.
     public int fill() {
         return fill;
     }

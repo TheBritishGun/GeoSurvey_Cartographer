@@ -8,7 +8,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-// Notifies ChunkSampler and LandCoverClassifier when tags update in PLAY.
+// Notifies ChunkSampler and LandCoverClassifier on tag update in PLAY.
 @Mixin(ClientPacketListener.class)
 public abstract class ClientPacketListenerTagsMixin {
 

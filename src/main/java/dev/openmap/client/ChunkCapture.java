@@ -62,7 +62,7 @@ public final class ChunkCapture {
                 MIN_SCAN_RADIUS, MAX_SCAN_RADIUS);
     }
 
-    // Matches ClientChunkCache's retention beyond view.
+    // Chunks kept beyond the view.
     private static final int CACHE_SLACK = 3;
 
     private static final int DEADLINE_CHECK_MASK = 63;
@@ -218,17 +218,17 @@ public final class ChunkCapture {
     private final java.util.Set<String> saidUnapproved =
             new java.util.LinkedHashSet<>();
 
-    // Tick thread only; label and labelCollector are for this address.
+    // Tick thread only. Label and collector for this address.
     private String labelFor;
 
     private String label;
 
     private String labelCollector = "";
 
-    // The share name of the server whose world the store's root holds; null with no server. Any thread reads it.
+    // Share name of root's server, or null. Any thread reads.
     private volatile String rootServer = null;
 
-    // Tick thread only; the label rootServer was last made from, and the usable name made from it.
+    // Tick thread only. Last label and its usable name.
     private String namedLabel = null;
 
     private String namedAs = null;
@@ -313,24 +313,24 @@ public final class ChunkCapture {
         ground.drainWith(imports);
     }
 
-    // Client thread; the player joined a server or a single-player world.
+    // Client thread. Player joined a server or world.
     void joined(Minecraft client) {
         rootAt(worldRoot(client, LandNav.config()), uploadLabel(shareServer(client)));
         world.followRoot(storage.root());
     }
 
-    // Moves the store's root, then the share name of its server; the tick thread. label may be null: no server.
+    // Tick thread. Moves root, then label; null: no server.
     void rootAt(Path root, String label) {
         storage.setRoot(root);
         rootServer = shareName(label);
     }
 
-    // The share name of the server whose world the store's root holds, or null; any thread.
+    // Share name of root's server, or null; any thread.
     String rootServer() {
         return rootServer;
     }
 
-    // Tick thread only; the usable name of a label, made again only when the label changes.
+    // Tick thread only. Usable name of a label.
     private String shareName(String label) {
         if (label != null && !label.equals(namedLabel)) {
             namedAs = Batch.usableServerName(label);
@@ -1100,7 +1100,7 @@ public final class ChunkCapture {
 
     private boolean sampledUnchanged;
 
-    // Null if the budget ends first or held ground is unchanged.
+    // Null if the budget ends first or ground is unchanged.
     private ChunkSample sample(ClientLevel level, LevelChunk chunk, int cx, int cz,
                                long deadline, ChunkSample held) {
         sampledUnchanged = false;

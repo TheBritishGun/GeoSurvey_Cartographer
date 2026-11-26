@@ -5,7 +5,7 @@ import dev.openmap.api.CartographerGround;
 import dev.openmap.api.CartographerMarkers;
 import dev.openmap.api.CartographerWorld;
 
-// The running collector as GeoSurvey reaches it, in 3 parts.
+// Running collector as GeoSurvey reaches it, in 3 parts.
 final class CollectorCartographer implements Cartographer {
 
     private static final int API_VERSION = 1;

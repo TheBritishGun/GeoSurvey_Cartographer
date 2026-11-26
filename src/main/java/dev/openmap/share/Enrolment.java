@@ -37,7 +37,6 @@ public record Enrolment(String challenge, String name) {
         return encode(challenge, name);
     }
 
-    // The same bytes; the caller already checked both fields.
     static byte[] encode(String challenge, String name) throws IOException {
         int challengeLength = WireWrite.modifiedUtfLength(challenge);
         int nameLength = WireWrite.modifiedUtfLength(name);

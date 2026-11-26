@@ -48,9 +48,9 @@ final class ShareOutbox implements Claims.SharedFrom {
     private static final long MAX_RETRY_AFTER_SECONDS = 3_600L;
     private static final long MILLIS_PER_SECOND = 1_000L;
     private static final long NANOS_PER_MILLI = 1_000_000L;
-    // How long a command waits for the collector's answer to a claim it sent: one retry period.
+    // Wait for a claim answer: one retry period.
     private static final long ANSWER_WAIT_NANOS = RETRY_MILLIS * NANOS_PER_MILLI;
-    // The source every claim entry carried while one claims book served every world.
+    // Source name for claim entries.
     private static final String LEGACY_CLAIMS_SOURCE = "claims";
     private static final int DEFAULT_SNAPSHOT_ENTRIES = 12;
     private static final int OUTBOX_VERSION = 1;
@@ -59,7 +59,7 @@ final class ShareOutbox implements Claims.SharedFrom {
 
     private enum State { TO_SEND, SENT, SETTLED, REFUSED }
 
-    // What the outbox posts now: nothing, removals alone while sharing is off, or every record.
+    // What the outbox posts: none, removals, or all.
     enum Posting {
         NONE,
         REMOVALS,
@@ -70,7 +70,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // What a save learns as it is made: the open server's share name, and what is posted.
+    // Open server's share name and what is posted.
     interface Moment {
 
         // Null: no server, or none known.
@@ -79,13 +79,13 @@ final class ShareOutbox implements Claims.SharedFrom {
         Posting posting();
     }
 
-    // The collector's post of one record; server is null when none is known, else the collector is told it.
+    // Posts one record; server may be null.
     interface Poster {
 
         ShareSender.Reply post(URI endpoint, byte[] body, String server) throws IOException;
     }
 
-    // Whether this client is vanished; while it is, nothing is posted. Any thread.
+    // Whether this client is vanished; posts nothing. Any thread.
     interface Vanish {
 
         boolean vanished();
@@ -94,7 +94,7 @@ final class ShareOutbox implements Claims.SharedFrom {
     private record Fixed(String server, Posting posting) implements Moment {
     }
 
-    // A command's wait for the collector's answer to one claim revision; guarded by this outbox.
+    // Answer wait for one claim revision; guarded by outbox.
     private static final class Watch {
         private final Entry entry;
         private final String source;
@@ -116,11 +116,11 @@ final class ShareOutbox implements Claims.SharedFrom {
         private final SharedRecord.Kind kind;
         private final String id;
         private String source;
-        // The share name of the server its record was queued under; null from an older outbox file.
+        // Share name of the server; null from older files.
         private String server;
-        // A server whose scope may hold a live revision; it gets a removal first. "" names no server; null: none.
+        // Live-revision server; "" for no server, null for none.
         private String withdrawFrom = null;
-        // Whether the entry's server may hold a live revision that this outbox posted there.
+        // Whether the entry's server may hold a live revision.
         private boolean serverMayHold = false;
         private String playerId;
         private String ownerId;
@@ -133,9 +133,9 @@ final class ShareOutbox implements Claims.SharedFrom {
         private boolean logged;
         private boolean postFailureLogged;
         private boolean unrevisableLogged = false;
-        // The collector's last answer of 404 or 507 that was logged for this entry; 0 before any.
+        // Last logged 404 or 507 answer; 0 before any.
         private int conditionLogged = 0;
-        // A claim's removal whose book still held the claim, unshared, when that book was last saved.
+        // Removal whose book still held the claim unshared.
         private boolean unshared = false;
         private final Runnable onDrop = this;
 
@@ -171,11 +171,11 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // Since: the save's nanoTime; session: the answerSession the save was held in.
+    // Since: save nanoTime. Session: answerSession at hold.
     private record PendingClaims(String source, String server, Posting posting, ClaimBook book, long nowMillis,
             long since, long session) { }
 
-    // A held save's wait for the collector's answer to one claim its book shares.
+    // Held wait for one shared claim's answer.
     private record HeldWait(String source, String id, String name, long since) { }
 
     private record PendingMarkers(String source, String server, String dimensionId, LandmarkStore store,
@@ -185,34 +185,34 @@ final class ShareOutbox implements Claims.SharedFrom {
     private record HeldPort(String book, Supplier<Claims.Said> port) { }
 
     private final Path file;
-    // Read at each save, off the lock, for the saving world's server and what the outbox posts.
+    // Read at each save, off the lock.
     private final Moment moment;
-    // Read off the lock at each beat and again before each post.
+    // Read off the lock at each beat and post.
     private final Vanish vanish;
     private final Map<String, Entry> entries = new HashMap<>();
     private final Map<String, PendingClaims> pendingClaims = new HashMap<>();
     private final Map<String, PendingMarkers> pendingMarkers = new HashMap<>();
     private final List<Watch> watches = new ArrayList<>();
-    // The waits of saves held until the outbox has loaded; guarded by this outbox.
+    // Waits of held saves; guarded by outbox.
     private final List<HeldWait> heldWaits = new ArrayList<>();
-    // Waits of claims a later held save no longer shares, said only if the load fails; guarded by this outbox.
+    // Waits said only if the load fails; guarded by outbox.
     private final List<HeldWait> droppedWaits = new ArrayList<>();
-    // The cause each shared claim the record refuses was logged for, by claim id; guarded by this outbox.
+    // Logged refusal cause per claim id; guarded by outbox.
     private final Map<String, Claims.Shareable> refusedClaims = new HashMap<>();
-    // The shared markers the record refuses that were logged, by shared id; guarded by this outbox.
+    // Logged refused marker ids; guarded by outbox.
     private final Set<String> refusedMarkers = new HashSet<>();
     private final AtomicLong writtenSeq = new AtomicLong();
     private boolean loaded;
     private boolean loading;
     private boolean unreadable;
     private long saveSeq;
-    // Counts the times every wait was forgotten; guarded by this outbox.
+    // Count of forgotten waits; guarded by outbox.
     private long answerSession;
-    // A world's one-time claims port held until the first load has ended, or null; guarded by this outbox.
+    // Held port until load ends, or null; guarded by outbox.
     private HeldPort heldPort = null;
-    // Whether the last walk found no entry to post and no entry changed since; guarded by this outbox.
+    // Last walk found nothing to post; guarded by outbox.
     private boolean quiet = false;
-    // The posting, player and least retry time of the last walk; guarded by this outbox.
+    // Last walk's posting, player and retry time; guarded by outbox.
     private Posting quietPosting = null;
     private String quietPlayer = null;
     private long quietUntil = 0L;
@@ -267,7 +267,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // Source names the one world's book the claims were saved to.
+    // Source: the one book the claims were saved to.
     Claims.Sent claimsSaved(String source, ClaimBook book, long nowMillis) {
         if (source == null || book == null || !book.unreadable().isEmpty()) {
             return Claims.Sent.NOTHING;
@@ -298,7 +298,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return sent;
     }
 
-    // TO_NODE when a queued record is posted, HELD when every one is held back, NOTHING when none was queued.
+    // TO_NODE: posted. HELD: all held back. NOTHING: none queued.
     private static Claims.Sent toNode(int posted, int heldBack) {
         Claims.Sent sent;
         if (posted > 0) {
@@ -311,7 +311,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return sent;
     }
 
-    // A save of this book made now is newer than its held save, which is dropped with its held waits.
+    // Drops the held save and its waits.
     private void dropHeld(String source) {
         pendingClaims.remove(source);
         removeWaitsOf(heldWaits, source);
@@ -414,7 +414,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // The post goes to the work pool; a pool that refuses it frees the entry for the next beat.
+    // Posts to the work pool; a refusal frees the entry.
     private void queuePost(Poster poster, URI endpoint, Entry posted, SharedRecord record, String server,
                            boolean withdrawing) {
         boolean queued = Sandpaper.isReady() && Sandpaper.workPool().submit(CollectorMod.MOD_ID,
@@ -427,7 +427,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // A client that vanished after the beat posts nothing; the entry waits for a later beat.
+    // Posts nothing if vanished; the entry waits for a beat.
     private void postWhileVisible(Poster poster, URI endpoint, Entry entry, SharedRecord record, String server,
                                   boolean withdrawing) {
         if (vanish.vanished()) {
@@ -437,24 +437,24 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // Whether a beat has a player with an id and a name, a poster and an address to post to.
+    // Whether the beat has a named player, poster and address.
     private static boolean ready(String playerId, String playerName, Poster poster, URI endpoint) {
         return playerId != null && !playerId.isEmpty() && playerName != null && !playerName.isEmpty()
                 && poster != null && endpoint != null;
     }
 
-    // Whether the last walk found nothing to post under this posting and player, and no retry time has come.
+    // Last walk found nothing to post; no retry due.
     private boolean quietFor(Posting posting, String playerId, long nowMillis) {
         return quiet && (posting == quietPosting) && playerId.equals(quietPlayer) && (nowMillis < quietUntil);
     }
 
-    // Whether a walk skips the entry: a post of it is under way, or it is sent or settled.
+    // Whether a walk skips the entry: posting, sent or settled.
     private static boolean postedOrPosting(Entry entry) {
         return entry.posting || entry.state == State.SENT || entry.state == State.SETTLED;
     }
 
-    // The number of entries this save queued for the collector, each one watched for its answer.
-    // Hold may be null: a save made now, not one held until the outbox has loaded.
+    // Number of entries this save queued.
+    // Null: save made now, not held.
     private Claims.Sent saveClaims(String source, String server, Posting posting, ClaimBook book, long nowMillis,
                                    PendingClaims hold) {
         long since = (hold == null) ? System.nanoTime() : hold.since();
@@ -493,7 +493,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return removalsPosted ? toNode(posted + removals, heldBack) : toNode(posted, heldBack + removals);
     }
 
-    // Each claim entry of this book that it no longer shares: unshared while the book still holds the claim.
+    // Claim entries this book no longer shares.
     private void markUnshared(String source, Map<String, Boolean> seen, ClaimBook book) {
         for (Entry entry : entries.values()) {
             if ((entry.kind == SharedRecord.Kind.CLAIM) && source.equals(entry.source)
@@ -581,7 +581,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return kind.wire() + "/" + id;
     }
 
-    // Null when the record refuses the claim or its entry is unrevisable, each logged once; prior may be null.
+    // Null when refused or unrevisable; prior may be null.
     private SharedRecord claimRecord(Claim claim, Entry prior) {
         Claims.Shareable fit = Claims.shareable(claim);
         SharedRecord record;
@@ -611,7 +611,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return record;
     }
 
-    // Null when the record refuses the marker's world, label or coordinate.
+    // Null when the record refuses the marker data.
     private SharedRecord.Item markerItem(Landmark marker, String dimensionId) {
         String label = clean(marker.name());
         SharedRecord.Item item;
@@ -629,7 +629,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return item;
     }
 
-    // Exact: Claims.shareable passed only whole corners within the record's range, so each fits an int.
+    // Exact: values are whole and fit an int.
     private static int[] coordinates(double[] values) {
         int[] out = new int[values.length];
         for (int at = 0; at < values.length; at++) {
@@ -651,12 +651,12 @@ final class ShareOutbox implements Claims.SharedFrom {
         return entry.item != null && entry.item.equals(item);
     }
 
-    // True when the entry changed and was queued for the collector; server may be null: none known.
+    // True when the entry changed; server may be null.
     private boolean replace(Entry entry, String source, String server, String playerId, SharedRecord record,
                             long nowMillis, boolean revisionChanged) {
         boolean unchanged = same(entry, record.item()) && record.ownerId().equals(entry.ownerId)
                 && record.owner().equals(entry.owner) && playerId.equals(entry.playerId) && !revisionChanged;
-        // An unchanged claim saved in another book moves to that book's saves and is not sent again.
+        // Moves the entry to this book's saves.
         entry.source = source;
         if (!unchanged) {
             moveTo(entry, server);
@@ -672,7 +672,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return !unchanged;
     }
 
-    // The entry takes this server. A scope it leaves that may hold a live revision gets a removal first.
+    // Sets the entry's server; old scope may need removal.
     private static void moveTo(Entry entry, String server) {
         if (!Objects.equals(entry.server, server)) {
             if (scopeOf(server).equals(entry.withdrawFrom)) {
@@ -688,17 +688,17 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // The scope a post to this server reaches: "" for no server.
+    // Scope a post reaches; "" for no server.
     private static String scopeOf(String server) {
         return (server == null) ? "" : server;
     }
 
-    // The server a post to this scope names: null for the scope with no server.
+    // Server named by scope; null for no server.
     private static String serverOf(String scope) {
         return scope.isEmpty() ? null : scope;
     }
 
-    // The number of tombstones queued; watched ones wait for the collector's answer.
+    // Number of tombstones queued.
     private int tombstoneMissing(String source, Map<String, Boolean> seen, long nowMillis, long since,
                                  boolean watched) {
         int queued = 0;
@@ -734,7 +734,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return queued;
     }
 
-    // Waits for the collector's answer to the entry's revision now queued, in place of any earlier wait for it.
+    // Waits for the answer to the queued revision.
     private void watch(Entry entry, String source, String name, long since) {
         int at = 0;
         while ((at < watches.size()) && (watches.get(at).entry != entry)) {
@@ -746,7 +746,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         watches.add(new Watch(entry, source, name, since));
     }
 
-    // In place of the book's earlier held waits, one from the held save for each claim the book shares.
+    // Replaces the book's held waits; one per shared claim.
     private void holdWaits(PendingClaims hold) {
         ClaimBook book = hold.book();
         int at = 0;
@@ -754,7 +754,7 @@ final class ShareOutbox implements Claims.SharedFrom {
             HeldWait wait = heldWaits.get(at);
             if (wait.source().equals(hold.source())) {
                 heldWaits.remove(at);
-                // A claim this book no longer shares is owed its line only if the load fails.
+                // Said only if the load fails.
                 if (!book.isShared(wait.id())) {
                     droppedWaits.add(wait);
                 }
@@ -762,7 +762,7 @@ final class ShareOutbox implements Claims.SharedFrom {
                 at++;
             }
         }
-        // A claim the save itself took out of sharing is owed the same line, once.
+        // Claims the save unshared; said once.
         for (Claim stopped : book.stoppedSharing()) {
             if (!waitsFor(droppedWaits, hold.source(), stopped.id())) {
                 droppedWaits.add(new HeldWait(hold.source(), stopped.id(), stopped.name(), hold.since()));
@@ -785,7 +785,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // Whether a held save's wait for this claim of that book still waits: not said, dropped or forgotten.
+    // Whether a held wait is still pending.
     private boolean stillHeld(String source, String id) {
         return waitsFor(heldWaits, source, id);
     }
@@ -799,7 +799,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return waiting;
     }
 
-    // Marks the wait for this revision of the entry answered; the first answer stands.
+    // Marks this revision's wait answered; first answer stands.
     private void answered(Entry entry, long revised, Claims.NodeAnswer answer) {
         for (int at = 0; at < watches.size(); at++) {
             Watch watch = watches.get(at);
@@ -809,7 +809,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // The next line a command awaits from the collector for this world's book, or null; the client thread.
+    // Client thread. Next awaited line, or null.
     Claims.Said answer(String world, long nowNanos) {
         Claims.Said said = null;
         synchronized (this) {
@@ -835,7 +835,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return said;
     }
 
-    // The no-answer line of a held save whose minute has run, or null; another world's wait is dropped.
+    // No-answer line of a held save, or null.
     private Claims.Said heldAnswer(String world, long nowNanos) {
         Claims.Said said = dueWait(heldWaits, Claims.NodeAnswer.NONE, world, nowNanos);
         if ((said == null) && unreadable) {
@@ -861,7 +861,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return said;
     }
 
-    // Drops every wait for an answer; nothing is said of them.
+    // Drops every answer wait; says nothing.
     synchronized void forgetAnswers() {
         watches.clear();
         heldWaits.clear();
@@ -869,7 +869,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         answerSession++;
     }
 
-    // The book a claim's entry was last saved from, or null when it has none.
+    // Book the claim was last saved from; null if none.
     @Override
     public Claims.SharedEntry entryOf(String claimId) {
         loadIfNeeded();
@@ -880,7 +880,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // What the entry's book did with its claim last: shared it, kept it unshared, or removed it.
+    // Last book action: shared, kept unshared, or removed.
     private static Claims.Kept kept(Entry entry) {
         Claims.Kept kept;
         if (!(entry.item instanceof SharedRecord.Removed)) {
@@ -893,7 +893,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return kept;
     }
 
-    // Whether the entries can be asked: the first load has ended, read or not.
+    // Whether entries can be asked; first load ended.
     @Override
     public boolean ready() {
         loadIfNeeded();
@@ -902,13 +902,13 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // Keeps the world's one-time claims port, in place of any held before, until the first load has ended.
+    // Holds the world's claims port until first load ends.
     @Override
     public synchronized void holdPort(Path book, Supplier<Claims.Said> port) {
         heldPort = new HeldPort(book.toString(), port);
     }
 
-    // The held port to run now in this world's book, or null; another world's held port is dropped.
+    // Held port for this world's book, or null.
     synchronized Supplier<Claims.Said> portDue(String world) {
         Supplier<Claims.Said> due = null;
         if ((heldPort != null) && loaded) {
@@ -920,12 +920,12 @@ final class ShareOutbox implements Claims.SharedFrom {
         return due;
     }
 
-    // Whether the entry's next post is a removal: one a scope is owed, or the entry's own.
+    // Whether the next post is a removal.
     private static boolean postsARemoval(Entry entry) {
         return (entry.withdrawFrom != null) || (entry.item instanceof SharedRecord.Removed);
     }
 
-    // A removal for the scope owed one, else the entry's record; null when the record refuses the entry.
+    // Owed removal, else entry's record; null if refused.
     private static SharedRecord nextPost(Entry entry) {
         SharedRecord post;
         if (entry.withdrawFrom == null) {
@@ -939,7 +939,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return post;
     }
 
-    // Marks the entry as posting and answers where the post goes. A live record to its server may then stay there.
+    // Marks the entry posting; returns the post's server.
     private static String beginPost(Entry entry) {
         entry.posting = true;
         String server;
@@ -954,7 +954,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return server;
     }
 
-    // Null when the record refuses the entry's id, owner, revision or item.
+    // Null when the record refuses the entry.
     private static SharedRecord recordFor(Entry entry) {
         SharedRecord record;
         if (recordable(entry)) {
@@ -965,7 +965,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return record;
     }
 
-    // The record's rules asked of an entry: its id, owner, revision and item.
+    // Whether the entry has id, owner, revision and item.
     private static boolean recordable(Entry entry) {
         return SharedRecord.isId(entry.id) && SharedRecord.isName(entry.owner)
                 && lowercaseOwnerMatches(entry.owner, entry.ownerId)
@@ -992,14 +992,14 @@ final class ShareOutbox implements Claims.SharedFrom {
         return matches;
     }
 
-    // A removal, or an area for a claim and a point for a marker.
+    // Removal; area for claim, point for marker.
     private static boolean itemOfKind(SharedRecord.Kind kind, SharedRecord.Item item) {
         return (item instanceof SharedRecord.Removed)
                 || ((kind == SharedRecord.Kind.CLAIM) && (item instanceof SharedRecord.Area))
                 || ((kind == SharedRecord.Kind.MARKER) && (item instanceof SharedRecord.Point));
     }
 
-    // Server: the entry's own when its record was chosen, or the server a withdrawal goes to; null: no header.
+    // Server for the header; null for no header.
     private void postOne(Poster poster, URI endpoint, Entry entry, SharedRecord record, String server,
                          boolean withdrawing) {
         ShareSender.Reply reply = null;
@@ -1029,11 +1029,11 @@ final class ShareOutbox implements Claims.SharedFrom {
         saveAsync();
     }
 
-    // Marks what the collector's answer means for the entry; true when the answer is to be logged.
+    // Marks the answer for the entry; true if logged.
     private boolean replied(Entry entry, SharedRecord record, ShareSender.Reply reply, long repliedMillis,
                             String scope, boolean withdrawing) {
         boolean warn = false;
-        // Only the revision this post carried may be marked sent or settled.
+        // Only the posted revision may be marked sent or settled.
         boolean current = entry.revised == record.revised();
         boolean held = landed(reply);
         if (held && (record.item() instanceof SharedRecord.Removed)) {
@@ -1078,12 +1078,12 @@ final class ShareOutbox implements Claims.SharedFrom {
         return warn;
     }
 
-    // Whether the collector holds the posted revision or a newer one: an answer of 204 or 409.
+    // True for an answer of 204 or 409.
     private static boolean landed(ShareSender.Reply reply) {
         return (reply != null) && ((reply.status() == RECORD_KEPT) || (reply.status() == OLDER_REVISION));
     }
 
-    // The collector holds a removal in this scope: no live revision of the entry stays there.
+    // Collector holds a removal for this scope.
     private static void removedAt(Entry entry, String scope) {
         if (scope.equals(entry.withdrawFrom)) {
             entry.withdrawFrom = null;
@@ -1093,7 +1093,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // The collector's refusal of the entry, or its answer of 404 or 507, in the log.
+    // Logs a refusal, or a 404 or 507 answer.
     private static void warnOf(Entry entry, int status) {
         if ((status == NO_SHARED_STORE) || (status == STORE_FULL)) {
             LOGGER.warn("The collector answered {} for the shared {} {}. It tries again later.",
@@ -1108,7 +1108,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return (status == NO_SHARED_STORE) ? Claims.NodeAnswer.NOT_SHARING : Claims.NodeAnswer.FULL;
     }
 
-    // Writes the entries now, on this thread, unless the file is unread.
+    // Writes entries on this thread unless file unread.
     void flush() {
         long seq;
         Map<String, Entry> snapshot = null;
@@ -1149,7 +1149,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         }
     }
 
-    // A copy of each entry, so the write reads no entry a beat changes.
+    // Copies each entry so the write reads stable data.
     private Map<String, Entry> copyOfEntries() {
         int size = entries.size();
         Map<String, Entry> snapshot = (size > DEFAULT_SNAPSHOT_ENTRIES) ? HashMap.newHashMap(size) : new HashMap<>();
@@ -1159,7 +1159,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return snapshot;
     }
 
-    // A write lands only while no newer write has; the file's lock decides it.
+    // Newest write wins; the file lock decides.
     private final class Newest implements AtomicFileReplace.Turn {
 
         private final long sequence;
@@ -1308,7 +1308,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return entry;
     }
 
-    // An older file has no such key: an entry with a player may have posted to its server.
+    // Older files lack this key; entry may have posted.
     private static boolean serverMayHold(JsonObject object, Entry entry) {
         boolean mayHold;
         if (entry.withdrawFrom != null) {
@@ -1388,7 +1388,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return (element != null && element.isJsonNull()) ? null : string(object, name);
     }
 
-    // The entry's server, null when an older file wrote none; one no batch could carry is refused.
+    // The entry's server; null in older files.
     private static String server(JsonObject object) {
         String server = (object.get("server") == null) ? null : nullableString(object, "server");
         if ((server != null) && !Batch.usableName(server)) {
@@ -1397,7 +1397,7 @@ final class ShareOutbox implements Claims.SharedFrom {
         return server;
     }
 
-    // The scope owed a removal, null when the file names none; "" names no server.
+    // Scope owed a removal; null if none; "" no server.
     private static String withdrawal(JsonObject object) {
         String scope = (object.get("withdrawFrom") == null) ? null : nullableString(object, "withdrawFrom");
         if ((scope != null) && !scope.isEmpty() && !Batch.usableName(scope)) {

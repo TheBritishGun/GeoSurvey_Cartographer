@@ -10,9 +10,9 @@ public interface GroundChunk {
 
     int captureVersion();
 
-    // 256 columns at localZ * 16 + localX; -32768 marks an unfilled column.
+    // 256 columns, localZ * 16 + localX. -32768 is unfilled.
     void copyHeights(short[] into);
 
-    // 256 columns at localZ * 16 + localX; each byte is LandCover.code().
+    // 256 columns, localZ * 16 + localX. Byte: LandCover.code().
     void copyCoverCodes(byte[] into);
 }

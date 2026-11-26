@@ -239,7 +239,7 @@ public final class CollectorGuess {
         return valid;
     }
 
-    // Four dot-separated octets, 0-255, no leading zeros.
+    // Four dot-separated octets, 0 to 255, no leading zeros.
     private static boolean ipv4Literal(String host) {
         int length = host.length();
         int octets = 0;

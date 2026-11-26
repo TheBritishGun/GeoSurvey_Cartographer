@@ -42,7 +42,7 @@ public final class CollectorSettings {
         }
     }
 
-    // While held, or arming a cleartext address, writes only a withdrawal.
+    // While held, or arming a cleartext address: withdrawals only.
     static boolean write(LandNavConfig config, Draft draft, CollectorAddressCheck check) {
         String typed = draft.collector().trim();
         String stored = config.shareCollector == null

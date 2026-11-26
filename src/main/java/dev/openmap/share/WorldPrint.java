@@ -462,7 +462,7 @@ public final class WorldPrint {
         return Fingerprints.digest(bits, x, z);
     }
 
-    // Null biomes when unused, else each column's key, newline joined, in bits' walk order.
+    // Biome keys by walk order, newline joined; null if unused.
     public static long digest(byte[] bits, String biomes, int x, int z) {
         return Fingerprints.digest(bits, biomes, x, z);
     }
@@ -476,7 +476,7 @@ public final class WorldPrint {
         return Fingerprints.signature(prints, minX, minZ);
     }
 
-    // minX and minZ are block coordinates; length counts prints, not bytes.
+    // minX, minZ are block coordinates; length counts prints.
     public static String signature(long[] prints, int length, int minX, int minZ) {
         return Fingerprints.signature(prints, length, minX, minZ);
     }

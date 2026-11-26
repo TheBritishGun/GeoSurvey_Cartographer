@@ -138,7 +138,7 @@ public final class LandNavConfig {
     // Staff tab-list markers, comma separated. Blank means none.
     public String shareStaffMarkers = "\u2605";
 
-    // Logs the vanish filter's decisions to disk, including vanished players' names.
+    // Logs vanish filter decisions, vanished names, to disk.
     public boolean shareVanishProbe = false;
 
     public java.util.List<String> approvedServers =
@@ -185,7 +185,7 @@ public final class LandNavConfig {
         private KnownServers() {
         }
 
-        // key: a lower-case host, plus ":port" if the port is not 25565, or null.
+        // Lower-case host, plus :port unless port is 25565. Or null.
         public static String nameOf(String key) {
             Group group = groupOf(key);
             return group == null ? "" : group.name();
@@ -363,7 +363,7 @@ public final class LandNavConfig {
     // Marks hostile mobs within radarRange on the dial.
     public boolean compassHostileMarks = false;
 
-    // Marks other players on the dial: neutral, or a friend colour.
+    // Marks other players on the dial: neutral or friend colour.
     public boolean compassPlayerMarks = false;
 
     public boolean locatorBarEnabled = true;
@@ -1193,7 +1193,7 @@ public final class LandNavConfig {
         return DIRECTORY_CREATIONS.get();
     }
 
-    // No lock: never save one config from two threads at once.
+    // No lock. Never save one config from two threads.
     public void save(Path path) throws IOException {
         normalise();
         save(path, stateVersion(), null);

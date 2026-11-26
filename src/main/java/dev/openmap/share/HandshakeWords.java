@@ -74,12 +74,12 @@ public final class HandshakeWords {
         return appendWalkTo(out, left, count);
     }
 
-    // The first line of the report that more than 1 region is left: the ground that was accepted.
+    // First line: accepted ground, when over 1 region is left.
     public static String acceptedAt(String region) {
         return ACCEPTED_PREFIX + region + ".";
     }
 
-    // The second line: how many regions are left and the way to them.
+    // Second line: regions left and the way to them.
     public static String leftToWalk(List<WorldPrint.Region> left) {
         int count = left.size();
         if (count == 0) {

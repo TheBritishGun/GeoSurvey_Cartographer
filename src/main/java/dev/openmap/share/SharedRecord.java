@@ -67,7 +67,7 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
     public sealed interface Item permits Removed, Area, Point {
     }
 
-    // Which rules an item's fields were checked against: a new record's, or those of the build that stored it.
+    // Rules that checked an item's fields: new or stored.
     private enum Road {
         LIVE,
         STORED
@@ -184,7 +184,7 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
             }
             this.label = label;
             this.world = world;
-            // The stored road keeps the arrays it is given; the live road copies them.
+            // Stored road keeps arrays; live road copies them.
             if (road == Road.STORED) {
                 this.xs = xs;
                 this.zs = zs;
@@ -317,7 +317,7 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
         return SERVER_HEADER;
     }
 
-    // The server's UTF-8 bytes, percent-encoded as RFC 3986 does, in upper case.
+    // UTF-8 bytes, percent-encoded per RFC 3986, upper case.
     public static String serverHeaderValue(String server) {
         byte[] bytes = server.getBytes(StandardCharsets.UTF_8);
         StringBuilder encoded = new StringBuilder(bytes.length * ENCODED_BYTE_CHARS);
@@ -338,7 +338,7 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
                 || (value == '~');
     }
 
-    // The item a stored document names, as the rules of the build that wrote it allow.
+    // Item a stored document names.
     public static Item itemFromStored(Kind kind, JsonObject fields) throws IOException {
         String label = storedLabel(text(fields, "label"));
         Item item;
@@ -351,7 +351,7 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
         return item;
     }
 
-    // Corner arrays of a size the area refuses are read in full but not kept.
+    // Refused-size corner arrays are read, not kept.
     private static Item storedArea(String label, JsonObject fields) throws IOException {
         String world = text(fields, "world");
         JsonElement xsElement = fields.get("xs");
@@ -412,7 +412,7 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
         return array;
     }
 
-    // The array's integers; where keep is false each is read and none is kept.
+    // Integers of the array; keep false: read, not kept.
     private static int[] ints(JsonElement element, String name, boolean keep) throws IOException {
         if (!(element instanceof JsonArray array)) {
             throw new IOException(name + " is not an array");
@@ -539,12 +539,12 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
                 && labelFor(label).equals(label);
     }
 
-    // The label a record carries for a name: cleaned, and bounded to MAX_LABEL.
+    // Cleaned label for a name, bounded to MAX_LABEL.
     public static String labelFor(String name) {
         return LabelText.clean(name, MAX_LABEL, LabelText.UNBOUNDED_READ, false);
     }
 
-    // A stored label reads back cleaned as today's rules clean it, which may leave nothing of it.
+    // Cleans a stored label; may return empty.
     private static String storedLabel(String label) {
         checkStoredLabel(label);
         return labelFor(label);
@@ -576,7 +576,7 @@ public record SharedRecord(Kind kind, String id, String ownerId, String owner, l
         }
     }
 
-    // An older build's colour alphabet: upper-case letters and underscore, which holds every name.
+    // Colour alphabet: upper-case letters and underscore.
     private static boolean storedColourCharacters(String colour) {
         boolean allowed = true;
         for (int at = 0; allowed && (at < colour.length()); at++) {

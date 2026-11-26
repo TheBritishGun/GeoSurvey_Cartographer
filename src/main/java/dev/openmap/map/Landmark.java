@@ -29,7 +29,7 @@ public final class Landmark {
     // Null when the marker is not shared.
     private String shared;
 
-    // For JsonBind.
+    // Read by JsonBind.
     @SuppressWarnings("unused")
     public Landmark() {
         this(null, 0, 0, 0, null, null);
