@@ -244,7 +244,7 @@ public record SignedBatch(Attestation.Credential credential, byte[] signature,
         return held == null ? null : held.attestedProof(at);
     }
 
-    // A proof, with a window in hours, not minutes.
+    // Proof with a window in hours.
     private WorldProof attestedProof(long at) throws IOException {
         WorldProof inside = WorldProof.decode(batch);
         if (!matches(credential.player(), inside.by())) {

@@ -134,7 +134,7 @@ final class GroundWalk {
     // Null until the node is asked.
     private volatile List<WorldPrint.Region> asked;
 
-    // Null until the node answers; empty when nothing is left.
+    // Null until answered; empty when none left.
     private volatile List<String> remaining;
 
     private record Owed(List<WorldPrint.Region> asked, List<String> remaining,
@@ -151,7 +151,7 @@ final class GroundWalk {
 
     private volatile String trouble;
 
-    // Refused row names; a row with no readable name is "".
+    // Refused row names; an unreadable name is empty.
     private volatile List<String> refusedRows = List.of();
 
     private volatile boolean reasked;
@@ -262,7 +262,7 @@ final class GroundWalk {
         return notices.poll();
     }
 
-    // Narrows the race around a network call; cannot close it.
+    // Narrows the network race; cannot close it.
     private boolean stillWalking(URI atCollector, String atServer,
                                  java.util.function.Supplier<URI> liveCollector) {
         URI live = liveCollector == null ? null : liveCollector.get();
@@ -341,7 +341,7 @@ final class GroundWalk {
         return ask(transport, atCollector, forServer, liveCollector, null);
     }
 
-    // Ground pool's worker; a null identity skips the standing ask.
+    // Ground pool's worker. Null identity skips the standing ask.
     boolean ask(ShareSender.Transport transport, URI atCollector, String forServer,
                 java.util.function.Supplier<URI> liveCollector, ShareSender.Identity identity) {
         if (atCollector == null || forServer == null || forServer.isBlank()) {
@@ -525,7 +525,7 @@ final class GroundWalk {
         return outcome;
     }
 
-    // Caller holds walkLock; left is null unless said is LISTED.
+    // Caller holds walkLock. left null unless LISTED.
     private void fileStanding(Outcome said, List<String> left) {
         switch (said) {
             case LISTED -> {
@@ -715,7 +715,7 @@ final class GroundWalk {
         return saying;
     }
 
-    // A name from a collector stays on its line; only this class puts a line break in a line.
+    // Removes line breaks; only this class adds them.
     private static String flat(String text) {
         return text.replace('\n', ' ').replace('\r', ' ');
     }
@@ -725,7 +725,7 @@ final class GroundWalk {
         return refusedStillListed(list, left, refused) ? REFUSED_ROW : null;
     }
 
-    // The line for listed ground with no rectangle to walk.
+    // Line for listed ground with no rectangle.
     private static String unwalkable(List<WorldPrint.Region> list, List<String> left,
                                      List<String> refused) {
         return refusedStillListed(list, left, refused) ? REFUSED_ROW : NOT_TOLD;

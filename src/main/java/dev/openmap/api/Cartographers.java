@@ -10,7 +10,7 @@ public final class Cartographers {
     private Cartographers() {
     }
 
-    // Client thread. Null before the collector starts and after it stops.
+    // Client thread. Null when the collector is not running.
     public static Cartographer running() {
         return RUNNING.get();
     }

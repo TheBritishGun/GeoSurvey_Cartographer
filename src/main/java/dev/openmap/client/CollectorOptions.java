@@ -228,7 +228,7 @@ public final class CollectorOptions implements SettingsContributor {
                 defaults.shareEnabled,
                 editing.enabled,
                 on -> editing.enabled = on,
-                // Greyed only where it would arm.
+                // Grayed only where it would arm.
                 () -> editing.enabled || (!editing.isCleartext()
                         && !editing.check.awaitsAnswer(editing.live.shareCollector, editing.trimmed)),
                 on -> editing.turned(on),

@@ -23,7 +23,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-// The ground part of the published cartographer: it pushes captured ground and takes imported regions.
+// Ground part of the cartographer; pushes ground, takes imports.
 final class CollectorCartographerGround implements CartographerGround {
 
     private static final org.slf4j.Logger LOGGER =
@@ -76,7 +76,7 @@ final class CollectorCartographerGround implements CartographerGround {
 
     private static final String BUSY = "The collector is busy with other imports. Nothing was written.";
 
-    // One region of an import, between the caller's thread and the client thread.
+    // One imported region, handed from caller to client thread.
     private static final class Import {
 
         private static final int WAITING = 0;
@@ -105,10 +105,10 @@ final class CollectorCartographerGround implements CartographerGround {
 
         private final CountDownLatch ready = new CountDownLatch(1);
 
-        // Set by the client thread before ready opens; null when no region was prepared.
+        // Set on client thread before ready; null if no region.
         private volatile MapStorage.RegionImport region;
 
-        // Set by the client thread before ready opens; null when the region was prepared.
+        // Set on client thread before ready; null if region prepared.
         private volatile String failure;
 
         private Import(String storedKey, String dimensionId, int regionX, int regionZ, Path world) {
@@ -120,7 +120,7 @@ final class CollectorCartographerGround implements CartographerGround {
         }
     }
 
-    // The batch as the caller's thread copied it; slots is null when the copy failed.
+    // Batch copied on caller thread; slots null if copy failed.
     private record Copy(ChunkSample[] slots, int chunks, String failure) {
     }
 
@@ -141,7 +141,7 @@ final class CollectorCartographerGround implements CartographerGround {
     // Client thread; replaced on each change, never changed in place.
     private GroundListener[] listeners = NO_LISTENERS;
 
-    // Client thread; a stored dimension key to its resource id text.
+    // Client thread; stored dimension key to resource id text.
     private final Map<String, String> dimensionIds = new HashMap<>();
 
     // Client thread.
@@ -200,7 +200,7 @@ final class CollectorCartographerGround implements CartographerGround {
         }
     }
 
-    // Client thread; a region save landed in the world whose folder is root.
+    // Client thread; root is the world folder.
     void saved(Path root, String storedKey, int regionX, int regionZ) {
         if (listeners.length == 0 || root == null || !root.equals(world.worldFolder())) {
             return;
@@ -208,7 +208,7 @@ final class CollectorCartographerGround implements CartographerGround {
         regionWritten(dimensionIdOf(storedKey), regionX, regionZ);
     }
 
-    // Client thread; the import job's handle, or null to stop taking imports.
+    // Client thread; import job handle, or null to stop.
     void drainWith(Handle handle) {
         clientThread = Thread.currentThread();
         if (handle != null) {
@@ -274,7 +274,7 @@ final class CollectorCartographerGround implements CartographerGround {
         return failure == null ? new Copy(slots, filled(slots), null) : new Copy(null, 0, failure);
     }
 
-    // The chunks the slots hold: 1 for each chunk, however many entries the batch gave it.
+    // Chunks held by slots; one per chunk, however many entries.
     private static int filled(ChunkSample[] slots) {
         int chunks = 0;
         for (ChunkSample slot : slots) {
@@ -285,7 +285,7 @@ final class CollectorCartographerGround implements CartographerGround {
         return chunks;
     }
 
-    // Keeps the better of 2 entries for one chunk; null when the chunk was taken.
+    // Keeps the better entry; null if the chunk was taken.
     private static String copyInto(ChunkSample[] slots, GroundChunk chunk, int regionX, int regionZ,
             short[] heights, byte[] cover) {
         if (chunk == null) {
@@ -329,7 +329,7 @@ final class CollectorCartographerGround implements CartographerGround {
         return failure == null ? written(job, copy, budget - (System.nanoTime() - started)) : refused(failure);
     }
 
-    // The caller's thread; the write runs on the writer's thread, and the caller waits for it at most leftNanos.
+    // Caller thread waits at most leftNanos; writer thread writes.
     private ImportResult written(Import job, Copy copy, long leftNanos) {
         CollectorImportWrite.Write write =
                 new CollectorImportWrite.Write(job.region, copy.slots(), () -> writtenOnDisk(job));
@@ -340,7 +340,7 @@ final class CollectorCartographerGround implements CartographerGround {
         };
     }
 
-    // The caller's thread; a write still running when the wait ends can land later.
+    // Caller thread; a late write may still land.
     private static ImportResult answered(CollectorImportWrite.Write write, Copy copy, long leftNanos) {
         boolean ended;
         boolean interrupted = false;
@@ -364,7 +364,7 @@ final class CollectorCartographerGround implements CartographerGround {
         return result;
     }
 
-    // The writer's thread; the client thread folds the written region in its next step.
+    // Writer thread; client thread folds in the region next.
     private void writtenOnDisk(Import job) {
         job.state.set(Import.LANDED);
         if (!offer(job)) {
@@ -376,7 +376,7 @@ final class CollectorCartographerGround implements CartographerGround {
         return new ImportResult(0, 0, failure);
     }
 
-    // Any thread; false while the collector's import job is not registered.
+    // Any thread; false if import job is not registered.
     private boolean offer(Import job) {
         Handle held = drain;
         if (held == null) {
@@ -387,7 +387,7 @@ final class CollectorCartographerGround implements CartographerGround {
         return true;
     }
 
-    // The caller's thread; null once the client thread has prepared the region.
+    // Caller thread; null once client thread prepares region.
     private static String awaitPrepared(Import job, long timeoutNanos) {
         boolean ready;
         boolean interrupted = false;

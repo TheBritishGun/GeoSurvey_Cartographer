@@ -28,8 +28,8 @@ import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import net.minecraft.world.level.GameType;
 
-// Tick thread: observe(), armed(). Writer thread: drain(), which owns written,
-// faults, faultSaidAt, renderBuffer; due, owed, out, closing, stopped are shared.
+// Tick: observe, armed. Writer: drain; owns written, faults, faultSaidAt, renderBuffer.
+// Shared: due, owed, out, closing, stopped.
 class VanishProbe implements AutoCloseable {
 
     private static final org.slf4j.Logger LOGGER =

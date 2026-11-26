@@ -91,7 +91,7 @@ public final class LandmarkStore {
         revision = REVISIONS.incrementAndGet();
     }
 
-    // Puts back a list and a revision this store held before; each marker keeps its fields.
+    // Restores a list and revision; markers keep their fields.
     public void restore(List<Landmark> held, long heldRevision) {
         List<Landmark> kept = new ArrayList<>(held);
         landmarks.clear();
@@ -105,7 +105,7 @@ public final class LandmarkStore {
         revision = heldRevision;
     }
 
-    // Returns the normalised name.
+    // Returns the normalized name.
     public String rename(Landmark landmark, String newName) {
         nameIndexRemove(landmark);
         landmark.setName(newName);
@@ -114,7 +114,7 @@ public final class LandmarkStore {
         return landmark.name();
     }
 
-    // Zero-alpha colours become opaque.
+    // Zero-alpha colors become opaque.
     public void setColour(Landmark landmark, int argb) {
         landmark.setColour(argb);
         revision = REVISIONS.incrementAndGet();

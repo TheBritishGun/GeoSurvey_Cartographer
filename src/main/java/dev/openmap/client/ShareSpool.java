@@ -185,7 +185,7 @@ final class ShareSpool implements AutoCloseable {
 
     private final Map<Path, Integer> attempts = new HashMap<>();
 
-    // Segments given up on, with their try counts; guarded by this.
+    // Given-up segments and their try counts. Guarded by this.
     private final Map<Path, Integer> spent = new HashMap<>();
 
     // Segments a take() is reading; guarded by this.
@@ -1726,7 +1726,7 @@ final class ShareSpool implements AutoCloseable {
         }
     }
 
-    // Resets the byte count for the next segment; does not end the deflater.
+    // Resets the byte count. Deflater keeps running.
     private void stopMeasuring() {
         if (sizing != null) {
             sizing.beginSegment(GZIP_HEADER_BYTES);
@@ -2051,7 +2051,7 @@ final class ShareSpool implements AutoCloseable {
         private Loaded outcomeLoaded;
     }
 
-    // Null when no segment waits; the file stays until done() or failed().
+    // Null when no segment waits. Stays until done() or failed().
     Loaded take() throws IOException {
 
         DecodeScratch scratch = spareOrNewScratch();
@@ -2909,7 +2909,7 @@ final class ShareSpool implements AutoCloseable {
         }
     }
 
-    // Ends the Deflater, after the current writer if another thread holds the write turn.
+    // Ends the Deflater after any current writer finishes.
     synchronized void endForGood() {
         Thread turn = writeTurn;
         if (turn == null || turn == Thread.currentThread()) {

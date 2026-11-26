@@ -472,7 +472,7 @@ public final class ShareSender {
         }
     }
 
-    // Who the game says is online, filtered. Null means not connected.
+    // Online players per the game, filtered. Null: not connected.
     interface Sight {
 
         List<RosterReport.Entry> listed();
@@ -480,7 +480,7 @@ public final class ShareSender {
         // The client's tab entry looks vanished.
         boolean hidden();
 
-        // The client is in a world, with a connection and a player.
+        // In a world, with a connection and a player.
         default boolean inWorld() {
             return true;
         }
@@ -852,7 +852,7 @@ public final class ShareSender {
                 && Character.isLetterOrDigit(folded.charAt(at));
     }
 
-    // One unfiltered tab-list player; shown is null until named, nearby is null unless loaded.
+    // Player; shown null until named, nearby null unless loaded.
     static final class Seen {
 
         private UUID id;
@@ -930,7 +930,7 @@ public final class ShareSender {
         }
     }
 
-    // The client's tab entry for the probe; connected false means nothing else was read.
+    // Probe's tab entry; connected false: nothing else was read.
     record Self(UUID id, String name, String shown, String nearby,
                 boolean connected, boolean found, boolean listed, GameType gameMode) {
 
@@ -1293,7 +1293,7 @@ public final class ShareSender {
         return profile == null ? null : profile.id();
     }
 
-    // Returns online when it fits, else a new list in account order; counts the cut accounts.
+    // Online list if it fits, else account-ordered new list.
     <T> List<T> withinRosterCap(List<T> online, Function<T, UUID> account) {
         return withinRosterCap(online, account, each -> true);
     }
@@ -1564,7 +1564,7 @@ public final class ShareSender {
     // Tick thread only.
     private boolean proofLineOwed;
 
-    // Set on the share thread, taken on the tick thread; null when no refusal waits.
+    // Share thread sets, tick thread takes; null if none waits.
     private final AtomicReference<URI> enrolDeniedAt = new AtomicReference<>();
 
     private Handle enrolJob;
@@ -1634,7 +1634,7 @@ public final class ShareSender {
 
     private int scribeIdlePasses;
 
-    // Null before the first scan or with no world; only standing writes it.
+    // Null before first scan or without world; standing writes it.
     private volatile Scan scan;
 
     private final Scan scanFirst = new Scan(RosterReport.MAX_PLAYERS, false);
@@ -1649,13 +1649,13 @@ public final class ShareSender {
 
     private volatile boolean selfHidden;
 
-    // Set by each vanish sample, after selfHidden; cleared out of a world.
+    // Set by each vanish sample after selfHidden; cleared outside world.
     private volatile boolean selfSampled = false;
 
     // Written only by standing.
     private volatile boolean selfStarred;
 
-    // Material behind selfHidden, for the probe; null when not sampled.
+    // Probe data behind selfHidden; null when not sampled.
     private volatile Self selfRead;
 
     private URI beatingAt;
@@ -1690,7 +1690,7 @@ public final class ShareSender {
     // No early roster before this System.nanoTime(). Share thread only.
     private long rosterUrgentDueAt;
 
-    // Checksum and player count of the last roster taken; count is -1 if none.
+    // Last roster checksum and player count; -1 if none.
     private long rosterPostedKey;
 
     private int rosterPostedCount = -1;
@@ -1792,7 +1792,7 @@ public final class ShareSender {
         }
     }
 
-    // Tick thread only; the one sample of whether this client is vanished.
+    // Tick thread only; samples if this client is vanished.
     private void sampleHidden() {
         boolean hidden = sight.hidden();
         if (hidden != selfHidden) {
@@ -1811,12 +1811,12 @@ public final class ShareSender {
         }
     }
 
-    // Any thread; true while this client is vanished, and before the first vanish sample in a world.
+    // Any thread; true while vanished or before first sample.
     boolean vanished() {
         return !selfSampled || selfHidden;
     }
 
-    // Any thread; the live sender's answer, and true when no sender exists.
+    // Any thread; live sender's answer, or true if none.
     static boolean liveVanished() {
         ShareSender sender = live;
         return sender == null || sender.vanished();
@@ -1910,12 +1910,12 @@ public final class ShareSender {
 
     private volatile boolean withheldByBuild;
 
-    // Share thread writes; enrol worker and client thread read.
+    // Share thread writes; enroll worker and client thread read.
     private volatile String enrolledAt = "";
 
     private String enrolmentShut = "";
 
-    // Enrol worker thread only.
+    // Enroll worker thread only.
     private String enrolKey = "";
 
     private URI enrolKeyFrom;
@@ -1936,7 +1936,7 @@ public final class ShareSender {
     // Share thread only.
     private final BackoffKey backoffArmedOn = new BackoffKey();
 
-    // Restart count at the last enrolment and ground ask. Share thread only.
+    // Share thread only; restart count at last enrollment.
     private long enrolAskedUnder = 0L;
 
     private long groundAskedUnder = 0L;
@@ -1956,7 +1956,7 @@ public final class ShareSender {
         private BackoffKey() {
         }
 
-        // True when an input moved; keeps the new inputs and counts a restart.
+        // True when an input moved; keeps the new inputs.
         private boolean moved(URI atCollector, String onServer, long atRolls,
                               Attestation.Credential withKey) {
             boolean moved = !Objects.equals(collector, atCollector)
@@ -2160,7 +2160,7 @@ public final class ShareSender {
         this(transport, keys, spoolRoot, sight, UtcClock.collector(), false);
     }
 
-    // sight is null for the running client's own tab list; the share thread measures utc.
+    // Null sight is own tab list; share thread measures utc.
     ShareSender(Transport transport, Keys keys, Path spoolRoot, Sight sight, UtcClock utc) {
         this(transport, keys, spoolRoot, sight, utc, true);
     }
@@ -2209,7 +2209,7 @@ public final class ShareSender {
 
         probe = VanishProbe.armed(config.shareVanishProbe, probe);
 
-        // With no server, sync takes the vanish sample; out of a world, no sample is current.
+        // No server: sync takes vanish sample; outside a world, none.
         if (server == null) {
             if (sight.inWorld()) {
                 sampleHidden();
@@ -2567,7 +2567,7 @@ public final class ShareSender {
         return endpointAt(baseOf(configured), path);
     }
 
-    // Null when the address normalises to nothing.
+    // Null when the address normalizes to nothing.
     static String baseOf(String configured) {
         String base = Directory.withScheme(configured.trim());
 
@@ -2584,7 +2584,7 @@ public final class ShareSender {
         return base.isEmpty() ? null : base;
     }
 
-    // Null if base is null or base plus path is unusable.
+    // Null if base or base plus path is unusable.
     private static URI endpointAt(String base, String path) {
         if (base == null) {
             return null;
@@ -3915,7 +3915,7 @@ public final class ShareSender {
         return line != null ? line : walk.notice();
     }
 
-    // Tick thread only; null unless a refusal of this computer's own key waits for the current collector.
+    // Tick thread only; null unless own key refusal waits.
     private String enrolDeniedLine() {
         if (enrolDeniedAt.get() == null) {
             return null;
@@ -5258,7 +5258,7 @@ public final class ShareSender {
         return new HttpTransport();
     }
 
-    // The outbox's poster, over a transport of its own; closing it closes the transport.
+    // Outbox poster with its own transport; close closes it.
     static ShareOutbox.Poster outboxPoster() {
         return new OutboxPoster(new HttpTransport());
     }
@@ -5376,7 +5376,7 @@ public final class ShareSender {
             return replyTo(response);
         }
 
-        // server is null, or the name of the server whose world the record is from.
+        // Null, or the server the record's world is from.
         Reply postNamed(URI endpoint, byte[] body, String server) throws IOException {
             if (server == null) {
                 return post(endpoint, body);

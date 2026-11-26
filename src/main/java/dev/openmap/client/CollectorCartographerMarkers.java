@@ -16,10 +16,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-// The markers part of the published cartographer, on the collector's own marker store and its save road.
+// Markers part of the cartographer; uses the marker store.
 final class CollectorCartographerMarkers implements CartographerMarkers {
 
-    // The revision of a dimension whose markers are not loaded; a loaded store's revision is above it.
+    // Revision of unloaded markers; below any loaded revision.
     private static final long NOT_LOADED = 0L;
 
     private static final int MAX_KEYS = 16;
@@ -38,7 +38,7 @@ final class CollectorCartographerMarkers implements CartographerMarkers {
 
     private final CollectorCartographerWorld world;
 
-    // Client thread; a resource id text to its stored dimension key.
+    // Client thread; resource id text to stored dimension key.
     private final Map<String, String> keys = new HashMap<>();
 
     CollectorCartographerMarkers(MapStorage storage, CollectorCartographerWorld world) {
@@ -142,7 +142,7 @@ final class CollectorCartographerMarkers implements CartographerMarkers {
         return refusal;
     }
 
-    // Null when the save was handed to the collector's own write road.
+    // Null when collector's write path took the save.
     private String saved(String key) {
         String failure = null;
         try {
@@ -160,7 +160,7 @@ final class CollectorCartographerMarkers implements CartographerMarkers {
                 mark.icon().name(), mark.shared());
     }
 
-    // Null for a name that is no affiliation, and for no name.
+    // Null for a non-affiliation name, or for no name.
     private static Affiliation affiliationOf(String name) {
         Affiliation found = null;
         for (int at = 0; found == null && name != null && at < AFFILIATIONS.length; at++) {
@@ -171,7 +171,7 @@ final class CollectorCartographerMarkers implements CartographerMarkers {
         return found;
     }
 
-    // Null for a name that is no symbol, and for no name.
+    // Null for a non-symbol name, or for no name.
     private static SymbolIcon iconOf(String name) {
         SymbolIcon found = null;
         for (int at = 0; found == null && name != null && at < ICONS.length; at++) {

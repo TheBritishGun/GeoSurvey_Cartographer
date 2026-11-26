@@ -409,7 +409,7 @@ public final class CollectorFinder {
         return Directory.seeds(candidates);
     }
 
-    // results has 1 entry per readable card; server and spawnNote are never null.
+    // One result per readable card. Server and spawnNote never null.
     record CardScan(List<MapCard.Read> reads, List<CardCheck.Result> results,
             String server, String spawnNote, int entries) {
 

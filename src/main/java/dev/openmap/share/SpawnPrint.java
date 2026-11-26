@@ -407,7 +407,7 @@ public final class SpawnPrint {
         return Math.max(Short.MIN_VALUE + 1, Math.min(Short.MAX_VALUE, base));
     }
 
-    // Big endian: 2 base bytes, 64 height nibbles (even cell high), 64 five-bit covers, MSB first.
+    // Big endian: 2 base bytes, 64 nibbles, 64 five-bit covers.
     public byte[] toBytes() {
         byte[] out = new byte[BYTES];
         writeTo(out, 0);

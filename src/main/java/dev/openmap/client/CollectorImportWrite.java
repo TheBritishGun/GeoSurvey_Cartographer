@@ -10,7 +10,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
-// Writes each imported region on a thread of its own; the importing thread waits for it with a bound.
+// Regions are written on one writer thread; importer waits, bounded.
 final class CollectorImportWrite {
 
     private static final int WRITER_THREADS = 1;
@@ -27,7 +27,7 @@ final class CollectorImportWrite {
         FULL
     }
 
-    // One region's write; afterWrite runs on the writer's thread once the file holds the import.
+    // One region's write. afterWrite runs on the writer's thread.
     static final class Write implements Runnable {
 
         private static final int NOT_WRITTEN = -1;
@@ -81,7 +81,7 @@ final class CollectorImportWrite {
             return failed;
         }
 
-        // The client thread hears of a landed write before the importing thread does.
+        // Tells the client thread first.
         private void tell() {
             try {
                 if (landed()) {
@@ -95,7 +95,7 @@ final class CollectorImportWrite {
 
     private final Object lock = new Object();
 
-    // Guarded by lock; null until a write needs it, and after stop.
+    // Guarded by lock; null until needed and after stop.
     private ThreadPoolExecutor writer = null;
 
     // Guarded by lock.
@@ -113,7 +113,7 @@ final class CollectorImportWrite {
         return held == null ? Taken.CLOSED : executed(held, write);
     }
 
-    // Client thread; takes no more writes, and lets a write already taken land.
+    // Client thread. Takes no new writes; taken writes land.
     void stop() {
         ThreadPoolExecutor held;
         synchronized (lock) {

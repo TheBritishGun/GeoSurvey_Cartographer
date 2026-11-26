@@ -88,7 +88,6 @@ public final class ChunkSample implements GroundChunk {
         } else if (was != NO_HEIGHT && now == NO_HEIGHT) {
             unfilled++;
         } else {
-            // Unchanged fill state.
         }
         heights[i] = now;
         cover[i] = (byte) landCover.code();
@@ -109,7 +108,7 @@ public final class ChunkSample implements GroundChunk {
         unfilled = missing;
     }
 
-    // Writes COLUMNS big-endian heights, then cover ordinals, from offset at.
+    // Writes COLUMNS big-endian heights then cover ordinals from at.
     void copyColumnsInto(byte[] into, int at) {
         int coverBase = at + COLUMNS * Short.BYTES;
         for (int i = 0; i < COLUMNS; i++) {
@@ -175,13 +174,13 @@ public final class ChunkSample implements GroundChunk {
         return holds;
     }
 
-    // Epoch milliseconds UTC from WALL_CLOCK_VERSION; game ticks below it; 0 or an import's mtime otherwise.
+    // Epoch ms UTC; game ticks below WALL_CLOCK_VERSION; 0 or mtime.
     @Override
     public long capturedAt() {
         return capturedAt;
     }
 
-    // False before WALL_CLOCK_VERSION: rank those as unknown age, never convert.
+    // False before WALL_CLOCK_VERSION; age unknown, never converted.
     public boolean hasWallClockCapture() {
         return isWallClock(captureVersion);
     }

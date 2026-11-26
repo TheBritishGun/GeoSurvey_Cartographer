@@ -429,7 +429,7 @@ public final class JsonBind {
         for (int at = 0; at < fields.length; at++) {
             Field field = fields[at];
             JsonElement member = members.get(field.getName());
-            // Absent leaves the field's initialiser; present-and-null overwrites it.
+            // Absent keeps the initializer; present null overwrites it.
             if (member != null) {
                 Store store = found.stores[at];
                 if (store != Store.REFLECTIVE) {
@@ -502,7 +502,7 @@ public final class JsonBind {
     }
 
 
-    // 3.0 reads as 3 and "7" as 7; 3.5 and values outside int range are refused.
+    // Reads 3.0 and "7" as ints; refuses 3.5 and out-of-range.
     private static int toInt(JsonElement value) {
         long asLong = toLong(value);
         if (asLong < Integer.MIN_VALUE || asLong > Integer.MAX_VALUE) {
@@ -1031,7 +1031,7 @@ public final class JsonBind {
         }
     }
 
-    // Binder(Spec) binds one value;
+    // Binder(Spec) binds one value.
     // Binder(Spec, null) collects a JSON array into a list.
     // Binder(Spec, each) hands each array element to each.
     private static final class Binder implements JsonParser.Sink {

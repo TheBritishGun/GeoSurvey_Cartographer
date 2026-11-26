@@ -139,13 +139,13 @@ public final class Claims {
     public record Said(boolean ok, String text) {
     }
 
-    // Whether a save sent a shared claim to the collector; its answer is said later.
+    // Whether a save sent a shared claim to the collector.
     public enum Sent { NOTHING, TO_NODE, NOT_TOLD, HELD }
 
-    // What the collector answered for a claim a command sent; NONE is no answer in time.
+    // Collector's answer; NONE means no answer in time.
     public enum NodeAnswer { SAVED, REFUSED, NONE, NOT_SHARING, FULL, NOT_TOLD_TO_DROP }
 
-    // Whether a claim can be a shared record, and if not, what of it the record refuses.
+    // Whether a claim is shareable, and what the record refuses.
     public enum Shareable {
         YES(""),
         OWNER_NAME("its owner name is not 1 to " + SharedRecord.MAX_NAME + " letters, digits or _"),
@@ -162,17 +162,17 @@ public final class Claims {
         }
     }
 
-    // Told the file a book was saved to, and the book; answers what the save sent.
+    // Receives the saved file and book; returns what was sent.
     @FunctionalInterface
     public interface BookSaved {
 
         Sent saved(Path file, ClaimBook book);
     }
 
-    // What the book that last saved an entry did with its claim.
+    // What the last saving book did with its claim.
     public enum Kept { SHARED, UNSHARED, REMOVED }
 
-    // The book a shared claim's entry was last saved from, and what that book did with the claim.
+    // Book the entry was last saved from, and its action.
     public record SharedEntry(String book, Kept kept) {
     }
 
@@ -188,7 +188,7 @@ public final class Claims {
             return true;
         }
 
-        // Keeps a world's one-time port, to run once the entries are ready; asked only while they are not.
+        // Holds a world's one-time port until entries are ready.
         default void holdPort(Path book, Supplier<Said> port) {
         }
     }
@@ -1456,17 +1456,17 @@ public final class Claims {
         return note.isEmpty() ? "" : LINE_BREAK + note;
     }
 
-    // A name read from a file stays on its own line.
+    // A file's name stays on its own line.
     private static String flat(String name) {
         return name.replace('\n', ' ').replace('\r', ' ');
     }
 
-    // The name of the claim at the row, on one line.
+    // Name of the claim at the row, on one line.
     private static String nameAt(ClaimBook book, int row) {
         return flat(book.at(row).name());
     }
 
-    // The name the book stores for a typed name, on one line.
+    // Stored name for a typed name, on one line.
     private static String storedName(String typed) {
         return flat(Claim.cleaned(typed).trim());
     }
@@ -1711,7 +1711,7 @@ public final class Claims {
             return home;
         }
 
-        // A claim whose book is gone goes where its maps say; a removed claim stays out.
+        // Mapped home if book is gone; removed claims stay out.
         private static Home goneBookHome(Home mapped, Kept kept) {
             Home home;
             if (kept != Kept.REMOVED) {
@@ -2054,7 +2054,7 @@ public final class Claims {
         return write(book, path, now, said, false);
     }
 
-    // dropped: the save took a shared claim out of the book or out of sharing.
+    // Dropped: save removed a shared claim from book or sharing.
     private Said write(ClaimBook book, Path path, long now, String said, boolean dropped) {
         Said failed;
         try {
@@ -2104,7 +2104,7 @@ public final class Claims {
         return end;
     }
 
-    // A sentence for each shared claim in the book that the collector cannot take, and why.
+    // Sentence per shared claim the collector cannot take, with reason.
     private static String unsendable(ClaimBook book) {
         StringBuilder said = null;
         for (Claim claim : book.claims()) {
@@ -2131,7 +2131,7 @@ public final class Claims {
         return shared;
     }
 
-    // The line for what the collector answered about the claim of that name.
+    // Line for the collector's answer about a named claim.
     public static Said nodeAnswer(NodeAnswer answer, String name) {
         String shown = flat(name);
         return switch (answer) {
@@ -2146,7 +2146,7 @@ public final class Claims {
         };
     }
 
-    // The record's rules asked of this claim, its owner name and corners first.
+    // Record rules for a claim, owner name and corners first.
     public static Shareable shareable(Claim claim) {
         Shareable fit;
         if (!SharedRecord.isName(claim.owner())) {
@@ -2175,7 +2175,7 @@ public final class Claims {
         return whole;
     }
 
-    // Whether a claim's entry leaves it shared; entry may be null: it has none.
+    // Whether entry keeps the claim shared; entry may be null.
     private static boolean stillShared(SharedEntry entry) {
         return (entry == null) || (entry.kept() == Kept.SHARED);
     }

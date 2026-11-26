@@ -120,7 +120,7 @@ public final class ClaimBook {
         return found;
     }
 
-    // The first claim, other than the one at except, whose name cleans like this name; -1 for none.
+    // Index of a clean-name match, skipping except; -1 if none.
     int indexByCleanName(String name, int except) {
         String wanted = name == null ? "" : cleanName(name);
         int found = -1;
@@ -215,7 +215,7 @@ public final class ClaimBook {
         return found != null && found.shared();
     }
 
-    // The shared claims this copy took out of sharing, by remove or unshare, oldest first.
+    // Shared claims this copy stopped sharing, oldest first.
     public List<Claim> stoppedSharing() {
         return Collections.unmodifiableList(stoppedSharing);
     }
@@ -509,7 +509,7 @@ public final class ClaimBook {
         return ids;
     }
 
-    // Each area whose name cleans like another area's name, as stored; null for the rest.
+    // Stored name per clashing area; null for the rest.
     private static String[] keptStoredNames(JsonArray areas) {
         String[] kept = new String[areas.size()];
         String[] stored = new String[kept.length];
@@ -528,7 +528,7 @@ public final class ClaimBook {
         return kept;
     }
 
-    // The name an area is stored by, trimmed; null when load would read no name from it.
+    // Stored name of an area, trimmed; null if none.
     private static String storedLabel(JsonElement area) {
         String stored = null;
         if (area.isJsonObject()) {

@@ -686,14 +686,14 @@ public final class MapStorage {
     private final java.util.Map<Path, Long> landmarkLastWritten =
             new java.util.concurrent.ConcurrentHashMap<>();
 
-    // Coalesced-away saves: file to the dimension that needs a follow-up snapshot.
+    // File to dimension needing a follow-up snapshot.
     private final java.util.Map<Path, String> landmarksWantedAgain =
             new java.util.concurrent.ConcurrentHashMap<>();
 
-    // Told after each landmark save, on the client thread; null: nobody.
+    // Client thread; told after each landmark save. Null: none.
     private volatile Markers.Saved landmarksSavedListener;
 
-    // Chunks all dimensions may hold together before the coldest flushes.
+    // Chunks all dimensions may hold before the coldest flushes.
     private final long residentBudget;
 
     private long residentChunks;
@@ -718,7 +718,7 @@ public final class MapStorage {
 
     public static final String DIMENSION_MARKER = "dimension.id";
 
-    // The key GeoSurvey knows a folder by now; this class reads it and never writes it.
+    // Folder key GeoSurvey keeps; this class only reads it.
     private static final String CURRENT_MARKER = "world.current";
 
     private static final String SAVE_KEY_PREFIX = "singleplayer-";
@@ -766,12 +766,12 @@ public final class MapStorage {
         return found;
     }
 
-    // A server key written in another letter case is the same server; a save key is exact.
+    // Server keys ignore letter case; save keys are exact.
     private static boolean spellsSameServer(String marker, String key) {
         return !key.startsWith(SAVE_KEY_PREFIX) && marker.equalsIgnoreCase(key);
     }
 
-    // This world's marker: its key, the same server in another letter case, or an older spelling.
+    // Marker matches the key, a server case variant, or priorKeys.
     private static boolean markerIsThisWorld(String marker, String key, String[] priorKeys) {
         return marker.equals(key) || spellsSameServer(marker, key) || heldUnderAPrior(marker, priorKeys);
     }
@@ -805,7 +805,7 @@ public final class MapStorage {
         return matched;
     }
 
-    // A folder search over both collision chains: where it looks, how it reads a marker, and whose marker counts.
+    // Folder search across both collision chains.
     private interface Search {
 
         Path dataDir();
@@ -815,7 +815,7 @@ public final class MapStorage {
         boolean isOurs(String marker);
     }
 
-    // One key's folder search: the first folder, its marker, the key and its older spellings.
+    // One key's search: first folder, marker, key, older spellings.
     private record WorldSearch(Path dataDir, Path first, String held, String key, String[] priorKeys)
             implements Search {
 
@@ -831,7 +831,7 @@ public final class MapStorage {
         }
     }
 
-    // One dimension's folder search: the world folder its folders lie in, and the dimension id.
+    // One dimension's folder search: world folder and dimension id.
     private record DimensionSearch(Path dataDir, String id) implements Search {
 
         @Override
@@ -845,11 +845,11 @@ public final class MapStorage {
         }
     }
 
-    // ours: a folder whose marker counts; unmarked: one with no marker; free: where a new folder goes.
+    // ours: marker counts; unmarked: no marker; free: new folder.
     private record Collisions(Path ours, Path unmarked, Path free) {
     }
 
-    // An older spelling's own folder, else its collision folder; null when neither holds that spelling.
+    // Older spelling's folder, else its collision folder, else null.
     private static Path priorFolder(WorldSearch prior, String priorName, String rawPrior) {
         Path was = prior.dataDir().resolve(priorName);
         String there = was.equals(prior.first()) ? null : markerOf(was);
@@ -862,7 +862,7 @@ public final class MapStorage {
         return found;
     }
 
-    // The folder from before the device guard, then this key's collision folders, then the first folder.
+    // Pre-device-guard folder, collision folders, then first folder.
     private static Path ownFolder(WorldSearch own, String stripped, String name, String rawKey) {
         Path unguarded = own.dataDir().resolve(stripped);
         Path found;
@@ -875,7 +875,7 @@ public final class MapStorage {
         return found;
     }
 
-    // The hashed collision folder, then the collector's chain after it, then GeoSurvey's numbered chain.
+    // Hashed collision folder, collector chain, then numbered chain.
     private static Collisions collisions(Search search, String stem) {
         Path hashed = search.dataDir().resolve(stem);
         String there = search.markerAt(hashed);
@@ -890,7 +890,7 @@ public final class MapStorage {
         return found;
     }
 
-    // Each chain stops at a folder with no marker; the collector's chain is asked first.
+    // Each chain stops at an unmarked folder. Collector chain first.
     private static Collisions pastTheHashedFolder(Search search, String stem) {
         Collisions collectors = collectorChain(search, stem);
         Collisions found;
@@ -904,7 +904,7 @@ public final class MapStorage {
         return found;
     }
 
-    // The collector's own chain: each name adds a dash and the hash of the name before it.
+    // Collector chain: each name adds a dash and previous hash.
     private static Collisions collectorChain(Search search, String stem) {
         Path ours = null;
         Path stopped = null;
@@ -926,7 +926,7 @@ public final class MapStorage {
         return new Collisions(ours, unmarked, free);
     }
 
-    // GeoSurvey's numbered chain: the hashed name, a dash, and 1 to NUMBERED_COLLISIONS.
+    // GeoSurvey chain: hashed name, a dash, 1 to NUMBERED_COLLISIONS.
     private static Collisions numberedChain(Search search, String stem) {
         Path ours = null;
         Path free = null;
@@ -943,12 +943,12 @@ public final class MapStorage {
         return new Collisions(ours, null, free);
     }
 
-    // The first folder says nothing: this world's collision folder, else the first folder.
+    // First folder says nothing: own collision folder, else first.
     private static Path ownOrFirst(Collisions chains, Path first) {
         return chains.ours() == null ? first : chains.ours();
     }
 
-    // Another world or dimension holds the first folder: its own collision folder, an unmarked one, else a free one.
+    // Another holds the first folder: own collision, unmarked, else free.
     private static Path ownOrFree(Collisions chains) {
         Path found;
         if (chains.ours() != null) {
@@ -978,7 +978,7 @@ public final class MapStorage {
         return STORED_DIMENSION + id + STORED_END;
     }
 
-    // The resource id text of a stored key, such as minecraft:overworld; other text comes back trimmed.
+    // Resource id of a stored key. Other text returns trimmed.
     public static String dimensionIdOf(String stored) {
         String key = stored == null ? "" : stored.trim();
         if (!key.startsWith(STORED_DIMENSION) || !key.endsWith(STORED_END)) {
@@ -1332,7 +1332,7 @@ public final class MapStorage {
         }
     }
 
-    // The hashed folder, then GeoSurvey's numbered chain, then the collector's: the first no other dimension holds.
+    // Hashed, numbered, then collector folder; first no other holds.
     private Folder divertFolder(Path at, String id) {
         String stem = dimensionFolder(id) + "-" + shortHash(id);
         Folder settled = freeFolder(at, id, stem);
@@ -1365,7 +1365,7 @@ public final class MapStorage {
         return guardDevice(dev.openmap.live.WorldMapping.publishedFolder(dimensionId));
     }
 
-    // An older spelling's folder, else its collision folder of either chain; null when neither says this dimension.
+    // Older spelling's folder, else a collision folder, else null.
     private static String keptFolder(DimensionSearch search, String name, String hash) {
         String was = sanitise(search.id());
         if (was.equals(name)) {
@@ -1395,7 +1395,7 @@ public final class MapStorage {
         return picked;
     }
 
-    // Its own folder says nothing: an older spelling's folder, a collision folder marked for it, else its own.
+    // Own folder says nothing: older spelling, marked collision, else own.
     private static FolderName unmarkedFolder(DimensionSearch search, String name, String hash) {
         String kept = keptFolder(search, name, hash);
         if (kept == null) {
@@ -2164,7 +2164,7 @@ public final class MapStorage {
             try {
                 queued = coldest == null ? 0 : writeOut(coldest, going);
             } catch (IOException failed) {
-                // A sentinel: save() already re-marked the regions it did not write.
+                // Sentinel: save() re-marks regions it did not write.
                 queued = 1;
             }
             boolean letGo = coldest != null && !(going != null && going.hasDirtyRegions());
@@ -2391,7 +2391,7 @@ public final class MapStorage {
         return writing;
     }
 
-    // A region write that did not land; the writer thread leaves it here.
+    // Region write that failed; writer thread leaves it here.
     private record Unwritten(String dimensionId, MapStore store,
                              int regionX, int regionZ, MapStore ground, Path file,
                              boolean dropped) {
@@ -2739,14 +2739,14 @@ public final class MapStorage {
     // The one thread for region writes.
     private java.util.concurrent.ThreadPoolExecutor regionWrites;
 
-    // The shared pool to write through; null keeps this class's own thread.
+    // Shared pool to write through. Null: this class's own thread.
     private volatile Writes sharedWrites;
 
     public interface Writes {
 
         // null: refused, caller keeps the ground;
-        // WILL_RUN: taken, no way to report a later discard.
-        // otherwise: a probe, true once the work is thrown away unrun.
+        // WILL_RUN: taken. Later discard is not reported.
+        // Otherwise: a probe. True once the work is discarded unrun.
         java.util.function.BooleanSupplier off(Runnable write);
     }
 
@@ -3019,12 +3019,12 @@ public final class MapStorage {
         return landmarks.computeIfAbsent(dimensionId, id -> landmarksAt(landmarkFileFor(id)));
     }
 
-    // Null while the dimension's markers are not loaded; it never loads them.
+    // Null until markers load. Never loads them.
     public LandmarkStore loadedLandmarks(String dimensionId) {
         return landmarks.get(dimensionId);
     }
 
-    // listener may be null: nobody is told. It runs on the client thread, after the markers were saved or queued.
+    // Client thread. Null: nobody told. Runs after save or queue.
     public void afterLandmarksSaved(Markers.Saved listener) {
         landmarksSavedListener = listener;
     }
@@ -3469,7 +3469,7 @@ public final class MapStorage {
 
     }
 
-    // Merges a region snapshot into its file; the better copy of each chunk wins.
+    // Merges snapshot into file; better copy of each chunk wins.
     // The file's lock is held throughout.
     public static void writeRegionFile(MapStore prepared, Path file,
                                        java.util.function.IntFunction<LandCover> legacy)
@@ -3850,8 +3850,8 @@ public final class MapStorage {
         }
     }
 
-    // Whether the sample on disk outranks the incoming one: ground first, then age.
-    // Undated (pre-wall-clock) samples always lose to dated ones; two undated samples compare by raw tick.
+    // Whether disk sample outranks fresh: ground first, then age.
+    // Undated loses to dated. Undated pairs compare by raw tick.
     public static boolean outranks(ChunkSample existing, ChunkSample fresh) {
         boolean ground = existing.holdsGround();
         if (ground != fresh.holdsGround()) {
@@ -3887,7 +3887,7 @@ public final class MapStorage {
                 && MapCodec.columnsHoldGround(columns, columnsVersion, legacy);
     }
 
-    // How ground turned the counted age verdict: 1 to existing, -1 to fresh, else 0.
+    // Age verdict from ground: 1 existing, -1 fresh, else 0.
     private static int groundTurn(ChunkSample existing, ChunkSample fresh, boolean existingWins) {
         int turn;
         if (existingWins == outranks(existing.capturedAt(), existing.captureVersion(), fresh)) {
@@ -3940,7 +3940,7 @@ public final class MapStorage {
 
     private static final byte UNKNOWN_COVER_CODE = (byte) LandCover.UNKNOWN.code();
 
-    // A stored copy of the chunk; heights and cover are scratch columns of ChunkSample.COLUMNS.
+    // Stored copy. Heights and cover are COLUMNS-long scratch.
     public static ChunkSample copyOf(GroundChunk chunk, short[] heights, byte[] cover) {
         java.util.Arrays.fill(heights, ChunkSample.NO_HEIGHT);
         java.util.Arrays.fill(cover, UNKNOWN_COVER_CODE);
@@ -3953,7 +3953,7 @@ public final class MapStorage {
         return copy;
     }
 
-    // One region of an import: the ground the collector held for it, and its file.
+    // One import region: held ground and its file.
     public static final class RegionImport {
 
         private final String dimensionId;
@@ -3962,7 +3962,7 @@ public final class MapStorage {
 
         private final Path file;
 
-        // The import writer's thread's until the import is written; the client thread's after.
+        // Import writer thread until written, then client thread.
         private final MapStore ground;
 
         private final Unlanded kept;
@@ -3987,7 +3987,7 @@ public final class MapStorage {
         }
     }
 
-    // Client thread; null outside a world, or when the dimension's folder cannot be claimed.
+    // Client thread. Null outside a world or if claim fails.
     public RegionImport prepareImport(String dimensionId, int regionX, int regionZ) {
         Path at = root;
         Path file = at == null ? null : regionFileFor(dimensionId, regionX, regionZ);
@@ -4001,7 +4001,7 @@ public final class MapStorage {
                 legacyColourToCover, damage);
     }
 
-    // Any thread but the client thread; returns how many imported chunks the file holds now.
+    // Not the client thread. Returns imported count in file.
     public static int writeImport(RegionImport region, ChunkSample[] imported) throws IOException {
         MapStore ground = region.ground;
         for (ChunkSample sample : imported) {
@@ -4024,7 +4024,7 @@ public final class MapStorage {
         return written;
     }
 
-    // Client thread; puts the written import over resident ground it outranks or ties.
+    // Client thread. Puts import over ground it outranks or ties.
     // False when its world was left.
     public boolean landImport(RegionImport region) {
         if (region.root != root) {
@@ -4048,7 +4048,7 @@ public final class MapStorage {
         return true;
     }
 
-    // An import takes a held chunk it outranks, or one with the same ground, dated form and time.
+    // Takes held chunk it outranks, or same-ground dated match.
     private static boolean importTakes(ChunkSample held, ChunkSample sample) {
         return outranks(sample, held) || ties(held, sample);
     }

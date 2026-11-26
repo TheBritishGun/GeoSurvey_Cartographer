@@ -7,7 +7,7 @@ public interface CartographerWorld {
     // Client thread; null outside a world.
     Path worldFolder();
 
-    // Client thread; null outside a world. The id is the resource id text, such as minecraft:overworld.
+    // Client thread; null outside a world. Resource id like minecraft:overworld.
     String dimensionFolder(String dimensionId);
 
     // Client thread; null outside a world.

@@ -88,7 +88,7 @@ public final class GreetingLearner {
         pending.add(new Pending(server, world, claimId, false, atNanos));
     }
 
-    // Records the claims at (x, z) while a crossing is unpaired.
+    // Records claims at (x, z) while a crossing is unpaired.
     public void stoodAt(String world, double x, double z, List<LiveSnapshot.Area> claims,
                         long atNanos) {
         if (pending.isEmpty()) {

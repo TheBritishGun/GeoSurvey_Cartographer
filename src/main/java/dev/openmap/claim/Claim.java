@@ -32,7 +32,7 @@ public final class Claim {
 
     private final String name;
 
-    // Descriptive only; not authorisation.
+    // Descriptive only; not authorization.
     private final String owner;
 
     // Empty when the client has none.
@@ -75,7 +75,7 @@ public final class Claim {
         return drawn;
     }
 
-    // Keeps the given arrays; the caller must not use them again. A stored claim may enclose no ground.
+    // Keeps the given arrays; caller must not reuse them.
     static Claim fromOwnedArrays(Identity who, String name, double[] xs, double[] zs,
                                  MarkerColour colour, long revised, boolean shared) {
         return new Claim(who.id(), name, who.owner(), who.ownerId(), who.dimension(),
@@ -262,7 +262,7 @@ public final class Claim {
         return kept.equals(name) ? this : new Claim(this, kept, colour, revised, false);
     }
 
-    // The revision of a copy: the clock reading, or one past this revision if that is later.
+    // Copy's revision: now, or one past the source if later.
     private long nextRevision(long now) {
         return Math.max(now, (revised == Long.MAX_VALUE) ? revised : revised + 1L);
     }
@@ -276,7 +276,7 @@ public final class Claim {
         return trimmedHandle != null && name.equalsIgnoreCase(trimmedHandle);
     }
 
-    // The name without line breaks, format codes or direction marks; a name with nothing left is kept as it is.
+    // Strips breaks, format codes, direction marks; keeps raw if empty.
     static String cleaned(String raw) {
         String cleaned = LabelText.clean(raw, LabelText.UNBOUNDED_READ, LabelText.UNBOUNDED_READ, false);
         return cleaned.isBlank() ? raw : cleaned;

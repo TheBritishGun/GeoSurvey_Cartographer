@@ -154,7 +154,7 @@ public record ColourSwatch(Preset preset, int custom) {
         return interned;
     }
 
-    // A preset name or 6/8 hex digits; null if unknown. alphaWhenAbsent fills a missing alpha (0 becomes FF).
+    // Preset or 6/8 hex; null if unknown; alphaWhenAbsent fills alpha.
     public static ColourSwatch parse(String text, int alphaWhenAbsent) {
         if (text == null) {
             return null;

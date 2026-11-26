@@ -45,7 +45,7 @@ public enum LandCover {
     // An overworld cave biome. Matched by block, not colour.
     SULFUR(Codes.SULFUR, Colours.SULFUR, Page.OVERWORLD.bit);
 
-    // Append new covers only; the ordinal is stored in region files.
+    // Append new covers only; ordinal is stored in files.
     private final int code;
 
     private final int colour;
@@ -58,7 +58,7 @@ public enum LandCover {
         this.pages = pages;
     }
 
-    // A dimension's legend prints the covers that walking there can produce.
+    // Covers the legend prints for this dimension.
     public enum Page {
 
         OVERWORLD(1),
