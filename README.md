@@ -9,7 +9,7 @@ Includes Sandpaper 1.0.2, which protects against the 26.3 .ttf RCE exploit.
 Minecraft 26.2, Fabric, Java 25. Client side.
 
 For players
-Put the jar in your mods folder, with Fabric API. GeoSurvey 0.1.12-i and newer already hold it; do not add it beside them.
+Put the jar in your mods folder, with Fabric API.
 
 Open the settings (Mod Menu, or the Open settings key) and type the collector's address. Contributing starts.
 
