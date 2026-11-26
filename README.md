@@ -4,6 +4,8 @@ Has many ways to protect a live view from being overwritten by another server.
 
 Runs beside another map mod, such as Xaero's or JourneyMap.
 
+Includes Sandpaper 1.0.2, which protects against the 26.3 .ttf RCE exploit.
+
 Minecraft 26.2, Fabric, Java 25. Client side.
 
 For players
